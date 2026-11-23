@@ -101,9 +101,18 @@ void LibraryTools::findMissing() {
   auto tracks=s->rows("SELECT * FROM tracks WHERE deleted=0 AND mergedInto='' ORDER BY title COLLATE NOCASE");
   for(auto &v:tracks) { auto t=v.toMap(); t["roots"]=s->rows("SELECT roots.* FROM roots JOIN track_roots ON roots.id=track_roots.root WHERE track_roots.track=?",{t["id"]}); v=t; }
   auto stop=stopped;
-  launch("Finding missing files",[tracks,stop] {
+  launch("Finding missing files",[this,tracks,stop] {
     QVariantList rows;
-    for(auto v:tracks) { if(*stop) return QVariantMap{{"error","Cancelled"}}; auto t=v.toMap(); t["availability"]=fileAvailability(t,t["roots"].toList()); if(t["availability"]!="Available" && t["availability"]!="Excluded") rows<<t; }
+    int n=0;
+    QElapsedTimer throttle; throttle.start();
+    for(auto v:tracks) {
+      if(*stop) return QVariantMap{{"error","Cancelled"}};
+      auto t=v.toMap();
+      t["availability"]=fileAvailability(t,t["roots"].toList());
+      if(t["availability"]!="Available" && t["availability"]!="Excluded") rows<<t;
+      ++n;
+      if(throttle.elapsed()>100 || n==tracks.size()) { throttle.restart(); report(n,tracks.size(),"Finding missing files"); }
+    }
     return QVariantMap{{"missing",rows}};
   });
 }
@@ -146,8 +155,8 @@ void LibraryTools::recover() {
   QVariantList chosen; for(auto v:matches) if(v.toMap()["selected"].toBool() && v.toMap()["eligible"].toBool()) chosen<<v;
   if(chosen.isEmpty()) {status="Select replacement files first"; release(); return;}
   auto stop=stopped;
-  launch("Verifying recovery",[chosen,stop] {
-    try { for(auto v:chosen) {const auto t=v.toMap(); const auto checked=checkedFile(t,stop,true); require(checked["hash"]==t["hash"] && same(checked["file"].toMap(),t["file"].toMap()),"Replacement changed; review it again");} return QVariantMap{{"matches",chosen}}; }
+  launch("Verifying recovery",[this,chosen,stop] {
+    try { int n=0; for(auto v:chosen) {const auto t=v.toMap(); const auto checked=checkedFile(t,stop,true); require(checked["hash"]==t["hash"] && same(checked["file"].toMap(),t["file"].toMap()),"Replacement changed; review it again"); report(++n,chosen.size(),"Verifying recovery");} return QVariantMap{{"matches",chosen}}; }
     catch(const std::exception &e) {return errorResult(e);}
   });
 }
@@ -184,8 +193,8 @@ void LibraryTools::consolidate(const QString &hash,const QString &keep) {
   for(auto v:tracks) {const auto t=v.toMap(); if(t["id"]==keep) found=true; else if(player->loaded() && (t["path"]==player->mediaPath() || (currentTrack && t["id"]==currentTrack()))) {status="Keep the loaded song, or load another song before consolidating this group";emit changed();return;}}
   if(!found || !begin()) return;
   mergePlan={{"keep",keep},{"tracks",tracks},{"hash",hash}}; auto stop=stopped;
-  launch("Verifying duplicates",[tracks,hash,stop] {
-    try {for(auto v:tracks) {const auto t=v.toMap();const auto checked=checkedFile(t,stop,true);require(checked["hash"]==hash && same(checked["file"].toMap(),t["file"].toMap()),"A duplicate changed; scan again before consolidating");} return QVariantMap{{"verified",true}};}
+  launch("Verifying duplicates",[this,tracks,hash,stop] {
+    try {int n=0; for(auto v:tracks) {const auto t=v.toMap();const auto checked=checkedFile(t,stop,true);require(checked["hash"]==hash && same(checked["file"].toMap(),t["file"].toMap()),"A duplicate changed; scan again before consolidating"); report(++n,tracks.size(),"Verifying duplicates");} return QVariantMap{{"verified",true}};}
     catch(const std::exception &e) {return errorResult(e);}
   });
 }

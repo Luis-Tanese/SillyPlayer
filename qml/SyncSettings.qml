@@ -85,6 +85,12 @@ ColumnLayout {
                 FlatButton { text: "Pair phone"; glyph: "plus"; primary: true; onClicked: app.sync.pair(address.currentText) }
                 FlatButton { text: "Prepare library"; outlined: true; enabled: !app.sync.busy; onClicked: app.sync.prepare() }
             }
+            AppProgress {
+                visible: app.sync.busy
+                Layout.fillWidth: true
+                indeterminate: app.sync.progress < 0
+                value: Math.max(0, app.sync.progress)
+            }
             Label { visible: app.sync.enabled; text: "Pairing grants access to this library. Start a sync from the phone to connect. While its app stays open, shared choices update on both devices. Resolve a change here or on the phone; unresolved audio stays untouched."; color: Theme.muted; font.pixelSize: 12; wrapMode: Text.WordWrap; Layout.fillWidth: true }
             Image { visible: !!app.sync.pairingQr; source: app.sync.pairingQr; sourceSize: Qt.size(300,300); Layout.preferredWidth: 300; Layout.preferredHeight: visible ? 300 : 0; fillMode: Image.PreserveAspectFit; smooth: false }
             FlatButton { visible: !!app.sync.pairingLink; text: "Copy pairing link · expires in 5 minutes"; glyph: "external-link"; outlined: true; onClicked: app.sync.copyLink() }

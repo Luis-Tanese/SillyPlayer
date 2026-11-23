@@ -187,9 +187,19 @@ SyncManager::SyncManager(Store *store, QObject *parent, quint16 port)
       ok = s->db().commit();
     if (!ok)
       s->db().rollback();
-    const bool more = ok && !s->rows("SELECT key FROM sync_dirty LIMIT 1").isEmpty();
+    const qint64 remaining = ok ? s->rows("SELECT COUNT(*) AS n FROM sync_dirty").value(0).toMap()["n"].toLongLong() : 0;
+    const bool more = ok && remaining > 0;
     preparing = more;
-    message = more ? "Preparing library for sync" : ok ? "Ready to sync" : "Could not save sync journal";
+    if (more) {
+      if (prepareTotal < remaining) prepareTotal = remaining;
+      const qint64 done = qMax<qint64>(0, prepareTotal - remaining);
+      progressValue = prepareTotal > 0 ? qBound(0.0, double(done) / double(prepareTotal), 1.0) : -1;
+      message = QString("Preparing library for sync (%1/%2)").arg(done).arg(prepareTotal);
+    } else {
+      prepareTotal = 0;
+      progressValue = -1;
+      message = ok ? "Ready to sync" : "Could not save sync journal";
+    }
     emit changed();
     if (more) QTimer::singleShot(0, this, [this] { preparing = false; prepare(); });
   });
@@ -473,12 +483,18 @@ void SyncManager::prepare() {
                        "'tracks' THEN 0 WHEN 'collections' THEN 1 WHEN "
                        "'members' THEN 2 WHEN 'orders' THEN 3 ELSE 4 END,key LIMIT 100");
   if (dirty.isEmpty()) {
+    prepareTotal = 0;
+    progressValue = -1;
     message = "Ready to sync";
     emit changed();
     return;
   }
+  const qint64 remaining = s->rows("SELECT COUNT(*) AS n FROM sync_dirty").value(0).toMap()["n"].toLongLong();
+  if (prepareTotal <= 0 || remaining > prepareTotal) prepareTotal = remaining;
+  const qint64 done = qMax<qint64>(0, prepareTotal - remaining);
   preparing = true;
-  message = "Preparing library for sync";
+  progressValue = prepareTotal > 0 ? qBound(0.0, double(done) / double(prepareTotal), 1.0) : -1;
+  message = QString("Preparing library for sync (%1/%2)").arg(done).arg(prepareTotal);
   emit changed();
   QVariantList items;
   for (auto value : dirty) {
@@ -678,7 +694,8 @@ QVariantMap SyncManager::changes(qint64 cursor, int limit) const {
                         {"key", query.value(2)}, {"payload", decode(payload)}};
     bytes += rowBytes;
   }
-  return {{"changes", rows}, {"cursor", last}, {"more", more},
+  const qint64 latest = s->rows("SELECT COALESCE(MAX(revision),0) AS r FROM sync_changes").value(0).toMap()["r"].toLongLong();
+  return {{"changes", rows}, {"cursor", last}, {"latest", latest}, {"more", more},
           {"deviceId", s->setting("libraryIdentity")}};
 }
 
@@ -1323,6 +1340,7 @@ void SyncManager::startResolutions(const QVariantList &snapshots, bool usePhone,
   auto timer = new QTimer(this);
   timer->setSingleShot(true);
   resolving = true; resolutionCancelled = false;
+  progressValue = snapshots.isEmpty() ? 1.0 : 0.0;
   resolutionResult = {{"resolved", 0}, {"skipped", 0}, {"failed", 0}, {"total", snapshots.size()}, {"cancelled", false}, {"message", "Applying song choices"}};
   message = "Applying song choices";
   emit aboutToApply();
@@ -1355,6 +1373,7 @@ void SyncManager::startResolutions(const QVariantList &snapshots, bool usePhone,
     message = finished ? resolutionResult["message"].toString() : QString("Applying song choices · %1/%2").arg(batch->next).arg(batch->rows.size());
     if (finished) {
       resolving = false;
+      progressValue = -1;
       timer->deleteLater();
       if (batch->resolved) emit applied();
       emit resolutionProgressChanged();
@@ -1362,8 +1381,9 @@ void SyncManager::startResolutions(const QVariantList &snapshots, bool usePhone,
       if (connection) reply(connection, 200, {{"results", batch->results}, {"summary", resolutionResult}});
       if (!s->rows("SELECT key FROM sync_dirty LIMIT 1").isEmpty()) QTimer::singleShot(0, this, &SyncManager::prepare);
     } else {
+      progressValue = batch->rows.isEmpty() ? 1.0 : qBound(0.0, double(batch->next) / double(batch->rows.size()), 1.0);
       if (batch->progress.elapsed() >= 100) {
-        batch->progress.restart(); emit resolutionProgressChanged();
+        batch->progress.restart(); emit resolutionProgressChanged(); emit changed();
       }
       timer->start(0);
     }

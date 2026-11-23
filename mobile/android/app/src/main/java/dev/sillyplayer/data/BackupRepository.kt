@@ -73,6 +73,7 @@ class BackupRepository(private val g: Graph) {
                 val assets = linkedMapOf<String, JsonObject>()
                 var done = 0L
                 val total = tracks.sumOf { it.size.coerceAtLeast(0) }
+                var currentTrackIndex = 0
                 g.output(uri).use { raw ->
                     ZipOutputStream(BufferedOutputStream(raw, 256 * 1024)).use { zip ->
                         suspend fun add(source: String, kind: String, extension: String): String {
@@ -95,12 +96,15 @@ class BackupRepository(private val g: Graph) {
                                     digest.update(buffer, 0, n)
                                     count += n
                                     if (kind == "media") done += n
+                                    val frac =
+                                        if (total > 0) (done.toFloat() / total).coerceIn(0f, 1f)
+                                        else if (tracks.isNotEmpty()) (currentTrackIndex.toFloat() / tracks.size).coerceIn(0f, 1f)
+                                        else -1f
                                     state.value =
                                         BackupState(
                                             true,
-                                            "Backing up audio",
-                                            if (total > 0) (done.toFloat() / total).coerceIn(0f, 1f)
-                                            else -1f,
+                                            "Backing up audio ($currentTrackIndex/${tracks.size})",
+                                            frac,
                                         )
                                 }
                             }
@@ -118,6 +122,7 @@ class BackupRepository(private val g: Graph) {
                             return name
                         }
                         for (track in tracks) {
+                            currentTrackIndex++
                             if (
                                 !track.available ||
                                     runCatching { g.input(track.uri).use { it.read() } }.isFailure
@@ -276,6 +281,7 @@ class BackupRepository(private val g: Graph) {
         var manifest: JsonObject? = null
         val names = mutableSetOf<String>()
         var inspectedBytes = 0L
+        val archiveLength = runCatching { DocumentFile.fromSingleUri(g.context, Uri.parse(uri))?.length() ?: 0L }.getOrDefault(0L)
         val inspectionLimit = StatFs(g.context.cacheDir.path).availableBytes
         val pattern = Regex("(media|art)/[a-f0-9]{64}\\.[a-z0-9]{1,10}")
         g.input(uri).use { raw ->
@@ -305,6 +311,13 @@ class BackupRepository(private val g: Graph) {
                             if (n < 0) break
                             inspectedBytes += n
                             require(inspectedBytes <= inspectionLimit) { "Not enough storage to stage this archive" }
+                            if (archiveLength > 0L) {
+                                state.value = BackupState(
+                                    true,
+                                    "Reading backup",
+                                    (inspectedBytes.toFloat() / archiveLength).coerceIn(0f, 1f),
+                                )
+                            }
                         }
                     }
                     zip.closeEntry()
@@ -464,7 +477,8 @@ class BackupRepository(private val g: Graph) {
     private suspend fun buildRestoredTracks(plan: RestorePlan, stage: File,
         published: MutableList<String>, publication: File) {
         val origin = plan.archive.origin
-        for (v in plan.archive.rows) {
+        val totalRows = plan.archive.rows.size
+        for ((index, v) in plan.archive.rows.withIndex()) {
             val fields = v.jsonObject
             val remote = fields.getValue("id").jsonPrimitive.content
             val asset = fields.getValue("media").jsonPrimitive.content
@@ -490,6 +504,13 @@ class BackupRepository(private val g: Graph) {
                 plan.trackMap[remote] = id
             }
             plan.mapping += RestoreId(origin, "track", remote, plan.trackMap.getValue(remote))
+            if (totalRows > 0) {
+                state.value = BackupState(
+                    true,
+                    "Restoring songs (${index + 1}/$totalRows)",
+                    ((index + 1).toFloat() / totalRows).coerceIn(0f, 1f),
+                )
+            }
         }
     }
 

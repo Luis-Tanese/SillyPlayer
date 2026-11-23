@@ -6,8 +6,8 @@ import SillyPlayer 1.0
 
 ApplicationWindow {
     id: root
-    width: Math.max(minimumWidth, Number(app.settings.windowWidth) || 1160)
-    height: Math.max(minimumHeight, Number(app.settings.windowHeight) || 800)
+    width: 1160
+    height: 800
     minimumWidth: 620
     minimumHeight: 540
     visible: true
@@ -16,6 +16,9 @@ ApplicationWindow {
     property string page: ["Music", "Browse", "Split", "Downloads", "Me!", "Settings"].includes(app.settings.lastPage) ? app.settings.lastPage : "Music"
     property bool geometryReady: false
     Component.onCompleted: {
+        // restore window geometry once so later setting changes cannot snap a maximized window back
+        width = Math.max(minimumWidth, Number(app.settings.windowWidth) || 1160);
+        height = Math.max(minimumHeight, Number(app.settings.windowHeight) || 800);
         const sx = Number(app.settings.windowX);
         const sy = Number(app.settings.windowY);
         if (isFinite(sx) && isFinite(sy) && sx >= Screen.virtualX && sy >= Screen.virtualY &&
@@ -25,23 +28,31 @@ ApplicationWindow {
             y = sy;
         }
         if (app.settings.windowMaximized)
-            visibility = Window.Maximized;
-        geometryReady = true;
+            showMaximized();
+        Qt.callLater(function() { geometryReady = true; });
     }
     Timer {
         id: windowStateSaver
         interval: 450
         onTriggered: {
             if (!root.geometryReady) return;
-            const maximized = root.visibility === Window.Maximized;
-            app.setSetting("windowMaximized", maximized);
-            if (root.visibility === Window.Windowed) {
-                app.setSetting("windowWidth", root.width);
-                app.setSetting("windowHeight", root.height);
-                app.setSetting("windowX", root.x);
-                app.setSetting("windowY", root.y);
+            if (root.visibility === Window.Windowed || root.visibility === Window.Maximized) {
+                const maximized = root.visibility === Window.Maximized;
+                if (Boolean(app.settings.windowMaximized) !== maximized)
+                    app.setSetting("windowMaximized", maximized);
             }
-            app.setSetting("lastPage", root.page);
+            if (root.visibility === Window.Windowed) {
+                if (Number(app.settings.windowWidth) !== root.width)
+                    app.setSetting("windowWidth", root.width);
+                if (Number(app.settings.windowHeight) !== root.height)
+                    app.setSetting("windowHeight", root.height);
+                if (Number(app.settings.windowX) !== root.x)
+                    app.setSetting("windowX", root.x);
+                if (Number(app.settings.windowY) !== root.y)
+                    app.setSetting("windowY", root.y);
+            }
+            if (app.settings.lastPage !== root.page)
+                app.setSetting("lastPage", root.page);
         }
     }
     onWidthChanged: {

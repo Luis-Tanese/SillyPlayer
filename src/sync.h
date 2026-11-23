@@ -23,6 +23,7 @@ class SyncManager : public QObject {
   Q_OBJECT
   Q_PROPERTY(bool enabled READ enabled NOTIFY changed)
   Q_PROPERTY(bool busy READ busy NOTIFY changed)
+  Q_PROPERTY(double progress READ progress NOTIFY changed)
   Q_PROPERTY(QString status READ status NOTIFY changed)
   Q_PROPERTY(QString pairingLink READ pairingLink NOTIFY changed)
   Q_PROPERTY(QString pairingQr READ pairingQr NOTIFY changed)
@@ -35,6 +36,7 @@ public:
   ~SyncManager();
   bool enabled() const { return server.isListening(); }
   bool busy() const { return preparing || exchanging || resolving; }
+  double progress() const { return progressValue; }
   QString status() const { return message; }
   QString pairingLink() const { return link; }
   QString pairingQr() const { return qr; }
@@ -75,7 +77,8 @@ private:
   QString message = "Sync is off", link, qr, pairToken, fingerprint;
   QString certPath, keyPath, stateDir, pairReplacement;
   quint16 listenPort;
-  qint64 pairUntil = 0;
+  qint64 pairUntil = 0, prepareTotal = 0;
+  double progressValue = -1;
   bool preparing = false, exchanging = false, resolving = false, resolutionCancelled = false, closing = false;
   QVariantMap resolutionResult;
   std::function<bool()> maintenanceGuard;

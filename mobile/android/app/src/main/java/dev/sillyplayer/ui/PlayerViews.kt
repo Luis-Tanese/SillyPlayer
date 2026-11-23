@@ -83,15 +83,7 @@ fun CompactPlayer(
     val latestTrack by rememberUpdatedState(track)
     val latestEngine by rememberUpdatedState(engine)
     val latestExpand by rememberUpdatedState(onExpand)
-    Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surfaceContainer)) {
-        PlaybackPosition(g) { position -> SeekLine(
-            position,
-            if (state.owner == "music") state.duration
-            else ((track?.duration ?: 0.0) * 1000).toLong(),
-            track?.id ?: "",
-        ) {
-            engine?.seek(it)
-        } }
+    Box(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surfaceContainer)) {
         Row(
             Modifier.fillMaxWidth()
                 .pointerInput(Unit) {
@@ -127,7 +119,7 @@ fun CompactPlayer(
                     }
                 }
                 .graphicsLayer { translationX = visualShift * 0.35f }
-                .padding(start = 10.dp, end = 3.dp, top = 4.dp, bottom = 8.dp),
+                .padding(start = 10.dp, end = 3.dp, top = 8.dp, bottom = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Artwork(
@@ -199,6 +191,17 @@ fun CompactPlayer(
                     Modifier.size(20.dp),
                     tint = if (state.mode != 0) MaterialTheme.colorScheme.primary else LocalContentColor.current,
                 )
+            }
+        }
+        PlaybackPosition(g) { position ->
+            SeekLine(
+                position,
+                if (state.owner == "music") state.duration
+                else ((track?.duration ?: 0.0) * 1000).toLong(),
+                track?.id ?: "",
+                flushTop = true,
+            ) {
+                engine?.seek(it)
             }
         }
     }

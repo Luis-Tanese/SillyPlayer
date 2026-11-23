@@ -18,13 +18,19 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.semantics.*
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.zIndex
 import coil3.compose.AsyncImage
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import dev.sillyplayer.data.Track
+import kotlin.math.ceil
+import kotlin.math.roundToInt
 import kotlin.math.roundToLong
 import dev.sillyplayer.media.pitchEffectLabel
 import dev.sillyplayer.online.thumbnailCandidates
@@ -113,16 +119,109 @@ fun Hint(value: String) {
         )
 }
 
+internal fun formatEta(remainingMs: Long): String {
+    if (remainingMs < 0L) return ""
+    val totalSec = ceil(remainingMs / 1000.0).toLong()
+    if (totalSec <= 1L) return "< 1s left"
+    if (totalSec < 60L) return "~${totalSec}s left"
+    val mins = totalSec / 60L
+    val secs = totalSec % 60L
+    if (mins < 60L) return if (secs > 0L) "~${mins}m ${secs}s left" else "~${mins}m left"
+    val hours = mins / 60L
+    val remMins = mins % 60L
+    return if (remMins > 0L) "~${hours}h ${remMins}m left" else "~${hours}h left"
+}
+
 @Composable
 fun Progress(stage: String, progress: Float = -1f) {
+    val determinate = progress >= 0f
+    val clamped = if (determinate) progress.coerceIn(0f, 1f) else -1f
+    val percent = if (determinate) (clamped * 100f).roundToInt().coerceIn(0, 100) else 0
+    var startMs by remember { mutableLongStateOf(0L) }
+    var startFraction by remember { mutableFloatStateOf(0f) }
+    var lastFraction by remember { mutableFloatStateOf(-1f) }
+    var smoothedEtaMs by remember { mutableDoubleStateOf(-1.0) }
+    var tick by remember { mutableLongStateOf(0L) }
+
+    LaunchedEffect(determinate, clamped) {
+        if (!determinate) {
+            startMs = 0L
+            startFraction = 0f
+            lastFraction = -1f
+            smoothedEtaMs = -1.0
+        } else {
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (startMs == 0L || clamped < lastFraction - 0.03f) {
+                startMs = now
+                startFraction = clamped
+                smoothedEtaMs = -1.0
+            }
+            lastFraction = clamped
+            if (clamped < 1f) {
+                val elapsed = now - startMs
+                val delta = clamped - startFraction
+                if (elapsed >= 500L && delta >= 0.005f) {
+                    val raw = (elapsed * (1.0 - clamped) / delta).coerceIn(0.0, 86_400_000.0)
+                    smoothedEtaMs = if (smoothedEtaMs < 0.0) raw else smoothedEtaMs * 0.7 + raw * 0.3
+                }
+            } else {
+                smoothedEtaMs = 0.0
+            }
+        }
+    }
+
+    LaunchedEffect(determinate, clamped >= 1f) {
+        if (determinate && clamped < 1f) {
+            while (isActive) {
+                delay(1000)
+                tick = android.os.SystemClock.elapsedRealtime()
+            }
+        }
+    }
+
+    val etaLabel = remember(determinate, clamped, startMs, startFraction, smoothedEtaMs, tick) {
+        if (!determinate || clamped >= 1f) ""
+        else if (smoothedEtaMs >= 0.0) "Estimated time left: ${formatEta(smoothedEtaMs.toLong())}"
+        else "Estimating time left…"
+    }
+
     Column(Modifier.fillMaxWidth()) {
-        Hint(stage)
-        if (progress < 0) LinearProgressIndicator(Modifier.fillMaxWidth())
+        Row(
+            Modifier.fillMaxWidth().padding(vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text(
+                stage,
+                Modifier.weight(1f),
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+            if (determinate) {
+                Text(
+                    "$percent%",
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+            }
+        }
+        if (!determinate) LinearProgressIndicator(Modifier.fillMaxWidth())
         else
             LinearProgressIndicator(
-                progress = { progress.coerceIn(0f, 1f) },
+                progress = { clamped },
                 modifier = Modifier.fillMaxWidth(),
             )
+        if (etaLabel.isNotEmpty()) {
+            Text(
+                etaLabel,
+                Modifier.padding(top = 3.dp),
+                fontSize = 11.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
     }
 }
 
@@ -209,7 +308,13 @@ fun Confirmation(
 }
 
 @Composable
-fun SeekLine(position: Long, duration: Long, identity: String, onSeek: (Long) -> Unit) {
+fun SeekLine(
+    position: Long,
+    duration: Long,
+    identity: String,
+    flushTop: Boolean = false,
+    onSeek: (Long) -> Unit,
+) {
     var dragging by remember(identity) { mutableStateOf(false) }
     var preview by remember(identity) { mutableFloatStateOf(0f) }
     val latestPosition by rememberUpdatedState(position)
@@ -217,7 +322,7 @@ fun SeekLine(position: Long, duration: Long, identity: String, onSeek: (Long) ->
     val rail = MaterialTheme.colorScheme.outlineVariant
     Canvas(
         Modifier.fillMaxWidth()
-            .height(28.dp)
+            .height(if (flushTop) 10.dp else 28.dp)
             .semantics {
                 contentDescription = "Seek"
                 progressBarRangeInfo =
@@ -253,14 +358,18 @@ fun SeekLine(position: Long, duration: Long, identity: String, onSeek: (Long) ->
         val fraction =
             if (dragging) preview
             else if (duration > 0) (latestPosition.toFloat() / duration).coerceIn(0f, 1f) else 0f
-        drawLine(rail, Offset(0f, size.height / 2), Offset(size.width, size.height / 2), 2.dp.toPx())
+        val lineY = if (flushTop) 1.dp.toPx() else size.height / 2
+        drawLine(rail, Offset(0f, lineY), Offset(size.width, lineY), 2.dp.toPx())
         drawLine(
             accent,
-            Offset(0f, size.height / 2),
-            Offset(size.width * fraction, size.height / 2),
+            Offset(0f, lineY),
+            Offset(size.width * fraction, lineY),
             2.dp.toPx(),
         )
-        if (dragging) drawCircle(accent, 5.dp.toPx(), Offset(size.width * fraction, size.height / 2))
+        if (dragging) {
+            val thumbY = if (flushTop) 5.dp.toPx() else lineY
+            drawCircle(accent, 5.dp.toPx(), Offset(size.width * fraction, thumbY))
+        }
     }
 }
 

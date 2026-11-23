@@ -478,13 +478,19 @@ class SyncClient(private val g: Graph) {
                 }
             }
             connectedPeer.value = peer.id
-            cursor = receiveChanges(peer, http, cursor)
+            cursor = receiveChanges(peer, http, cursor, reportProgress = true)
             // parents precede memberships, regardless of edit timestamps
+            val totalOutbox = g.dao.syncPendingCount(peer.id)
+            var sentOutbox = 0
             while (true) {
                 val batch = nextSyncBatch(g.dao.syncBatch(peer.id))
                 val pending = batch.entries
                 if (pending.isEmpty()) break
-                state.value = state.value.copy(stage = "Sending library changes")
+                val totalToSend = maxOf(totalOutbox, sentOutbox + pending.size)
+                state.value = state.value.copy(
+                    stage = "Sending library changes ($sentOutbox/$totalToSend)",
+                    progress = if (totalToSend > 0) (sentOutbox.toFloat() / totalToSend).coerceIn(0f, 1f) else -1f,
+                )
                 val response =
                     exchange(
                         peer,
@@ -559,9 +565,15 @@ class SyncClient(private val g: Graph) {
                 }
                 }
                 publishTrackChanges(updates, removals)
+                sentOutbox += pending.size
+                val denom = maxOf(totalOutbox, sentOutbox)
+                state.value = state.value.copy(
+                    stage = "Sending library changes ($sentOutbox/$denom)",
+                    progress = if (denom > 0) (sentOutbox.toFloat() / denom).coerceIn(0f, 1f) else 1f,
+                )
             }
             fetchConflicts(peer, http)
-            cursor = receiveChanges(peer, http, cursor)
+            cursor = receiveChanges(peer, http, cursor, reportProgress = true)
             val blockedTracks = g.dao.conflictsForPeer(peer.id).filter { it.entity == "tracks" }.map { it.key }.toSet()
             val selected =
                 JsonCodec.parseToJsonElement(peer.selected)
@@ -573,7 +585,7 @@ class SyncClient(private val g: Graph) {
                 g.dao.collections().filter {
                     it.artHash.isNotBlank() && (peer.allMedia || "collection:" + it.id in selected)
                 }
-            state.value = state.value.copy(stage = "Checking synced media…", progress = -1f)
+            state.value = state.value.copy(stage = "Checking synced media…", progress = 0f)
             val hashRegex = Regex("[a-f0-9]{64}")
             val candidateHashes = LinkedHashSet<String>(tracks.size * 2 + selectedCollections.size)
             for (t in tracks) {
@@ -597,6 +609,18 @@ class SyncClient(private val g: Graph) {
             }
             val bytes = java.util.concurrent.atomic.AtomicLong(0L)
             val completed = java.util.concurrent.atomic.AtomicInteger(0)
+            val totalMedia = tracks.size + selectedCollections.size
+            val activeFractions = java.util.concurrent.ConcurrentHashMap<String, Float>()
+            val lastProgressPost = java.util.concurrent.atomic.AtomicLong(0L)
+            fun publishMediaProgress(label: String, force: Boolean = false) {
+                val now = System.currentTimeMillis()
+                if (!force && now - lastProgressPost.get() < 120L) return
+                lastProgressPost.set(now)
+                val inFlight = activeFractions.values.sum()
+                val frac = if (totalMedia > 0) ((completed.get() + inFlight) / totalMedia).coerceIn(0f, 1f) else 1f
+                state.value = state.value.copy(stage = label, progress = frac)
+            }
+            if (totalMedia > 0) publishMediaProgress("Syncing audio 0/$totalMedia", force = true)
             val transferLimit = kotlinx.coroutines.sync.Semaphore(3)
             coroutineScope {
                 tracks.map { t ->
@@ -625,10 +649,20 @@ class SyncClient(private val g: Graph) {
                                             withContext(Dispatchers.Main) { g.engine.value?.updateTrack(restored) }
                                         }
                                         if (missingOnDesktop == null || t.hash in missingOnDesktop) {
-                                            bytes.addAndGet(upload(peer, http, t.hash, t.uri))
+                                            bytes.addAndGet(upload(peer, http, t.hash, t.uri, t.size) { done, total ->
+                                                if (total > 0) {
+                                                    activeFractions[t.id] = (done.toFloat() / total).coerceIn(0f, 1f)
+                                                    publishMediaProgress("Uploading ${t.title} · ${done / 1024} / ${total / 1024} KiB")
+                                                }
+                                            })
                                         }
                                     } else {
-                                        val file = download(peer, http, t.hash)
+                                        val file = download(peer, http, t.hash) { done, total ->
+                                            if (total > 0) {
+                                                activeFractions[t.id] = (done.toFloat() / total).coerceIn(0f, 1f)
+                                                publishMediaProgress("Downloading ${t.title} · ${done / 1024} / ${total / 1024} KiB")
+                                            }
+                                        }
                                         val wire =
                                             g.dao.replica(peer.id, "tracks", t.id)?.payload?.let {
                                                 JsonCodec.parseToJsonElement(it).jsonObject
@@ -700,14 +734,12 @@ class SyncClient(private val g: Graph) {
                                 throw e
                             } catch (e: Exception) {
                                 recordFailure("${t.title}: ${e.message ?: "Media transfer failed"}")
+                            } finally {
+                                activeFractions.remove(t.id)
                             }
                             val doneCount = completed.incrementAndGet()
-                            if (needsAudioCheck || needsArtCheck || doneCount == 1 || doneCount % 25 == 0 || doneCount == tracks.size) {
-                                state.value =
-                                    state.value.copy(
-                                        stage = "Syncing audio $doneCount/${tracks.size}: ${t.title}",
-                                        progress = if (tracks.isNotEmpty()) doneCount.toFloat() / tracks.size else 1f,
-                                    )
+                            if (needsAudioCheck || needsArtCheck || doneCount == 1 || doneCount % 10 == 0 || doneCount == totalMedia) {
+                                publishMediaProgress("Syncing audio $doneCount/$totalMedia: ${t.title}", force = doneCount == totalMedia)
                             }
                         } finally {
                             transferLimit.release()
@@ -740,11 +772,14 @@ class SyncClient(private val g: Graph) {
                                 g.dao.putCollection(c.copy(art = target.toURI().toString()))
                                 file.delete()
                             }
+                            val doneCount = completed.incrementAndGet()
+                            publishMediaProgress("Syncing artwork $doneCount/$totalMedia: ${c.name}", force = doneCount == totalMedia)
                         } catch (e: CancellationException) {
                             throw e
                         } catch (e: SyncPausedException) {
                             throw e
                         } catch (e: Exception) {
+                            completed.incrementAndGet()
                             recordFailure("${c.name} artwork: ${e.message}")
                         } finally {
                             transferLimit.release()
@@ -1011,7 +1046,8 @@ class SyncClient(private val g: Graph) {
     ): Set<String>? {
         if (hashes.isEmpty()) return emptySet()
         val missing = HashSet<String>()
-        for (chunk in hashes.chunked(2000)) {
+        var checked = 0
+        for (chunk in hashes.chunked(500)) {
             val response =
                 try {
                     exchange(
@@ -1029,11 +1065,23 @@ class SyncClient(private val g: Graph) {
                 }
             val array = response["missing"] as? JsonArray ?: return null
             for (item in array) missing += item.jsonPrimitive.content
+            checked += chunk.size
+            state.value = state.value.copy(
+                stage = "Checking synced media ($checked/${hashes.size})",
+                progress = (checked.toFloat() / hashes.size).coerceIn(0f, 1f),
+            )
         }
         return missing
     }
 
-    private suspend fun upload(peer: Peer, http: OkHttpClient, hash: String, uri: String): Long {
+    private suspend fun upload(
+        peer: Peer,
+        http: OkHttpClient,
+        hash: String,
+        uri: String,
+        expectedSize: Long = 0L,
+        onProgress: ((Long, Long) -> Unit)? = null,
+    ): Long {
         val exists = retrySyncNetwork(onRetry = ::showRetry) {
             syncResponse(http, request(peer, "HEAD", "/blobs/$hash")) {
                 when {
@@ -1113,6 +1161,7 @@ class SyncClient(private val g: Graph) {
                     require(next == offset + n) { "Desktop returned an invalid upload offset" }
                     offset = next
                     sent += n
+                    if (expectedSize > 0L) onProgress?.invoke(offset, expectedSize)
                     if (complete) return sent
                 }
             }
@@ -1125,8 +1174,12 @@ class SyncClient(private val g: Graph) {
         state.value = state.value.copy(stage = "Connection interrupted · retry $attempt/5")
     }
 
-    private suspend fun download(peer: Peer, http: OkHttpClient, hash: String): File {
-        val stage = state.value.stage.substringBefore(" · ")
+    private suspend fun download(
+        peer: Peer,
+        http: OkHttpClient,
+        hash: String,
+        onProgress: ((Long, Long) -> Unit)? = null,
+    ): File {
         return retrySyncNetwork(onRetry = ::showRetry) {
             downloadSyncBlob(
                 http,
@@ -1134,9 +1187,7 @@ class SyncClient(private val g: Graph) {
                 hash,
                 File(g.context.filesDir, "sync"),
             ) { done, total ->
-                state.value = state.value.copy(
-                    stage = "$stage · ${done / 1024} / ${total / 1024} KiB",
-                )
+                onProgress?.invoke(done, total)
             }
         }
     }
@@ -1149,14 +1200,22 @@ class SyncClient(private val g: Graph) {
         }
     }
 
-    private suspend fun receiveChanges(peer: Peer, http: OkHttpClient, initial: Long): Long {
+    private suspend fun receiveChanges(
+        peer: Peer,
+        http: OkHttpClient,
+        initial: Long,
+        reportProgress: Boolean = false,
+    ): Long {
         var cursor = initial
+        var received = 0
         do {
             val response = exchange(peer, http, "GET", "/changes?cursor=$cursor")
+            val latest = response["latest"]?.jsonPrimitive?.longOrNull ?: -1L
+            val pageChanges = response.getValue("changes").jsonArray
             val updates = mutableMapOf<String, Track>()
             val removals = mutableSetOf<String>()
             try {
-                for (chunk in response.getValue("changes").jsonArray.chunked(50)) {
+                for (chunk in pageChanges.chunked(50)) {
                     // reviews can perform a network exchange
                     // keep those outside a Room transaction, new records and non-track pages can commit together
                     val canBatch = chunk.none { value ->
@@ -1192,6 +1251,15 @@ class SyncClient(private val g: Graph) {
                         for (key in chunkUpdates.keys) removals.remove(key)
                         for (key in chunkRemovals) { updates.remove(key); removals += key }
                     } else applyChunk(false)
+                    received += chunk.size
+                    if (reportProgress && latest > initial) {
+                        val lastChunkRev = chunk.lastOrNull()?.jsonObject?.get("revision")?.jsonPrimitive?.longOrNull ?: cursor
+                        val frac = ((lastChunkRev - initial).toFloat() / (latest - initial)).coerceIn(0f, 1f)
+                        state.value = state.value.copy(
+                            stage = "Receiving library changes ($received)",
+                            progress = frac,
+                        )
+                    }
                 }
             } finally {
                 withContext(NonCancellable) { publishTrackChanges(updates, removals) }
@@ -1202,6 +1270,17 @@ class SyncClient(private val g: Graph) {
             }
             cursor = next
             g.dao.putPeer((g.dao.peers().firstOrNull { it.id == peer.id } ?: peer).copy(cursor = cursor))
+            if (reportProgress && (latest > initial || received > 0)) {
+                val frac = when {
+                    latest > initial -> ((cursor - initial).toFloat() / (latest - initial)).coerceIn(0f, 1f)
+                    !response.getValue("more").jsonPrimitive.boolean -> 1f
+                    else -> -1f
+                }
+                state.value = state.value.copy(
+                    stage = "Receiving library changes ($received)",
+                    progress = frac,
+                )
+            }
         } while (response.getValue("more").jsonPrimitive.boolean)
         acceptedChanges.clear()
         return cursor

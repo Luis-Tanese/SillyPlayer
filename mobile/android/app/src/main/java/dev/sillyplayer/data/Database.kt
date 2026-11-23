@@ -182,6 +182,11 @@ interface LibraryDao {
             WHEN 'counters' THEN 5 ELSE 6 END,o.created,o.opId LIMIT 100""")
     suspend fun syncBatch(peer: String): List<Outbox>
 
+    @Query("""SELECT COUNT(*) FROM outbox o WHERE (o.peer=:peer OR o.peer='')
+        AND NOT EXISTS(SELECT 1 FROM conflicts c WHERE c.peer=:peer
+            AND c.entity=o.entity AND c.`key`=o.`key`)""")
+    suspend fun syncPendingCount(peer: String): Int
+
     @Query(
         "SELECT * FROM outbox WHERE peer=:peer AND entity=:entity AND `key`=:key ORDER BY created LIMIT 1"
     )
