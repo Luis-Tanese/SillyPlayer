@@ -1,0 +1,26 @@
+/build*/
+/cmake-build-*/
+/.deps/
+/dist/
+/.idea/
+/qa/
+SillyCatProductionsBrandKit.zip
+*.user
+*.log
+.DS_Store
+Thumbs.db
+.env
+.env.*
+__pycache__/
+*~
+/mobile/android/.gradle/
+/mobile/android/.kotlin/
+/mobile/android/local.properties
+/mobile/android/**/build/
+/mobile/android/**/.cxx/
+
+# Signing keys
+*.keystore
+*.jks
+*.p12
+*.pfx

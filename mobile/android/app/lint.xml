@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<lint>
+    <!-- DSP and playback deliberately use Media3's advanced APIs. Keep the
+         opt-in limited to that marker; all other opt-in checks stay enabled. -->
+    <issue id="UnsafeOptInUsageError">
+        <option name="opt-in" value="androidx.media3.common.util.UnstableApi" />
+    </issue>
+</lint>

@@ -1,0 +1,31 @@
+--- a/libavformat/tls_openssl.c
++++ b/libavformat/tls_openssl.c
+@@ -313,6 +313,17 @@
+     bio->ptr = p;
+ #endif
+     SSL_set_bio(p->ssl, bio, bio);
++    /* SillyPlayer: verify both the trust chain and the requested host. */
++    if (c->verify && !c->listen) {
++        X509_VERIFY_PARAM *param = SSL_get0_param(p->ssl);
++        const int valid = c->numerichost
++            ? X509_VERIFY_PARAM_set1_ip_asc(param, c->host)
++            : SSL_set1_host(p->ssl, c->host);
++        if (valid != 1) {
++            ret = AVERROR(EINVAL);
++            goto fail;
++        }
++    }
+     if (!c->listen && !c->numerichost)
+         SSL_set_tlsext_host_name(p->ssl, c->host);
+     ret = c->listen ? SSL_accept(p->ssl) : SSL_connect(p->ssl);
+--- a/libavformat/aviobuf.c
++++ b/libavformat/aviobuf.c
+@@ -1039,7 +1039,7 @@
+ int ffio_copy_url_options(AVIOContext* pb, AVDictionary** avio_opts)
+ {
+     const char *opts[] = {
+-        "headers", "user_agent", "cookies", "http_proxy", "referer", "rw_timeout", "icy", NULL };
++        "headers", "user_agent", "cookies", "http_proxy", "referer", "rw_timeout", "icy", "tls_verify", "ca_file", NULL };
+     const char **opt = opts;
+     uint8_t *buf = NULL;
+     int ret = 0;
