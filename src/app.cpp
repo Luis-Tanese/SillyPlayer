@@ -158,8 +158,15 @@ App::App(Store *store, const QString &cacheDir, QObject *parent)
   saver.setInterval(15000);
   connect(&saver, &QTimer::timeout, this, &App::save);
   saver.start();
-  if (opts["updateNotifications"].toBool() && !qEnvironmentVariableIsSet("SILLYPLAYER_NO_UPDATE_CHECK")) {
-    QTimer::singleShot(3000, this, [this] { checkForUpdates(false); });
+  updateTimer.setInterval(2 * 60 * 60 * 1000);
+  connect(&updateTimer, &QTimer::timeout, this, [this] {
+    if (!closing && settings()["updateNotifications"].toBool())
+      checkForUpdates(false);
+  });
+  if (!qEnvironmentVariableIsSet("SILLYPLAYER_NO_UPDATE_CHECK")) {
+    updateTimer.start();
+    if (opts["updateNotifications"].toBool())
+      QTimer::singleShot(3000, this, [this] { checkForUpdates(false); });
   }
 }
 App::~App() { shutdown(); }
@@ -1376,6 +1383,7 @@ void App::shutdown() {
     return;
   closing = true;
   saver.stop();
+  updateTimer.stop();
   discord.shutdown();
   sync.shutdown();
   sleepTimer.cancel();

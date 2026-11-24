@@ -164,7 +164,7 @@ private:
   quint64 lastDiscordSeekGen = 0;
   void syncDiscordPresence(bool force = false);
   void removeTrashedFromQueue(const QStringList &tracks);
-  QTimer saver;
+  QTimer saver, updateTimer;
   void playIndex(int i, bool force = false, bool autoTransition = false);
   void advance(bool autoTransition);
   void rebuildShuffle();

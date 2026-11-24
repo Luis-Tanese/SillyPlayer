@@ -9,10 +9,10 @@ InstallDirRegKey HKCU "Software\SillyPlayer" "InstallDir"
 RequestExecutionLevel user
 SetCompressor /SOLID lzma
 SetCompressorDictSize 32
-VIProductVersion "1.2.1.0"
+VIProductVersion "1.2.2.0"
 VIAddVersionKey "ProductName" "SillyPlayer"
 VIAddVersionKey "FileDescription" "SillyPlayer installer"
-VIAddVersionKey "FileVersion" "1.2.1"
+VIAddVersionKey "FileVersion" "1.2.2"
 !define MUI_ICON "${PROJECT}\assets\sillyplayer.ico"
 !define MUI_UNICON "${PROJECT}\assets\sillyplayer.ico"
 !define MUI_ABORTWARNING

@@ -8,6 +8,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
+import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import dev.sillyplayer.BuildConfig
@@ -18,6 +19,7 @@ import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.booleanOrNull
@@ -63,18 +65,33 @@ class UpdateChecker(private val g: Graph) {
             .readTimeout(10, TimeUnit.SECONDS)
             .build()
 
+    @Volatile private var lastCheckAt = 0L
+
     init {
         g.scope.launch {
-            val prefs = g.prefs.loaded.await()
-            if (prefs.updateNotifications) {
-                delay(3000)
-                check(manual = false)
+            g.prefs.loaded.await()
+            delay(3000)
+            while (isActive) {
+                if (g.prefs.state.value.updateNotifications) {
+                    check(manual = false)
+                }
+                delay(CHECK_INTERVAL_MS)
+            }
+        }
+        g.scope.launch {
+            g.prefs.loaded.await()
+            g.foreground.collect { visible ->
+                if (!visible || !g.prefs.state.value.updateNotifications) return@collect
+                if (lastCheckAt > 0L && SystemClock.elapsedRealtime() - lastCheckAt >= CHECK_INTERVAL_MS) {
+                    check(manual = false)
+                }
             }
         }
     }
 
     suspend fun check(manual: Boolean = false) {
         if (state.value.checking) return
+        lastCheckAt = SystemClock.elapsedRealtime()
         state.value = state.value.copy(checking = true, status = if (manual) "Checking for updates…" else state.value.status)
         try {
             val request =
@@ -179,5 +196,6 @@ class UpdateChecker(private val g: Graph) {
         const val RELEASES_PAGE = "https://github.com/Luis-Tanese/SillyPlayer/releases"
         private const val CHANNEL_ID = "sillyplayer_updates"
         private const val NOTIFICATION_ID = 43820
+        private const val CHECK_INTERVAL_MS = 2L * 60L * 60L * 1000L
     }
 }
