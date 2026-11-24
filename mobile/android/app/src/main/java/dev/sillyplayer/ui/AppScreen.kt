@@ -57,6 +57,8 @@ fun AppScreen(g: Graph, pickers: Pickers) {
     val notice by g.message.collectAsStateWithLifecycle()
     val pairing by g.sync.pendingLink.collectAsStateWithLifecycle()
     val openPlayer by g.openPlayer.collectAsStateWithLifecycle()
+    val update by g.updates.state.collectAsStateWithLifecycle()
+    var updateBannerDismissed by rememberSaveable { mutableStateOf(false) }
     LaunchedEffect(openPlayer, playback.music) {
         if (openPlayer) {
             page = "Music"
@@ -103,39 +105,57 @@ fun AppScreen(g: Graph, pickers: Pickers) {
                     containerColor = MaterialTheme.colorScheme.background,
                     snackbarHost = { SnackbarHost(snackbar) },
                     topBar = {
-                        Row(
-                            Modifier.fillMaxWidth()
-                                .statusBarsPadding()
-                                .padding(horizontal = 12.dp, vertical = 3.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Image(
-                                painterResource(R.drawable.sillyplayer),
-                                "SillyPlayer",
-                                Modifier.size(34.dp),
-                            )
-                            Spacer(Modifier.width(8.dp))
-                            Text(
-                                if (expanded) "Music"
-                                else if (page == "Settings") "Settings" else "SillyPlayer",
-                                Modifier.weight(1f),
-                                fontSize = 17.sp,
-                            )
-                            if (wide)
-                                TextButton({
+                        Column(Modifier.fillMaxWidth().statusBarsPadding()) {
+                            Row(
+                                Modifier.fillMaxWidth()
+                                    .padding(horizontal = 12.dp, vertical = 3.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Image(
+                                    painterResource(R.drawable.sillyplayer),
+                                    "SillyPlayer",
+                                    Modifier.size(34.dp),
+                                )
+                                Spacer(Modifier.width(8.dp))
+                                Text(
+                                    if (expanded) "Music"
+                                    else if (page == "Settings") "Settings" else "SillyPlayer",
+                                    Modifier.weight(1f),
+                                    fontSize = 17.sp,
+                                )
+                                if (wide)
+                                    TextButton({
+                                        expanded = false
+                                        page = "Split"
+                                    }) {
+                                        Text(
+                                            "Split",
+                                            color =
+                                                if (page == "Split") MaterialTheme.colorScheme.primary
+                                                else MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                    }
+                                IconAction("settings", "Settings") {
                                     expanded = false
-                                    page = "Split"
-                                }) {
-                                    Text(
-                                        "Split",
-                                        color =
-                                            if (page == "Split") MaterialTheme.colorScheme.primary
-                                            else MaterialTheme.colorScheme.onSurfaceVariant,
-                                    )
+                                    page = "Settings"
                                 }
-                            IconAction("settings", "Settings") {
-                                expanded = false
-                                page = "Settings"
+                            }
+                            if (update.updateAvailable && prefs.updateNotifications && !updateBannerDismissed && !expanded) {
+                                Row(
+                                    Modifier.fillMaxWidth()
+                                        .background(MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.35f))
+                                        .padding(start = 14.dp, end = 4.dp, top = 2.dp, bottom = 2.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Text(
+                                        "SillyPlayer v${update.latestVersion} is available",
+                                        Modifier.weight(1f),
+                                        fontSize = 12.sp,
+                                        color = MaterialTheme.colorScheme.onSurface,
+                                    )
+                                    Action("View", "external-link") { g.updates.openReleasePage() }
+                                    IconAction("x", "Dismiss") { updateBannerDismissed = true }
+                                }
                             }
                         }
                     },

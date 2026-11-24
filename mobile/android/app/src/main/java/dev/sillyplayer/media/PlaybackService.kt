@@ -34,12 +34,12 @@ class PlaybackService : MediaLibraryService() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
     private fun buildNotificationButtons(liked: Boolean, mode: Int): ImmutableList<CommandButton> {
+        // use Media3's built-in notification icons so SystemUI doesn't scale up full-bleed stroke vectors
         val likeButton =
             CommandButton.Builder(
                 if (liked) CommandButton.ICON_HEART_FILLED else CommandButton.ICON_HEART_UNFILLED
             )
                 .setDisplayName(if (liked) "Unlike" else "Like")
-                .setCustomIconResId(if (liked) R.drawable.ic_heart_filled else R.drawable.ic_heart)
                 .setSessionCommand(SessionCommand(ACTION_TOGGLE_LIKE, Bundle.EMPTY))
                 .setSlots(CommandButton.SLOT_OVERFLOW, CommandButton.SLOT_BACK_SECONDARY)
                 .build()
@@ -56,13 +56,6 @@ class PlaybackService : MediaLibraryService() {
                         1 -> "Repeat one"
                         2 -> "Shuffle"
                         else -> "Repeat queue"
-                    }
-                )
-                .setCustomIconResId(
-                    when (mode) {
-                        1 -> R.drawable.ic_repeat_1
-                        2 -> R.drawable.ic_shuffle
-                        else -> R.drawable.ic_repeat
                     }
                 )
                 .setSessionCommand(SessionCommand(ACTION_CYCLE_MODE, Bundle.EMPTY))

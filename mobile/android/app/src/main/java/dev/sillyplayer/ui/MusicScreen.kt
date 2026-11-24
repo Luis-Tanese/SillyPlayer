@@ -4,11 +4,14 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.*
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.*
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.input.key.*
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -47,9 +50,13 @@ fun MusicScreen(
     val recent by recentSource.collectAsStateWithLifecycle(emptyList())
     var query by rememberSaveable { mutableStateOf("") }
     var sort by rememberSaveable { mutableStateOf("Recently added") }
+    var sortAsc by rememberSaveable { mutableStateOf(false) }
+    var artistSort by rememberSaveable { mutableStateOf("Name") }
+    var artistSortAsc by rememberSaveable { mutableStateOf(true) }
     var albumType by rememberSaveable { mutableStateOf("Generated") }
     var selecting by rememberSaveable { mutableStateOf(false) }
     var selected by rememberSaveable { mutableStateOf(listOf<String>()) }
+    var moreSelectionMenu by remember { mutableStateOf(false) }
     var editing by rememberSaveable { mutableStateOf(false) }
     var create by remember { mutableStateOf(false) }
     var name by remember { mutableStateOf("") }
@@ -86,7 +93,7 @@ fun MusicScreen(
     BackHandler(selecting || collectionId.isNotEmpty()) {
         if (selecting) closeSelection() else open("", "")
     }
-    val orderedRows by produceState<List<SongRow>>(emptyList(), tracks, members, likes, recent, collectionId, sort) {
+    val orderedRows by produceState<List<SongRow>>(emptyList(), tracks, members, likes, recent, collectionId, sort, sortAsc) {
         value = withContext(Dispatchers.Default) {
             val values: List<SongRow> =
                 when {
@@ -125,10 +132,17 @@ fun MusicScreen(
                 if (collectionId.isNotBlank()) values
                 else
                     when (sort) {
-                        "Title" -> values.sortedBy { it.track.title.lowercase() }
-                        "Artist" -> values.sortedBy { it.track.artist.lowercase() }
-                        "Duration" -> values.sortedBy { it.track.duration }
-                        else -> values
+                        "Title" ->
+                            if (sortAsc) values.sortedBy { it.track.title.lowercase(Locale.ROOT) }
+                            else values.sortedByDescending { it.track.title.lowercase(Locale.ROOT) }
+                        "Artist" ->
+                            if (sortAsc) values.sortedBy { it.track.artist.lowercase(Locale.ROOT) }
+                            else values.sortedByDescending { it.track.artist.lowercase(Locale.ROOT) }
+                        "Duration" ->
+                            if (sortAsc) values.sortedBy { it.track.duration }
+                            else values.sortedByDescending { it.track.duration }
+                        else ->
+                            if (sortAsc) values.reversed() else values
                     }
             ordered
         }
@@ -174,19 +188,41 @@ fun MusicScreen(
                 Action("Choose folder", "folder") { pickers.folder("destination") }
             }
         if (prefs.musicDir.isBlank()) PermissionNotice(pickers, compact = true)
-        Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())) {
-            for (item in listOf("Songs", "Playlists", "Artists", "Albums")) TextButton(
-                onClick = {
-                    tab = item
-                    open("", "")
+        Row(
+            Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 8.dp),
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            for (item in listOf("Songs", "Playlists", "Artists", "Albums")) {
+                val active = tab == item
+                Column(
+                    Modifier
+                        .clip(RoundedCornerShape(8.dp))
+                        .clickable {
+                            tab = item
+                            open("", "")
+                        }
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    Text(
+                        item,
+                        fontSize = 14.sp,
+                        fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
+                        color =
+                            if (active) MaterialTheme.colorScheme.primary
+                            else MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Box(
+                        Modifier.width(24.dp)
+                            .height(2.dp)
+                            .clip(RoundedCornerShape(1.dp))
+                            .background(
+                                if (active) MaterialTheme.colorScheme.primary
+                                else androidx.compose.ui.graphics.Color.Transparent
+                            )
+                    )
                 }
-            ) {
-                Text(
-                    item,
-                    color =
-                        if (tab == item) MaterialTheme.colorScheme.primary
-                        else MaterialTheme.colorScheme.onSurfaceVariant,
-                )
             }
         }
         if (collectionId.isNotBlank())
@@ -214,80 +250,170 @@ fun MusicScreen(
                 }
             }
         if (tab == "Albums" && collectionId.isBlank())
-            Row {
+            Row(Modifier.padding(horizontal = 12.dp, vertical = 2.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 Action("Generated", enabled = albumType != "Generated") { albumType = "Generated" }
                 Action("Custom", enabled = albumType != "Custom") { albumType = "Custom" }
             }
-        Input(
-            query,
-            { query = it },
-            if (showingSongs) "Search songs" else "Find $tab",
-            Modifier.padding(horizontal = 12.dp),
-            "search",
+        SearchBarField(
+            value = query,
+            onChange = { query = it },
+            placeholder = if (showingSongs) "Search songs" else "Find ${tab.lowercase(Locale.ROOT)}",
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
         )
         if (showingSongs) {
-            FlowRow(
-                Modifier.fillMaxWidth().padding(horizontal = 7.dp),
-                verticalArrangement = Arrangement.Center,
-            ) {
-                if (collections.any { it.id == collectionId && it.kind in listOf("playlist", "custom") })
-                    Action("Add songs", "plus") { showSongPicker = true }
-                if (!selecting)
-                    Action("Select songs", "list-checks", rows.isNotEmpty()) { selecting = true }
-                else {
-                    Action(if (all) "Deselect all" else "Select all") {
-                        selected = if (all) emptyList() else rows.map { it.key }
+            if (!selecting) {
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    if (collections.any { it.id == collectionId && it.kind in listOf("playlist", "custom") }) {
+                        Action("Add", "plus") { showSongPicker = true }
                     }
-                    Action("Clear", "x") { closeSelection() }
-                }
-                if (collectionId.isBlank())
-                    PickMenu(sort, listOf("Recently added", "Title", "Artist", "Duration")) {
-                        sort = it
-                    }
-            }
-            if (selecting)
-                FlowRow(Modifier.fillMaxWidth().padding(horizontal = 7.dp)) {
-                    Action("Queue", "list-music", chosen.isNotEmpty()) {
-                        g.engine.value?.addQueue(chosen.map { it.track }, false)
-                    }
-                    Action("Play next", "skip-forward", chosen.isNotEmpty()) {
-                        g.engine.value?.addQueue(chosen.map { it.track }, true)
-                    }
-                    Action("Add to playlist", "plus", chosen.isNotEmpty()) { addTo = true }
-                    Action("Edit tags", "pencil", chosen.isNotEmpty()) {
-                        batchArtist = ""
-                        batchAlbum = ""
-                        batchAlbumArtist = ""
-                        batchCover = ""
-                        batchEdit = true
-                    }
-                    Action("Clean titles", "check", chosen.isNotEmpty()) {
-                        val preview =
-                            chosen
-                                .distinctBy { it.track.id }
-                                .mapNotNull { row ->
-                                    val cleaned = cleanSongTitle(row.track.title)
-                                    if (cleaned != row.track.title)
-                                        Triple(row.track.id, row.track.title, cleaned)
-                                    else null
+                    Action("Select", "list-checks", rows.isNotEmpty()) { selecting = true }
+                    Spacer(Modifier.weight(1f))
+                    if (collectionId.isBlank()) {
+                        SortControl(
+                            value = sort,
+                            ascending = sortAsc,
+                            options = listOf("Recently added", "Title", "Artist", "Duration"),
+                            onPick = { picked ->
+                                if (picked == sort) {
+                                    sortAsc = !sortAsc
+                                } else {
+                                    sort = picked
+                                    sortAsc = picked == "Title" || picked == "Artist"
                                 }
-                        if (preview.isEmpty()) {
-                            g.message.value = "All selected titles are already clean"
-                        } else {
-                            cleanPreview = preview
+                            },
+                            onToggleDirection = { sortAsc = !sortAsc },
+                        )
+                    }
+                }
+            } else {
+                Surface(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+                    shape = RoundedCornerShape(14.dp),
+                    color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                ) {
+                    Row(
+                        Modifier.fillMaxWidth().padding(start = 2.dp, end = 6.dp, top = 2.dp, bottom = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        IconAction("x", "Exit selection") { closeSelection() }
+                        Text(
+                            "${chosen.size} selected",
+                            Modifier.weight(1f),
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Medium,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Action(
+                            if (all) "Deselect all" else "Select all",
+                            enabled = rows.isNotEmpty(),
+                        ) {
+                            selected = if (all) emptyList() else rows.map { it.key }
+                        }
+                        Box {
+                            Action(
+                                "Actions",
+                                "ellipsis",
+                                enabled = chosen.isNotEmpty(),
+                            ) {
+                                moreSelectionMenu = true
+                            }
+                            DropdownMenu(moreSelectionMenu, { moreSelectionMenu = false }) {
+                                DropdownMenuItem(
+                                    text = { Text("Play next") },
+                                    leadingIcon = { Glyph("skip-forward") },
+                                    onClick = {
+                                        moreSelectionMenu = false
+                                        g.engine.value?.addQueue(chosen.map { it.track }, true)
+                                        g.message.value = "Added ${chosen.size} to play next"
+                                        closeSelection()
+                                    },
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Add to queue") },
+                                    leadingIcon = { Glyph("list-music") },
+                                    onClick = {
+                                        moreSelectionMenu = false
+                                        g.engine.value?.addQueue(chosen.map { it.track }, false)
+                                        g.message.value = "Added ${chosen.size} to queue"
+                                        closeSelection()
+                                    },
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Add to playlist") },
+                                    leadingIcon = { Glyph("plus") },
+                                    onClick = {
+                                        moreSelectionMenu = false
+                                        addTo = true
+                                    },
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Edit tags") },
+                                    leadingIcon = { Glyph("pencil") },
+                                    onClick = {
+                                        moreSelectionMenu = false
+                                        batchArtist = ""
+                                        batchAlbum = ""
+                                        batchAlbumArtist = ""
+                                        batchCover = ""
+                                        batchEdit = true
+                                    },
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Clean titles") },
+                                    leadingIcon = { Glyph("check") },
+                                    onClick = {
+                                        moreSelectionMenu = false
+                                        val preview =
+                                            chosen
+                                                .distinctBy { it.track.id }
+                                                .mapNotNull { row ->
+                                                    val cleaned = cleanSongTitle(row.track.title)
+                                                    if (cleaned != row.track.title)
+                                                        Triple(row.track.id, row.track.title, cleaned)
+                                                    else null
+                                                }
+                                        if (preview.isEmpty()) {
+                                            g.message.value = "All selected titles are already clean"
+                                        } else {
+                                            cleanPreview = preview
+                                        }
+                                    },
+                                )
+                                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                                if (collectionId.isNotBlank() && chosen.any { it.member != null }) {
+                                    DropdownMenuItem(
+                                        text = { Text("Remove from playlist") },
+                                        leadingIcon = { Glyph("x") },
+                                        onClick = {
+                                            moreSelectionMenu = false
+                                            g.task {
+                                                chosen
+                                                    .mapNotNull { it.member }
+                                                    .forEach { g.library.removeMember(it.id) }
+                                            }
+                                            closeSelection()
+                                        },
+                                    )
+                                }
+                                DropdownMenuItem(
+                                    text = { Text("Move to Trash", color = MaterialTheme.colorScheme.error) },
+                                    leadingIcon = { Glyph("trash-2", tint = MaterialTheme.colorScheme.error) },
+                                    onClick = {
+                                        moreSelectionMenu = false
+                                        trash = true
+                                    },
+                                )
+                            }
                         }
                     }
-                    if (collectionId.isNotBlank() && chosen.any { it.member != null })
-                        Action("Remove", "x", chosen.isNotEmpty()) {
-                            g.task {
-                                chosen
-                                    .mapNotNull { it.member }
-                                    .forEach { g.library.removeMember(it.id) }
-                            }
-                            closeSelection()
-                        }
-                    Action("Trash", "trash-2", chosen.isNotEmpty()) { trash = true }
                 }
+            }
             val canDragReorder = editing && query.isBlank() && collectionId.isNotBlank() && collections.any { it.id == collectionId }
             var liveOrder by remember(rows, canDragReorder) { mutableStateOf(rows) }
             val displayedRows = if (canDragReorder) liveOrder else rows
@@ -373,7 +499,7 @@ fun MusicScreen(
             }
         } else {
             val groups by produceState<List<Triple<String, String, List<Track>>>>(
-                emptyList(), tab, albumType, tracks, membersByCollection, collections, likes, recent) {
+                emptyList(), tab, albumType, tracks, membersByCollection, collections, likes, recent, artistSort, artistSortAsc) {
                 value = withContext(Dispatchers.Default) {
                 when (tab) {
                     "Artists" -> {
@@ -385,9 +511,18 @@ fun MusicScreen(
                                 entry.second += track
                             }
                         }
-                        buckets
-                            .map { (key, entry) -> Triple("artist:$key", entry.first, entry.second.toList()) }
-                            .sortedBy { it.second.lowercase(Locale.ROOT) }
+                        val listItems =
+                            buckets.map { (key, entry) ->
+                                Triple("artist:$key", entry.first, entry.second.toList())
+                            }
+                        when (artistSort) {
+                            "Songs" ->
+                                if (artistSortAsc) listItems.sortedWith(compareBy<Triple<String, String, List<Track>>> { it.third.size }.thenBy { it.second.lowercase(Locale.ROOT) })
+                                else listItems.sortedWith(compareByDescending<Triple<String, String, List<Track>>> { it.third.size }.thenBy { it.second.lowercase(Locale.ROOT) })
+                            else ->
+                                if (artistSortAsc) listItems.sortedBy { it.second.lowercase(Locale.ROOT) }
+                                else listItems.sortedByDescending { it.second.lowercase(Locale.ROOT) }
+                        }
                     }
                     "Albums" ->
                         if (albumType == "Custom")
@@ -434,6 +569,33 @@ fun MusicScreen(
                 }
                 }
             }
+            if (tab == "Artists") {
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        "${groups.size} artists",
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.weight(1f))
+                    SortControl(
+                        value = artistSort,
+                        ascending = artistSortAsc,
+                        options = listOf("Name", "Songs"),
+                        onPick = { picked ->
+                            if (picked == artistSort) {
+                                artistSortAsc = !artistSortAsc
+                            } else {
+                                artistSort = picked
+                                artistSortAsc = picked == "Name"
+                            }
+                        },
+                        onToggleDirection = { artistSortAsc = !artistSortAsc },
+                    )
+                }
+            }
             LazyColumn(Modifier.weight(1f), state = list) {
                 if (tab == "Playlists" || tab == "Albums" && albumType == "Custom")
                     item {
@@ -443,16 +605,23 @@ fun MusicScreen(
                                     name = ""
                                     create = true
                                 }
-                                .padding(horizontal = 12.dp, vertical = 12.dp),
+                                .padding(horizontal = 12.dp, vertical = 10.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
-                            Box(Modifier.size(44.dp), contentAlignment = Alignment.Center) {
-                                Glyph("plus")
+                            Box(
+                                Modifier.size(44.dp)
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(MaterialTheme.colorScheme.surfaceContainerHigh)
+                                    .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(12.dp)),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Glyph("plus", tint = MaterialTheme.colorScheme.primary)
                             }
                             Spacer(Modifier.width(12.dp))
                             Text(
                                 if (tab == "Playlists") "New Playlist" else "New Album",
                                 fontSize = 14.sp,
+                                fontWeight = FontWeight.Medium,
                             )
                         }
                     }
@@ -461,15 +630,21 @@ fun MusicScreen(
                         Row(
                             Modifier.fillMaxWidth()
                                 .clickable { pickers.importPlaylist() }
-                                .padding(horizontal = 12.dp, vertical = 12.dp),
+                                .padding(horizontal = 12.dp, vertical = 10.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
-                            Box(Modifier.size(44.dp), contentAlignment = Alignment.Center) {
-                                Glyph("download")
+                            Box(
+                                Modifier.size(44.dp)
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(MaterialTheme.colorScheme.surfaceContainerHigh)
+                                    .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(12.dp)),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Glyph("download", tint = MaterialTheme.colorScheme.primary)
                             }
                             Spacer(Modifier.width(12.dp))
                             Column(Modifier.weight(1f)) {
-                                Text("Import Playlist (.m3u / .m3u8)", fontSize = 14.sp)
+                                Text("Import Playlist (.m3u / .m3u8)", fontSize = 14.sp, fontWeight = FontWeight.Medium)
                                 Text(
                                     "Match songs from your library",
                                     fontSize = 12.sp,

@@ -17,6 +17,9 @@
 #include <QFileDialog>
 #include <QImage>
 #include <QJsonDocument>
+#include <QJsonObject>
+#include <QNetworkReply>
+#include <QNetworkRequest>
 #include <QRandomGenerator>
 #include <QStandardPaths>
 #include <QUrl>
@@ -152,6 +155,9 @@ App::App(Store *store, const QString &cacheDir, QObject *parent)
   saver.setInterval(15000);
   connect(&saver, &QTimer::timeout, this, &App::save);
   saver.start();
+  if (opts["updateNotifications"].toBool() && !qEnvironmentVariableIsSet("SILLYPLAYER_NO_UPDATE_CHECK")) {
+    QTimer::singleShot(3000, this, [this] { checkForUpdates(false); });
+  }
 }
 App::~App() { shutdown(); }
 QVariantMap App::settings() const {
@@ -175,6 +181,8 @@ QVariantMap App::settings() const {
       {"windowMaximized", false},
       {"lastPage", "Music"},
       {"discordRpcEnabled", true},
+      {"updateNotifications", true},
+      {"lastNotifiedUpdate", ""},
       {"musicDir",
        QStandardPaths::writableLocation(QStandardPaths::MusicLocation) +
            "/SillyPlayer"}};
@@ -200,6 +208,97 @@ void App::setSetting(const QString &key, const QVariant &value) {
     syncDiscordPresence(true);
   }
   emit settingsChanged();
+}
+
+static QList<int> parseSemverParts(const QString &tag) {
+  auto clean = tag.trimmed();
+  if (clean.startsWith('v', Qt::CaseInsensitive)) clean.remove(0, 1);
+  const int dash = clean.indexOf('-');
+  if (dash >= 0) clean = clean.left(dash);
+  if (clean.isEmpty()) return {};
+  QList<int> out;
+  for (const auto &piece : clean.split('.')) {
+    bool ok = false;
+    const int n = piece.toInt(&ok);
+    if (!ok) return {};
+    out << n;
+  }
+  return out;
+}
+
+static bool isNewerReleaseVersion(const QString &latestTag, const QString &currentVersion) {
+  const auto latest = parseSemverParts(latestTag);
+  const auto current = parseSemverParts(currentVersion);
+  if (latest.isEmpty() || current.isEmpty()) return false;
+  const int len = std::max(latest.size(), current.size());
+  for (int i = 0; i < len; ++i) {
+    const int a = i < latest.size() ? latest[i] : 0;
+    const int b = i < current.size() ? current[i] : 0;
+    if (a != b) return a > b;
+  }
+  return false;
+}
+
+void App::checkForUpdates(bool manual) {
+  if (m_updateInfo.value("checking").toBool()) return;
+  m_updateInfo["checking"] = true;
+  if (manual) m_updateInfo["status"] = "Checking for updates…";
+  emit updateChanged();
+  QNetworkRequest req(QUrl("https://api.github.com/repos/Luis-Tanese/SillyPlayer/releases/latest"));
+  req.setRawHeader("Accept", "application/vnd.github+json");
+  req.setRawHeader("User-Agent", QByteArray("SillyPlayer/") + QByteArray(SILLYPLAYER_VERSION));
+  req.setTransferTimeout(10000);
+  auto *reply = updateNet.get(req);
+  connect(reply, &QNetworkReply::finished, this, [this, reply, manual] {
+    reply->deleteLater();
+    if (closing) return;
+    m_updateInfo["checking"] = false;
+    if (reply->error() != QNetworkReply::NoError) {
+      if (manual) m_updateInfo["status"] = "Could not check for updates: " + reply->errorString();
+      emit updateChanged();
+      return;
+    }
+    const auto doc = QJsonDocument::fromJson(reply->readAll());
+    const auto obj = doc.object();
+    if (obj.value("draft").toBool() || obj.value("prerelease").toBool()) {
+      m_updateInfo["available"] = false;
+      if (manual) m_updateInfo["status"] = QString("You're on the latest version (v%1)").arg(SILLYPLAYER_VERSION);
+      emit updateChanged();
+      return;
+    }
+    const QString tag = obj.value("tag_name").toString();
+    QString url = obj.value("html_url").toString();
+    if (!url.startsWith("https://github.com/"))
+      url = "https://github.com/Luis-Tanese/SillyPlayer/releases";
+    QString clean = tag;
+    if (clean.startsWith('v', Qt::CaseInsensitive)) clean.remove(0, 1);
+    if (isNewerReleaseVersion(tag, SILLYPLAYER_VERSION)) {
+      m_updateInfo["available"] = true;
+      m_updateInfo["version"] = clean;
+      m_updateInfo["url"] = url;
+      m_updateInfo["status"] = QString("Version %1 is available").arg(clean);
+      emit updateChanged();
+      const auto opts = settings();
+      if (!manual && opts["updateNotifications"].toBool() &&
+          opts["lastNotifiedUpdate"].toString() != clean) {
+        s->setSetting("lastNotifiedUpdate", clean);
+        emit updateAvailable(clean, url);
+      }
+    } else {
+      m_updateInfo["available"] = false;
+      m_updateInfo["version"] = clean;
+      m_updateInfo["url"] = url;
+      if (manual) m_updateInfo["status"] = QString("You're on the latest version (v%1)").arg(SILLYPLAYER_VERSION);
+      emit updateChanged();
+    }
+  });
+}
+
+void App::openReleasePage() {
+  QString url = m_updateInfo.value("url").toString();
+  if (!url.startsWith("https://github.com/"))
+    url = "https://github.com/Luis-Tanese/SillyPlayer/releases";
+  QDesktopServices::openUrl(QUrl(url));
 }
 QVariantMap App::current() const {
   const auto id=index>=0&&index<entries.size()?entries[index].toMap().value("trackId").toString():QString();

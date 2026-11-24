@@ -4,6 +4,7 @@
 /dist/
 /.idea/
 /qa/
+/testing/
 SillyCatProductionsBrandKit.zip
 *.user
 *.log

@@ -16,10 +16,10 @@ TextField {
     selectByMouse: true
     font.pixelSize: 13
     background: Rectangle {
-        radius: 8
+        radius: field.search ? 12 : 8
         color: Theme.surface
         border.width: 1
-        border.color: field.activeFocus ? Qt.alpha(Theme.accent, 0.65) : Theme.separator
+        border.color: field.activeFocus ? Qt.alpha(Theme.accent, 0.72) : field.hovered ? Qt.alpha(Theme.accent, 0.3) : Theme.separator
     }
     FlatButton {
         visible: field.search

@@ -229,6 +229,8 @@ data class Preferences(
     val musicDir: String = "",
     val queue: QueueState = QueueState(),
     val sleepEnd: Long = 0,
+    val updateNotifications: Boolean = true,
+    val lastNotifiedVersion: String = "",
 )
 
 @Serializable

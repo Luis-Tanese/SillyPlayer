@@ -452,6 +452,31 @@ fun SettingsScreen(g: Graph, pickers: Pickers) {
         }
         if (category == "Phone sync") SyncSettings(g, pickers)
         if (category == "About") {
+            val update by g.updates.state.collectAsStateWithLifecycle()
+            SettingsCard("Updates", "Check GitHub releases for newer versions. Updates are never downloaded automatically.") {
+                Choice("Notify about updates", prefs.updateNotifications) { enabled ->
+                    g.task { g.prefs.update { it.copy(updateNotifications = enabled) } }
+                }
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    SettingsAction(
+                        if (update.checking) "Checking…" else "Check for updates",
+                        "rotate-ccw",
+                        !update.checking,
+                        primary = !update.updateAvailable,
+                    ) {
+                        g.task { g.updates.check(manual = true) }
+                    }
+                    if (update.updateAvailable) {
+                        SettingsAction("View v${update.latestVersion}", "external-link", primary = true) {
+                            g.updates.openReleasePage()
+                        }
+                    }
+                }
+                if (update.status.isNotBlank()) Hint(update.status)
+            }
             SettingsCard("SillyPlayer ${dev.sillyplayer.BuildConfig.VERSION_NAME}", "Silly Cat Productions") {
                 SettingsAction("Third-party licenses", "info") { licenses = true }
                 HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)

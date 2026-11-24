@@ -542,6 +542,64 @@ Item {
             }
             Rectangle {
                 Layout.fillWidth: true
+                implicitHeight: updateCard.implicitHeight + 36
+                radius: 10
+                color: Theme.surface
+                border.width: 1
+                border.color: Theme.separator
+                ColumnLayout {
+                    id: updateCard
+                    anchors.fill: parent
+                    anchors.margins: 18
+                    spacing: 12
+                    Label {
+                        text: "Updates"
+                        color: Theme.text
+                        font.pixelSize: 15
+                        font.weight: Font.Medium
+                    }
+                    Label {
+                        text: "Checks GitHub releases for newer versions. Updates are never downloaded automatically."
+                        color: Theme.muted
+                        font.pixelSize: 12
+                        wrapMode: Text.WordWrap
+                        Layout.fillWidth: true
+                    }
+                    AppCheck {
+                        text: "Notify about updates"
+                        checked: app.settings.updateNotifications !== false
+                        onToggled: app.setSetting("updateNotifications", checked)
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 10
+                        FlatButton {
+                            text: app.updateInfo.checking ? "Checking…" : "Check for updates"
+                            glyph: "rotate-ccw"
+                            outlined: true
+                            enabled: !app.updateInfo.checking
+                            onClicked: app.checkForUpdates(true)
+                        }
+                        FlatButton {
+                            visible: !!app.updateInfo.available
+                            text: "View v" + (app.updateInfo.version || "")
+                            glyph: "external-link"
+                            primary: true
+                            onClicked: app.openReleasePage()
+                        }
+                    }
+                    Label {
+                        visible: !!(app.updateInfo.status)
+                        text: app.updateInfo.status || ""
+                        color: app.updateInfo.available ? Theme.accent : Theme.muted
+                        font.pixelSize: 12
+                        wrapMode: Text.WordWrap
+                        Layout.fillWidth: true
+                    }
+                }
+            }
+            Rectangle {
+                Layout.fillWidth: true
                 implicitHeight: aboutCard.implicitHeight + 40
                 radius: 10
                 color: Theme.surface

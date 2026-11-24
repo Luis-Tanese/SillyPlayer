@@ -12,6 +12,9 @@ Item {
     property string collectionId: ""
     property string collectionName: ""
     property bool editMode: false
+    property bool songSortAsc: false
+    property int artistSortIndex: 0
+    property bool artistSortAsc: true
     property var selectedCollection: {
         let observed = revision;
         return collectionId ? app.collections.find(c => c.id === collectionId) || ({}) : ({});
@@ -98,7 +101,7 @@ Item {
     BulkActions { id: bulkActions; pane: pane; shell: pane.shell }
     function bulkAction(action) { bulkActions.run(action); }
     function focusSearch() {
-        if (tab === "Playlists" && !collectionId) {
+        if (tab !== "Songs" && !collectionId) {
             collectionFilter.forceActiveFocus();
             collectionFilter.selectAll();
         } else {
@@ -124,11 +127,18 @@ Item {
     Timer { id: searchDelay; interval: 120; onTriggered: pane.appliedQuery = filter.text.toLowerCase() }
     property var orderedTracks: {
         let observed = revision;
+        let dir = songSortAsc ? 1 : -1;
         let list = (collectionId ? app.collectionTracks(collectionId) : library.tracks).slice();
-        if (!collectionId && sort.currentIndex === 1)
-            list.sort((a, b) => a.title.localeCompare(b.title));
-        if (!collectionId && sort.currentIndex === 2)
-            list.sort((a, b) => a.artist.localeCompare(b.artist));
+        if (!collectionId) {
+            if (sort.currentIndex === 1)
+                list.sort((a, b) => dir * (a.title || "").localeCompare(b.title || ""));
+            else if (sort.currentIndex === 2)
+                list.sort((a, b) => dir * (a.artist || "").localeCompare(b.artist || ""));
+            else if (sort.currentIndex === 3)
+                list.sort((a, b) => dir * ((a.duration || 0) - (b.duration || 0)));
+            else if (songSortAsc)
+                list.reverse();
+        }
         // keep a plain JS snapshot so field patches remain available when a later search/sort rebuilds the view, without invalidating that view now
         return list.map(row => Object.assign({},row));
     }
@@ -137,7 +147,15 @@ Item {
     property var visibleCollections: {
         let observed = revision;
         if(tab === "Songs" || collectionId)return [];
-        return app.collections.filter(c => tab === "Playlists" ? c.kind === "playlist" : c.kind === (tab === "Artists" ? "artist" : albumView === "Generated" ? "generated" : "custom"));
+        let list = app.collections.filter(c => tab === "Playlists" ? c.kind === "playlist" : c.kind === (tab === "Artists" ? "artist" : albumView === "Generated" ? "generated" : "custom")).slice();
+        if (tab === "Artists") {
+            let dir = artistSortAsc ? 1 : -1;
+            if (artistSortIndex === 1)
+                list.sort((a, b) => (dir * ((a.count || 0) - (b.count || 0))) || (a.name || "").localeCompare(b.name || ""));
+            else
+                list.sort((a, b) => dir * (a.name || "").localeCompare(b.name || ""));
+        }
+        return list;
     }
     Connections {
         target: app
@@ -281,19 +299,52 @@ Item {
             }
             AppCombo {
                 id: sort
-                onCurrentIndexChanged: { pane.clearSelection(); pane.cancelReorder(); }
-                model: ["Recently added", "Title", "Artist"]
+                onCurrentIndexChanged: {
+                    pane.clearSelection();
+                    pane.cancelReorder();
+                    pane.songSortAsc = (currentIndex === 1 || currentIndex === 2);
+                }
+                model: ["Recently added", "Title", "Artist", "Duration"]
                 Layout.preferredWidth: Math.min(150, pane.width * 0.28)
                 visible: !pane.collectionId
             }
+            FlatButton {
+                visible: !pane.collectionId
+                outlined: true
+                glyph: pane.songSortAsc ? "chevron-up" : "chevron-down"
+                hint: pane.songSortAsc ? "Ascending order (click to flip)" : "Descending order (click to flip)"
+                onClicked: pane.songSortAsc = !pane.songSortAsc
+            }
         }
-        AppField {
-            id: collectionFilter
-            objectName: "playlistSearch"
-            search: true
-            placeholderText: "Find a playlist"
-            visible: pane.tab === "Playlists" && !pane.collectionId
+        RowLayout {
+            visible: pane.tab !== "Songs" && !pane.collectionId
             Layout.fillWidth: true
+            spacing: 8
+            AppField {
+                id: collectionFilter
+                objectName: "playlistSearch"
+                search: true
+                placeholderText: pane.tab === "Playlists" ? "Find a playlist" : pane.tab === "Artists" ? "Find an artist" : "Find an album"
+                Layout.fillWidth: true
+            }
+            AppCombo {
+                id: artistSortCombo
+                visible: pane.tab === "Artists"
+                model: ["Name", "Songs"]
+                currentIndex: pane.artistSortIndex
+                Layout.preferredWidth: Math.min(120, pane.width * 0.24)
+                onCurrentIndexChanged: {
+                    pane.artistSortIndex = currentIndex;
+                    pane.artistSortAsc = (currentIndex === 0);
+                }
+            }
+            FlatButton {
+                visible: pane.tab === "Artists"
+                outlined: true
+                glyph: pane.artistSortAsc ? "chevron-up" : "chevron-down"
+                hint: pane.artistSortAsc ? "Ascending order (click to flip)" : "Descending order (click to flip)"
+                onClicked: pane.artistSortAsc = !pane.artistSortAsc
+            }
         }
         FocusScope {
             id: bulkToolbar
@@ -425,7 +476,7 @@ Item {
             Layout.fillHeight: true
             clip: true
             model: StableListModel {
-                rows: pane.tab === "Playlists" ? pane.matchingCollections : pane.visibleCollections
+                rows: pane.matchingCollections
             }
             ScrollBar.vertical: ScrollBar {
             }

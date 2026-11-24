@@ -267,7 +267,12 @@ class LibraryRepository(private val g: Graph) {
                 try {
                     walk(folder.uri)
                     g.dao.putRoot(root.copy(available = true))
-                    val removed = g.dao.tracks().filter { it.root == root.id && documentKey(it.uri) !in seen }
+                    val rootTreeId = runCatching { DocumentsContract.getTreeDocumentId(Uri.parse(root.uri)) }.getOrNull()
+                    val removed = g.dao.tracks().filter { t ->
+                        val inThisRoot = t.root == root.id || (t.root.isBlank() && rootTreeId != null &&
+                            runCatching { DocumentsContract.getTreeDocumentId(Uri.parse(t.uri)) == rootTreeId }.getOrDefault(false))
+                        inThisRoot && documentKey(t.uri) !in seen
+                    }
                     if (removed.isNotEmpty()) {
                         g.db.withTransaction {
                             for (t in removed) {
@@ -914,15 +919,24 @@ class LibraryRepository(private val g: Graph) {
         folder: String = g.prefs.state.value.musicDir,
     ): DocumentFile {
         val root = requireMusicFolder(folder)
-        return root.createFile(mime, safeName(name)) ?: error("Could not create destination file")
+        val clean = safeName(name)
+        // match mime to extension so Android SAF doesn't append a duplicate extension on createFile
+        val ext = clean.substringAfterLast('.', "").lowercase()
+        val resolvedMime =
+            if (ext.isNotEmpty())
+                android.webkit.MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)
+                    ?: "application/octet-stream"
+            else mime
+        return root.createFile(resolvedMime, clean) ?: error("Could not create destination file")
     }
 
     /** publish and index under one gate, so folder observers cannot index a partial download */
     suspend fun publishDownload(file: File, name: String, mime: String, folder: String,
         source: Source?, cover: File?, indexed: (Track) -> Unit): String = g.fileGate.withLock {
         val uri = publish(file, name, mime, folder)
+        val matchedRoot = g.dao.roots().firstOrNull { it.uri == folder }?.id.orEmpty()
         if (source != null) {
-            var track = indexUnlocked(uri, source, force = true)
+            var track = indexUnlocked(uri, source, force = true, rootId = matchedRoot)
             if (track.art.isBlank() && cover?.isFile == true) {
                 val target = File(g.context.filesDir, "art/downloads/${track.id}.jpg")
                 target.parentFile?.mkdirs()
@@ -933,6 +947,60 @@ class LibraryRepository(private val g: Graph) {
             indexed(track)
         }
         uri
+    }
+
+    suspend fun repairTrackUri(trackId: String): Track? = g.fileGate.withLock {
+        val track = g.dao.track(trackId) ?: return@withLock null
+        val readable =
+            track.uri.isNotBlank() &&
+                runCatching { g.input(track.uri).use { it.read() >= 0 } }.getOrDefault(false)
+        if (readable) return@withLock track
+        val candidates = LinkedHashSet<String>()
+        if (g.prefs.state.value.musicDir.isNotBlank()) candidates += g.prefs.state.value.musicDir
+        for (root in g.dao.roots()) candidates += root.uri
+        val wantName = track.fileName.ifBlank {
+            runCatching {
+                DocumentsContract.getDocumentId(Uri.parse(track.uri)).substringAfterLast('/')
+            }.getOrDefault("")
+        }
+        val wantStem = wantName.substringBeforeLast('.', wantName)
+        var matchUri: String? = null
+        var matchRootId = track.root
+        for (folderUri in candidates) {
+            val root = DocumentFile.fromTreeUri(g.context, Uri.parse(folderUri)) ?: continue
+            if (!root.canRead()) continue
+            val rootId = g.dao.roots().firstOrNull { it.uri == folderUri }?.id.orEmpty()
+            val files = runCatching { root.listFiles() }.getOrDefault(emptyArray())
+            val byName = files.firstOrNull { f ->
+                f.isFile && (f.name == wantName || (wantStem.isNotBlank() && f.name?.startsWith(wantStem) == true))
+            }
+            if (byName != null) {
+                matchUri = byName.uri.toString()
+                matchRootId = rootId.ifBlank { matchRootId }
+                break
+            }
+            if (track.hash.isNotBlank()) {
+                val byHash = files.firstOrNull { f ->
+                    f.isFile && (track.size <= 0L || f.length() == track.size) &&
+                        runCatching { g.input(f.uri.toString()).use { it.sha256() } == track.hash }.getOrDefault(false)
+                }
+                if (byHash != null) {
+                    matchUri = byHash.uri.toString()
+                    matchRootId = rootId.ifBlank { matchRootId }
+                    break
+                }
+            }
+        }
+        if (matchUri != null) {
+            val repaired = indexUnlocked(matchUri, force = true, rootId = matchRootId, knownTrack = track)
+            withContext(Dispatchers.Main) { g.engine.value?.updateTrack(repaired) }
+            repaired
+        } else {
+            val unavailable = track.copy(available = false)
+            g.dao.putTrack(unavailable)
+            withContext(Dispatchers.Main) { g.engine.value?.updateTrack(unavailable) }
+            null
+        }
     }
 
     suspend fun publish(

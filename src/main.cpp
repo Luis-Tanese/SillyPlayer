@@ -8,6 +8,7 @@
 #include <QApplication>
 #include <QCommandLineParser>
 #include <QCryptographicHash>
+#include <QDesktopServices>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QLocalServer>
@@ -209,6 +210,22 @@ int main(int argc, char **argv) {
                      [restore](auto reason) {
                        if (reason == QSystemTrayIcon::Trigger)
                          restore();
+                     });
+    QString pendingUpdateUrl;
+    QObject::connect(&app, &App::updateAvailable, &application,
+                     [&tray, trayAvailable, &pendingUpdateUrl](const QString &version, const QString &url) {
+                       pendingUpdateUrl = url;
+                       if (trayAvailable) {
+                         tray.showMessage(
+                             "SillyPlayer v" + version + " is out",
+                             "Click to view the release page on GitHub.",
+                             QSystemTrayIcon::Information, 8000);
+                       }
+                     });
+    QObject::connect(&tray, &QSystemTrayIcon::messageClicked, &application,
+                     [&pendingUpdateUrl] {
+                       if (!pendingUpdateUrl.isEmpty())
+                         QDesktopServices::openUrl(QUrl(pendingUpdateUrl));
                      });
     QObject::connect(&application, &QCoreApplication::aboutToQuit, &app,
                      &App::shutdown);

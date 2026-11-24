@@ -5,10 +5,13 @@ import android.net.Uri
 import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.*
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.*
 import androidx.compose.ui.*
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.unit.dp
@@ -38,22 +41,46 @@ fun BrowseScreen(g: Graph, pickers: Pickers) {
             .collectAsStateWithLifecycle()
     LaunchedEffect(opened?.provider) { opened?.let { provider = it.provider } }
     Column(Modifier.fillMaxSize()) {
-        Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())) {
+        Row(
+            Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 8.dp),
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
             for ((key, label) in
                 listOf(
                     "youtube" to "YouTube",
                     "soundcloud" to "SoundCloud",
                     "direct" to "Direct link",
-                )) TextButton({
-                provider = key
-                g.online.closePlayer()
-            }) {
-                Text(
-                    label,
-                    color =
-                        if (provider == key) MaterialTheme.colorScheme.primary
-                        else MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+                )) {
+                val active = provider == key
+                Column(
+                    Modifier
+                        .clip(RoundedCornerShape(8.dp))
+                        .clickable {
+                            provider = key
+                            g.online.closePlayer()
+                        }
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    Text(
+                        label,
+                        fontSize = 14.sp,
+                        fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
+                        color =
+                            if (active) MaterialTheme.colorScheme.primary
+                            else MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Box(
+                        Modifier.width(24.dp)
+                            .height(2.dp)
+                            .clip(RoundedCornerShape(1.dp))
+                            .background(
+                                if (active) MaterialTheme.colorScheme.primary
+                                else androidx.compose.ui.graphics.Color.Transparent
+                            )
+                    )
+                }
             }
         }
         holder.SaveableStateProvider(provider) {
@@ -69,23 +96,44 @@ fun BrowseScreen(g: Graph, pickers: Pickers) {
             }
             Column {
                 Row(
-                    Modifier.fillMaxWidth().padding(horizontal = 10.dp),
+                    Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
                     verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
                 ) {
-                    Input(
-                        query,
-                        { query = it },
-                        if (provider == "direct") "Paste an audio link"
-                        else "Search or paste a link",
-                        Modifier.weight(1f),
-                        "search",
+                    SearchBarField(
+                        value = query,
+                        onChange = { query = it },
+                        placeholder =
+                            if (provider == "direct") "Paste an audio link"
+                            else "Search or paste a link",
+                        modifier = Modifier.weight(1f),
                         trailing = {
-                            IconAction("arrow-right", "Search", query.isNotBlank(), onClick = submitSearch)
+                            IconButton(
+                                onClick = submitSearch,
+                                enabled = query.isNotBlank(),
+                                modifier = Modifier.size(34.dp),
+                            ) {
+                                Glyph(
+                                    "arrow-right",
+                                    "Search",
+                                    Modifier.size(18.dp),
+                                    tint = if (query.isNotBlank()) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
                         },
                         onSubmit = submitSearch,
                     )
-                    if (provider == "youtube")
-                        IconAction("list-music", "Playlist or mix") { collectionInput = true }
+                    if (provider == "youtube") {
+                        Surface(
+                            shape = RoundedCornerShape(12.dp),
+                            color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                        ) {
+                            IconButton(onClick = { collectionInput = true }, modifier = Modifier.size(44.dp)) {
+                                Glyph("list-music", "Playlist or mix", Modifier.size(20.dp))
+                            }
+                        }
+                    }
                 }
                 if (opened != null && opened?.provider == provider) {
                     val source = opened!!

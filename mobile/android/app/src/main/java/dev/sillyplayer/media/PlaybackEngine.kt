@@ -118,6 +118,7 @@ class PlaybackEngine(private val g: Graph) {
     private var previewGain: Pair<String, Float>? = null
     private var sleepFired = 0L
     private var playSession: Play? = null
+    private var repairedAttemptTrackId = ""
     private var sessionOccurrence: String? = null
     private var counted = 0L
     private var lastTick = SystemClock.elapsedRealtime()
@@ -199,8 +200,31 @@ class PlaybackEngine(private val g: Graph) {
                             .writeText(diagnostic)
                     }
                     val cause = generateSequence<Throwable>(error) { it.cause }.take(8).last()
+                    val active = if (owner == "music") currentTrack() else null
+                    val isSafMissing =
+                        active != null &&
+                            (cause is IllegalArgumentException ||
+                                cause is java.io.FileNotFoundException ||
+                                cause is SecurityException)
+                    if (isSafMissing && active != null && repairedAttemptTrackId != active.id) {
+                        repairedAttemptTrackId = active.id
+                        scope.launch {
+                            val repaired = withContext(Dispatchers.IO) { g.library.repairTrackUri(active.id) }
+                            if (repaired != null && repaired.uri != active.uri && owner == "music" && currentTrack()?.id == active.id) {
+                                restoreLocal(true)
+                            } else {
+                                g.message.value =
+                                    "Audio file not found for \"${active.title}\". Locate it in Settings → Library or rescan."
+                                publish("Audio file not found: ${active.title}")
+                            }
+                        }
+                        return
+                    }
                     g.message.value =
-                        "Playback: ${error.errorCodeName} · ${cause.javaClass.simpleName}: ${cause.message.orEmpty().take(140)}"
+                        if (isSafMissing && active != null)
+                            "Audio file not found for \"${active.title}\". Locate it in Settings → Library or rescan."
+                        else
+                            "Playback: ${error.errorCodeName} · ${cause.javaClass.simpleName}: ${cause.message.orEmpty().take(140)}"
                     publish(diagnostic)
                 }
             }

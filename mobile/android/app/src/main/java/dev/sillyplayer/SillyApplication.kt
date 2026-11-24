@@ -40,6 +40,7 @@ class Graph(val context: Context) {
         )
     val library = LibraryRepository(this)
     val online = OnlineRepository(this)
+    val updates = dev.sillyplayer.online.UpdateChecker(this)
     val backup = BackupRepository(this)
     val sync = SyncClient(this)
     val developer = LibraryReset(this)

@@ -26,7 +26,15 @@ ItemDelegate {
             Layout.preferredWidth: 46
             Layout.preferredHeight: 46
             Art { anchors.fill: parent; source: row.cover; visible: !row.glyph }
-            AppIcon { anchors.centerIn: parent; width: 22; height: 22; glyph: row.glyph; visible: !!row.glyph }
+            Rectangle {
+                anchors.fill: parent
+                visible: !!row.glyph
+                radius: 8
+                color: Theme.surface
+                border.width: 1
+                border.color: Theme.separator
+                AppIcon { anchors.centerIn: parent; width: 20; height: 20; glyph: row.glyph; color: Theme.accent }
+            }
         }
         ColumnLayout {
             Layout.fillWidth: true

@@ -67,6 +67,7 @@ ApplicationWindow {
     onYChanged: if (geometryReady && visibility === Window.Windowed) windowStateSaver.restart()
     onVisibilityChanged: if (geometryReady && (visibility === Window.Windowed || visibility === Window.Maximized)) windowStateSaver.restart()
     property bool expanded: false
+    property bool updateBannerDismissed: false
     property string returnPage: "Music"
     property bool videoOpen: false
     property var videoDetails: ({})
@@ -425,6 +426,37 @@ ApplicationWindow {
     ColumnLayout {
         anchors.fill: parent
         spacing: 0
+        Rectangle {
+            Layout.fillWidth: true
+            visible: !!app.updateInfo.available && app.settings.updateNotifications !== false && !root.updateBannerDismissed
+            implicitHeight: visible ? 40 : 0
+            color: Qt.alpha(Theme.accent, 0.14)
+            RowLayout {
+                anchors.fill: parent
+                anchors.leftMargin: 28
+                anchors.rightMargin: 20
+                spacing: 10
+                Label {
+                    text: "SillyPlayer v" + (app.updateInfo.version || "") + " is available"
+                    color: Theme.text
+                    font.pixelSize: 12
+                    font.weight: Font.Medium
+                    Layout.fillWidth: true
+                }
+                FlatButton {
+                    text: "View release"
+                    glyph: "external-link"
+                    primary: true
+                    onClicked: app.openReleasePage()
+                }
+                FlatButton {
+                    glyph: "x"
+                    hint: "Dismiss update notice"
+                    onClicked: root.updateBannerDismissed = true
+                }
+            }
+            Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; color: Theme.separator }
+        }
         Item {
             Layout.fillWidth: true
             Layout.fillHeight: true

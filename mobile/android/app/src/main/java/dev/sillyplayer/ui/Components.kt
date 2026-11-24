@@ -5,8 +5,12 @@ import androidx.compose.foundation.gestures.*
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -250,6 +254,136 @@ fun Input(
             },
         trailingIcon = trailing,
     )
+}
+
+@Composable
+fun SearchBarField(
+    value: String,
+    onChange: (String) -> Unit,
+    placeholder: String,
+    modifier: Modifier = Modifier,
+    trailing: @Composable (() -> Unit)? = null,
+    onSubmit: (() -> Unit)? = null,
+) {
+    var focused by remember { mutableStateOf(false) }
+    val shape = RoundedCornerShape(14.dp)
+    val borderColor =
+        if (focused) MaterialTheme.colorScheme.primary.copy(alpha = 0.7f)
+        else MaterialTheme.colorScheme.outlineVariant
+    Row(
+        modifier
+            .fillMaxWidth()
+            .height(44.dp)
+            .clip(shape)
+            .background(MaterialTheme.colorScheme.surfaceContainerHigh)
+            .border(1.dp, borderColor, shape)
+            .padding(start = 12.dp, end = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Glyph(
+            "search",
+            modifier = Modifier.size(18.dp),
+            tint = if (focused) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.width(10.dp))
+        Box(Modifier.weight(1f), contentAlignment = Alignment.CenterStart) {
+            if (value.isEmpty()) {
+                Text(
+                    placeholder,
+                    fontSize = 14.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            BasicTextField(
+                value = value,
+                onValueChange = onChange,
+                singleLine = true,
+                textStyle = TextStyle(color = MaterialTheme.colorScheme.onSurface, fontSize = 14.sp),
+                cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+                keyboardOptions = KeyboardOptions(imeAction = if (onSubmit != null) ImeAction.Search else ImeAction.Done),
+                keyboardActions = KeyboardActions(onSearch = { onSubmit?.invoke() }, onDone = { onSubmit?.invoke() }),
+                modifier = Modifier.fillMaxWidth().onFocusChanged { focused = it.isFocused },
+            )
+        }
+        if (value.isNotEmpty()) {
+            IconButton(onClick = { onChange("") }, modifier = Modifier.size(34.dp)) {
+                Glyph("x", "Clear search", Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+        trailing?.invoke()
+    }
+}
+
+@Composable
+fun SortControl(
+    value: String,
+    ascending: Boolean,
+    options: List<String>,
+    onPick: (String) -> Unit,
+    onToggleDirection: () -> Unit,
+) {
+    var open by remember { mutableStateOf(false) }
+    val shape = RoundedCornerShape(10.dp)
+    Surface(
+        shape = shape,
+        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Box {
+                Row(
+                    Modifier
+                        .clickable { open = true }
+                        .padding(start = 10.dp, end = 6.dp, top = 7.dp, bottom = 7.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        value,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        maxLines = 1,
+                    )
+                    Spacer(Modifier.width(4.dp))
+                    Glyph("chevron-down", modifier = Modifier.size(14.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                DropdownMenu(open, { open = false }) {
+                    for (choice in options) {
+                        DropdownMenuItem(
+                            text = {
+                                Text(
+                                    choice,
+                                    color = if (choice == value) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+                                    fontWeight = if (choice == value) FontWeight.Medium else FontWeight.Normal,
+                                )
+                            },
+                            trailingIcon = if (choice == value) { { Glyph("check", modifier = Modifier.size(16.dp), tint = MaterialTheme.colorScheme.primary) } } else null,
+                            onClick = {
+                                open = false
+                                onPick(choice)
+                            },
+                        )
+                    }
+                }
+            }
+            Box(Modifier.width(1.dp).height(18.dp).background(MaterialTheme.colorScheme.outlineVariant))
+            Row(
+                Modifier
+                    .clickable { onToggleDirection() }
+                    .padding(horizontal = 8.dp, vertical = 7.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Glyph(
+                    if (ascending) "chevron-up" else "chevron-down",
+                    if (ascending) "Ascending order" else "Descending order",
+                    Modifier.size(15.dp),
+                    tint = MaterialTheme.colorScheme.primary,
+                )
+            }
+        }
+    }
 }
 
 @Composable

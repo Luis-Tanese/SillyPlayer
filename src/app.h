@@ -9,6 +9,7 @@
 #include "librarytools.h"
 #include "sync.h"
 #include "discordrpc.h"
+#include <QNetworkAccessManager>
 #include <QVariantList>
 
 class App : public QObject {
@@ -29,6 +30,7 @@ class App : public QObject {
   Q_PROPERTY(int mode READ mode NOTIFY settingsChanged)
   Q_PROPERTY(QVariantMap sourceContext READ sourceContext NOTIFY queueChanged)
   Q_PROPERTY(QString context READ context NOTIFY queueChanged)
+  Q_PROPERTY(QVariantMap updateInfo READ updateInfo NOTIFY updateChanged)
 public:
   App(Store *store, const QString &cache, QObject *parent = nullptr);
   ~App();
@@ -58,6 +60,9 @@ public:
   int mode() const { return m_mode; }
   QString context() const { return m_context; }
   QVariantMap sourceContext() const { return m_source; }
+  QVariantMap updateInfo() const { return m_updateInfo; }
+  Q_INVOKABLE void checkForUpdates(bool manual = false);
+  Q_INVOKABLE void openReleasePage();
   Q_INVOKABLE void setSetting(const QString &key, const QVariant &value);
   Q_INVOKABLE QVariantList collectionTracks(const QString &id) const;
   Q_INVOKABLE void playTrack(const QString &id, const QVariantList &ids,
@@ -125,10 +130,14 @@ signals:
   void recentChanged();
   void error(const QString &message);
   void batchTrashFinished(const QVariantMap &result);
+  void updateChanged();
+  void updateAvailable(const QString &version, const QString &url);
 
 private:
   Store *s;
   QString cache;
+  QNetworkAccessManager updateNet;
+  QVariantMap m_updateInfo{{"checking", false}, {"available", false}, {"version", ""}, {"url", ""}, {"status", ""}};
   QVariantList entries;
   QStringList normalQueueOrder;
   int index = -1, m_mode = 0;
