@@ -54,6 +54,20 @@ Player::Player(bool video, QObject *parent) : QObject(parent) {
     fadeGain = std::max(0.0, 1.0 - double(fadeClock.elapsed()) / fadeMilliseconds);
     writeVolume();
   });
+  transitionTimer.setInterval(24);
+  connect(&transitionTimer, &QTimer::timeout, this, [this] {
+    if (!fadingIn || transitionMs <= 0) { resetTransitionFade(); return; }
+    const int halfFade = std::clamp(transitionMs / 2, 250, 4000);
+    const double elapsed = double(transitionClock.elapsed());
+    transitionGain = std::clamp(elapsed / halfFade, 0.0, 1.0);
+    writeVolume();
+    if (elapsed >= halfFade) {
+      fadingIn = false;
+      transitionGain = 1.0;
+      transitionTimer.stop();
+      writeVolume();
+    }
+  });
   // wakeups only post work to the owning Qt thread
   // coalesce callbacks while keeping acknowledgements responsive enough for smooth 16 ms fades
   mpv_set_wakeup_callback(m, [](void *context) {
@@ -68,6 +82,7 @@ Player::Player(bool video, QObject *parent) : QObject(parent) {
 Player::~Player() { shutdown(); }
 void Player::shutdown() {
   fadeTimer.stop();
+  transitionTimer.stop();
   volumeTimer.stop();
   timer.stop();
   if (m) {
@@ -95,12 +110,21 @@ bool Player::command(const QStringList &args) {
   return true;
 }
 void Player::load(const QString &path, const QString &audio,
-                  const QVariantMap &headers, double resume, bool paused) {
+                  const QVariantMap &headers, double resume, bool paused, bool fadeIn) {
   if (!m)
     return;
   ++mediaGeneration;
   sourcePath=path;
   resetFade();
+  if (fadeIn && transitionMs > 0 && !paused) {
+    transitionTimer.stop();
+    fadingIn = false;
+    pendingFadeIn = true;
+    transitionGain = 0.0;
+    writeVolume();
+  } else {
+    resetTransitionFade();
+  }
   pendingSeek = false;
   if (!paused) emit wantsPlay();
   err.clear();
@@ -182,11 +206,16 @@ void Player::pausePlayback() {
   resumePaused = true;
   if (command({"set", "pause", "yes"})) pause = true;
   resetFade();
+  resetTransitionFade();
 }
 void Player::setPauseFade(bool enabled, int milliseconds) {
   fadeEnabled = enabled;
   fadeMilliseconds = std::clamp(milliseconds, 50, 5000);
   if (pausing()) pausePlayback();
+}
+void Player::setCrossfadeMs(int milliseconds) {
+  transitionMs = std::clamp(milliseconds, 0, 8000);
+  if (transitionMs == 0) resetTransitionFade();
 }
 void Player::pauseWithFade() {
   if (!fadeEnabled || !hasFile || pause || effectiveVolume() <= 0) { pausePlayback(); return; }
@@ -198,13 +227,13 @@ void Player::pauseWithFade() {
 }
 void Player::writeVolume() {
   if (!m || volumeInFlight || volumeTimer.isActive()) return;
-  const double output = effectiveVolume() * fadeGain;
+  const double output = effectiveVolume() * fadeGain * transitionGain;
   if (volumeApplied && std::abs(output - appliedVolume) < 0.000001) return;
   volumeTimer.start();
 }
 void Player::flushVolume() {
   if (!m || volumeInFlight) return;
-  sentVolume = effectiveVolume() * fadeGain;
+  sentVolume = effectiveVolume() * fadeGain * transitionGain;
   if (volumeApplied && std::abs(sentVolume - appliedVolume) < 0.000001) return;
   // one request in flight: newer user volume/fade gain replaces pending work, never queues stale gain writes behind a resume or mute operation
   volumeInFlight = true;
@@ -221,6 +250,40 @@ void Player::resetFade() {
   if (fadeGain != 1) { fadeGain = 1; writeVolume(); }
   if (active) emit changed();
 }
+void Player::resetTransitionFade() {
+  transitionTimer.stop();
+  pendingFadeIn = false;
+  fadingIn = false;
+  if (transitionGain != 1.0) { transitionGain = 1.0; writeVolume(); }
+}
+void Player::startTransitionFadeIn() {
+  if (transitionMs <= 0) { resetTransitionFade(); return; }
+  pendingFadeIn = false;
+  fadingIn = true;
+  transitionGain = 0.0;
+  transitionClock.restart();
+  transitionTimer.start();
+  writeVolume();
+}
+void Player::updateTransitionFadeOut() {
+  if (transitionMs <= 0 || !hasFile || pause || pausing()) {
+    if (!fadingIn && !pendingFadeIn && transitionGain != 1.0) resetTransitionFade();
+    return;
+  }
+  if (dur * 1000.0 <= transitionMs) return;
+  const double halfFadeSec = std::clamp(transitionMs / 2000.0, 0.25, 4.0);
+  const double remaining = dur - pos;
+  if (remaining > 0.0 && remaining <= halfFadeSec) {
+    transitionTimer.stop();
+    fadingIn = false;
+    pendingFadeIn = false;
+    transitionGain = std::clamp(remaining / halfFadeSec, 0.0, 1.0);
+    writeVolume();
+  } else if (!fadingIn && !pendingFadeIn && transitionGain != 1.0) {
+    transitionGain = 1.0;
+    writeVolume();
+  }
+}
 void Player::toggle() {
   if (pause || pausing())
     play();
@@ -229,6 +292,7 @@ void Player::toggle() {
 }
 void Player::seek(double seconds) {
   if (!m || !canSeek || dur <= 0 || !std::isfinite(seconds)) return;
+  resetTransitionFade();
   seekTarget = std::clamp(seconds, 0.0, dur);
   resumeFloor = -1;
   const auto target = QString::number(seekTarget, 'f', 6).toUtf8();
@@ -390,6 +454,7 @@ void Player::poll() {
         if (n == "time-pos" && hasFile) {
           pos = v;
           if (!pause && pos >= resumeFloor) resumeFloor = -1;
+          updateTransitionFadeOut();
         } else if (n == "duration" && hasFile)
           dur = v;
       }
@@ -415,11 +480,15 @@ void Player::poll() {
         startAfterSpeed=true;
         speedTimer.stop();
         flushSpeed();
-      } else command({"set", "pause", resumePaused ? "yes" : "no"});
+      } else {
+        command({"set", "pause", resumePaused ? "yes" : "no"});
+        if (!resumePaused && pendingFadeIn) startTransitionFadeIn();
+      }
       emit loadedFile();
       dirty = true;
     } else if (e->event_id == MPV_EVENT_END_FILE) {
       resetFade();
+      resetTransitionFade();
       auto end = static_cast<mpv_event_end_file *>(e->data);
       const bool hadStarted = hasFile && pos > 0.05;
       pendingSeek = false;
@@ -438,6 +507,7 @@ void Player::poll() {
   if(hasFile && startAfterSpeed && !speedInFlight && !filtersInFlight && !speedTimer.isActive() && sentPitch==pitchFollows && std::abs(sentSpeed-playbackSpeed)<0.0001) {
     startAfterSpeed=false;
     command({"set","pause",resumePaused?"yes":"no"});
+    if (!resumePaused && pendingFadeIn) startTransitionFadeIn();
   }
   if (pendingSeek && seekClock.elapsed() > 5000) {
     pendingSeek = false; heldPosition = -1; err = "Seek timed out"; dirty = true;

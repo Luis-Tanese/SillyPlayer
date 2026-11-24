@@ -317,6 +317,54 @@ fun SearchBarField(
 }
 
 @Composable
+fun ToolPillButton(
+    label: String,
+    icon: String = "",
+    active: Boolean = false,
+    enabled: Boolean = true,
+    onClick: () -> Unit,
+) {
+    val shape = RoundedCornerShape(10.dp)
+    val bg =
+        if (active) MaterialTheme.colorScheme.primary.copy(alpha = 0.14f)
+        else MaterialTheme.colorScheme.surfaceContainerHigh
+    val border =
+        if (active) MaterialTheme.colorScheme.primary.copy(alpha = 0.55f)
+        else MaterialTheme.colorScheme.outlineVariant
+    val contentColor =
+        when {
+            !enabled -> MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f)
+            active -> MaterialTheme.colorScheme.primary
+            else -> MaterialTheme.colorScheme.onSurface
+        }
+    Surface(
+        shape = shape,
+        color = bg,
+        border = BorderStroke(1.dp, border),
+        modifier = Modifier.height(34.dp),
+    ) {
+        Row(
+            Modifier
+                .clickable(enabled = enabled, onClick = onClick)
+                .padding(horizontal = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            if (icon.isNotBlank()) {
+                Glyph(icon, modifier = Modifier.size(15.dp), tint = contentColor)
+            }
+            Text(
+                label,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Medium,
+                color = contentColor,
+                maxLines = 1,
+            )
+        }
+    }
+}
+
+@Composable
 fun SortControl(
     value: String,
     ascending: Boolean,
@@ -330,13 +378,15 @@ fun SortControl(
         shape = shape,
         color = MaterialTheme.colorScheme.surfaceContainerHigh,
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+        modifier = Modifier.height(34.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Box {
                 Row(
                     Modifier
+                        .fillMaxHeight()
                         .clickable { open = true }
-                        .padding(start = 10.dp, end = 6.dp, top = 7.dp, bottom = 7.dp),
+                        .padding(start = 10.dp, end = 6.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Text(
@@ -371,12 +421,13 @@ fun SortControl(
             Box(Modifier.width(1.dp).height(18.dp).background(MaterialTheme.colorScheme.outlineVariant))
             Row(
                 Modifier
+                    .fillMaxHeight()
                     .clickable { onToggleDirection() }
-                    .padding(horizontal = 8.dp, vertical = 7.dp),
+                    .padding(horizontal = 9.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Glyph(
-                    if (ascending) "chevron-up" else "chevron-down",
+                    if (ascending) "arrow-up" else "arrow-down",
                     if (ascending) "Ascending order" else "Descending order",
                     Modifier.size(15.dp),
                     tint = MaterialTheme.colorScheme.primary,

@@ -8,6 +8,7 @@ ItemDelegate {
     property string subtitle: ""
     property string cover: ""
     property string glyph: ""
+    property bool pinned: false
     property bool actions: false
     property bool selectable: false
     property bool selected: false
@@ -39,7 +40,18 @@ ItemDelegate {
         ColumnLayout {
             Layout.fillWidth: true
             spacing: 3
-            Label { objectName: "collectionTitle"; text: row.title; color: Theme.text; elide: Text.ElideRight; Layout.fillWidth: true; font.pixelSize: 14 }
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 6
+                Label { objectName: "collectionTitle"; text: row.title; color: Theme.text; elide: Text.ElideRight; Layout.fillWidth: true; font.pixelSize: 14 }
+                AppIcon {
+                    visible: row.pinned
+                    glyph: "pin"
+                    width: 14
+                    height: 14
+                    color: Theme.accent
+                }
+            }
             Label { text: row.subtitle; visible: !!text; color: Theme.muted; elide: Text.ElideRight; Layout.fillWidth: true; font.pixelSize: 11 }
         }
         FlatButton { glyph: "ellipsis"; hint: "Collection actions"; visible: row.actions; onClicked: row.menuRequested(this) }

@@ -65,6 +65,10 @@ public:
   Q_INVOKABLE void openReleasePage();
   Q_INVOKABLE void setSetting(const QString &key, const QVariant &value);
   Q_INVOKABLE QVariantList collectionTracks(const QString &id) const;
+  Q_INVOKABLE QVariantMap folderView(const QString &path = {}) const;
+  Q_INVOKABLE bool isPinned(const QString &kind, const QString &id) const;
+  Q_INVOKABLE void togglePin(const QString &kind, const QString &id);
+  Q_INVOKABLE void addFiles();
   Q_INVOKABLE void playTrack(const QString &id, const QVariantList &ids,
                              const QString &context, const QString &collection = {}, const QString &member = {});
   Q_INVOKABLE void next();
@@ -117,7 +121,7 @@ public:
   Q_INVOKABLE void openTrash();
   Q_INVOKABLE QString speedLabel(const QVariantMap &track) const;
   Q_INVOKABLE void applySpeed(double value, bool nightcore);
-  Q_INVOKABLE void applyEq(bool enabled, const QVariantList &gains);
+  Q_INVOKABLE void applyEq(bool enabled, const QVariantList &gains, const QString &preset = {});
   Q_INVOKABLE QString time(double value) const;
   void save();
   void shutdown();
@@ -161,7 +165,8 @@ private:
   void syncDiscordPresence(bool force = false);
   void removeTrashedFromQueue(const QStringList &tracks);
   QTimer saver;
-  void playIndex(int i, bool force = false);
+  void playIndex(int i, bool force = false, bool autoTransition = false);
+  void advance(bool autoTransition);
   void rebuildShuffle();
   void rememberQueueOrder();
   void reconcileQueueOrder();

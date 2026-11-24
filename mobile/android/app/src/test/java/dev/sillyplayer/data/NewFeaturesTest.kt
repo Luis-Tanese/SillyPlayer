@@ -92,4 +92,63 @@ class NewFeaturesTest {
         assertEquals(30, month.buckets.size)
         assertEquals(3L, month.totalPlays)
     }
+
+    @Test
+    fun preferencesDefaultsHaveSmartShuffleOffAndEmptyPins() {
+        val prefs = Preferences()
+        assertFalse(prefs.smartShuffle)
+        assertTrue(prefs.pinnedPlaylists.isEmpty())
+        assertTrue(prefs.pinnedArtists.isEmpty())
+    }
+
+    @Test
+    fun buildAndroidFolderViewHandlesSafTreeAndFileUris() {
+        val root =
+            Root(
+                id = "r1",
+                uri = "content://com.android.externalstorage.documents/tree/primary%3AMusic",
+                name = "Music",
+            )
+        val t1 =
+            Track(
+                id = "t1",
+                title = "Root Song",
+                root = "r1",
+                uri = "content://com.android.externalstorage.documents/tree/primary%3AMusic/document/primary%3AMusic%2Froot.mp3",
+            )
+        val t2 =
+            Track(
+                id = "t2",
+                title = "Classic Song",
+                root = "r1",
+                uri = "content://com.android.externalstorage.documents/tree/primary%3AMusic/document/primary%3AMusic%2FRock%2FClassic%2Fsong.mp3",
+            )
+        val t3 =
+            Track(
+                id = "t3",
+                title = "Synced Song",
+                uri = "file:///data/user/0/dev.sillyplayer/files/music/Synced/Chill/track.m4a",
+            )
+
+        val top = buildAndroidFolderView(listOf(t1, t2, t3), listOf(root), "")
+        assertEquals(listOf("Music", "Synced"), top.folders.map { it.name })
+        assertEquals(2, top.folders.first { it.name == "Music" }.trackCount)
+        assertEquals(1, top.folders.first { it.name == "Music" }.subfolderCount)
+
+        val music = buildAndroidFolderView(listOf(t1, t2, t3), listOf(root), "Music")
+        assertEquals(1, music.tracks.size)
+        assertEquals("Root Song", music.tracks.first().title)
+        assertEquals(listOf("Rock"), music.folders.map { it.name })
+        assertEquals("", music.parentPath)
+
+        val classic = buildAndroidFolderView(listOf(t1, t2, t3), listOf(root), "Music/Rock/Classic")
+        assertEquals(1, classic.tracks.size)
+        assertEquals("Classic Song", classic.tracks.first().title)
+        assertEquals("Music/Rock", classic.parentPath)
+        assertEquals(listOf("Folders", "Music", "Rock", "Classic"), classic.breadcrumbs.map { it.name })
+
+        val chill = buildAndroidFolderView(listOf(t1, t2, t3), listOf(root), "Synced/Chill")
+        assertEquals(1, chill.tracks.size)
+        assertEquals("Synced Song", chill.tracks.first().title)
+    }
 }

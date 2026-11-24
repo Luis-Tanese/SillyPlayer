@@ -1,5 +1,7 @@
 #include "app.h"
 #include "artistsplit.h"
+#include "foldertree.h"
+#include "smartshuffle.h"
 #include "m3u.h"
 #include "tagcleanup.h"
 #include "discordrpc.h"
@@ -381,6 +383,111 @@ int main(int argc, char **argv) {
     CHECK(weekIns["buckets"].toList().size() == 7);
     const auto monthIns = app.listening.insights("month");
     CHECK(monthIns["buckets"].toList().size() == 30);
+
+    // generated albums must merge featuring artists into one album instead of duplicating
+    CHECK(store.exec(
+        "INSERT INTO tracks(id,path,title,artist,album,albumArtist,duration,available,deleted,added) VALUES"
+        "('fa1','/tmp/fa/1.mp3','Track 1','ANGUISH','FALLEN ANGEL','',120,1,0,1000),"
+        "('fa2','/tmp/fa/2.mp3','Track 2','ANGUISH, EXILED','FALLEN ANGEL','',130,1,0,1001),"
+        "('fa3','/tmp/fa/3.mp3','Track 3','ANGUISH, Elfass','fallen angel','',140,1,0,1002)"));
+    emit app.library.changed();
+    int fallenCount = 0;
+    QString fallenId;
+    int fallenTracksCount = 0;
+    for (const auto &v : app.collections()) {
+      const auto m = v.toMap();
+      if (m["kind"].toString() == "generated" && m["name"].toString().compare("FALLEN ANGEL", Qt::CaseInsensitive) == 0) {
+        fallenCount++;
+        fallenId = m["id"].toString();
+        fallenTracksCount = m["count"].toInt();
+      }
+    }
+    CHECK(fallenCount == 1);
+    CHECK(fallenTracksCount == 3);
+    CHECK(app.collectionTracks(fallenId).size() == 3);
+
+    // pinning playlists and artists keeps them sorted first
+    const auto pinA = app.createCollection("Alpha List", "playlist");
+    const auto pinB = app.createCollection("Beta List", "playlist");
+    CHECK(!app.isPinned("playlist", pinB));
+    app.togglePin("playlist", pinB);
+    CHECK(app.isPinned("playlist", pinB));
+    QStringList playlistIds;
+    for (const auto &v : app.collections()) {
+      const auto m = v.toMap();
+      if (m["kind"].toString() == "playlist") playlistIds << m["id"].toString();
+    }
+    CHECK(!playlistIds.isEmpty() && playlistIds.first() == pinB);
+    app.deleteCollection(pinB);
+    CHECK(!app.isPinned("playlist", pinB));
+
+    app.togglePin("artist", "artist:elfass");
+    CHECK(app.isPinned("artist", "artist:elfass"));
+    QStringList artistIds;
+    for (const auto &v : app.collections()) {
+      const auto m = v.toMap();
+      if (m["kind"].toString() == "artist") artistIds << m["id"].toString();
+    }
+    CHECK(!artistIds.isEmpty() && artistIds.first() == "artist:elfass");
+
+    // crossfade and smart shuffle settings defaults and updates
+    CHECK(app.settings()["crossfadeMs"].toInt() == 0);
+    CHECK(app.settings()["smartShuffle"].toBool() == false);
+    app.setSetting("crossfadeMs", 3000);
+    CHECK(app.music.crossfadeMs() == 3000);
+    app.setSetting("smartShuffle", true);
+    CHECK(app.settings()["smartShuffle"].toBool() == true);
+
+    // smart shuffle avoids back to back same artist when other artists are available
+    {
+      QVector<SmartShuffleItem> items;
+      for (int i = 0; i < 4; ++i) items << SmartShuffleItem{i, "Artist A", 0};
+      for (int i = 4; i < 8; ++i) items << SmartShuffleItem{i, "Artist B", 0};
+      for (int i = 8; i < 12; ++i) items << SmartShuffleItem{i, "Artist C", 0};
+      std::mt19937 rng(42);
+      const auto order = smartShuffleOrder(items, "Artist A", rng, 1'000'000'000LL);
+      CHECK(order.size() == 12);
+      CHECK(items[order.first()].artist != "Artist A");
+      int consecutiveSame = 0;
+      for (int i = 1; i < order.size(); ++i) {
+        if (items[order[i]].artist == items[order[i - 1]].artist) consecutiveSame++;
+      }
+      CHECK(consecutiveSame == 0);
+    }
+
+    // folder tree view builds nested roots, breadcrumbs, direct tracks, and counts
+    {
+      QVariantList fakeTracks{
+        QVariantMap{{"id", "1"}, {"title", "Root Song"}, {"path", "/music/root.mp3"}, {"art", ""}},
+        QVariantMap{{"id", "2"}, {"title", "Rock Song"}, {"path", "/music/Rock/Classic/song.mp3"}, {"art", ""}},
+        QVariantMap{{"id", "3"}, {"title", "Alt Song"}, {"path", "/music/Rock/alt.mp3"}, {"art", ""}},
+      };
+      QVariantList fakeRoots{QVariantMap{{"id", "r1"}, {"path", "/music"}}};
+      const auto rootView = buildFolderView(fakeTracks, fakeRoots, "/music", "");
+      CHECK(rootView["folders"].toList().size() == 1);
+      CHECK(rootView["folders"].toList().first().toMap()["trackCount"].toInt() == 3);
+      CHECK(rootView["folders"].toList().first().toMap()["subfolderCount"].toInt() == 1);
+      const auto musicView = buildFolderView(fakeTracks, fakeRoots, "/music", "/music");
+      CHECK(musicView["tracks"].toList().size() == 1);
+      CHECK(musicView["folders"].toList().size() == 1);
+      CHECK(musicView["folders"].toList().first().toMap()["name"].toString() == "Rock");
+      CHECK(musicView["folders"].toList().first().toMap()["trackCount"].toInt() == 2);
+      const auto classicView = buildFolderView(fakeTracks, fakeRoots, "/music", "/music/Rock/Classic");
+      CHECK(classicView["tracks"].toList().size() == 1);
+      CHECK(classicView["parentPath"].toString() == "/music/Rock");
+      CHECK(classicView["breadcrumbs"].toList().size() == 4);
+    }
+
+    // toggling sort direction on desktop Songs stays at the top of the list
+    auto musicPane = window->findChild<QObject*>("musicPane");
+    auto songList = window->findChild<QObject*>("musicSongList");
+    auto sortDirBtn = window->findChild<QObject*>("songSortDirection");
+    CHECK(musicPane && songList && sortDirBtn);
+    const bool initialAsc = musicPane->property("songSortAsc").toBool();
+    CHECK(QMetaObject::invokeMethod(sortDirBtn, "clicked"));
+    settle();
+    CHECK(musicPane->property("songSortAsc").toBool() == !initialAsc);
+    CHECK(songList->property("contentY").toDouble() <= 1.0);
   }
   {
     QTcpServer server;CHECK(server.listen(QHostAddress::LocalHost));

@@ -239,6 +239,11 @@ fun SettingsScreen(g: Graph, pickers: Pickers) {
                 }
             }
             SettingsCard("Focus & transitions") {
+                Choice("Smart shuffle", prefs.smartShuffle) { on ->
+                    g.task { g.prefs.update { it.copy(smartShuffle = on) } }
+                }
+                Hint("Avoids playing the same artist back to back and favors songs you haven't heard recently.")
+                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
                 Choice("Lower volume on notifications (duck)", prefs.duckAudio) { on ->
                     g.task { g.prefs.update { it.copy(duckAudio = on) } }
                 }

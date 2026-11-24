@@ -11,17 +11,25 @@ Item {
     property string albumView: "Generated"
     property string collectionId: ""
     property string collectionName: ""
+    property string folderPath: ""
     property bool editMode: false
+    property int songSortIndex: 0
     property bool songSortAsc: false
     property int artistSortIndex: 0
     property bool artistSortAsc: true
+    property bool pendingSongsTop: false
+    property bool pendingCollectionsTop: false
     property var selectedCollection: {
         let observed = revision;
         return collectionId ? app.collections.find(c => c.id === collectionId) || ({}) : ({});
     }
     property bool editable: !!selectedCollection.id && !["generated", "artist"].includes(selectedCollection.kind)
     onCollectionIdChanged: { editMode = false; clearSelection(); cancelReorder(); filter.text = ""; songs.contentY = 0; }
-    onTabChanged: { clearSelection(); cancelReorder(); }
+    onTabChanged: { clearSelection(); cancelReorder(); if (tab !== "Folders") folderPath = ""; }
+    onSongSortIndexChanged: { pendingSongsTop = true; }
+    onSongSortAscChanged: { pendingSongsTop = true; }
+    onArtistSortIndexChanged: { pendingCollectionsTop = true; }
+    onArtistSortAscChanged: { pendingCollectionsTop = true; }
     property bool selectionMode: false
     property var selectedKeys: ({})
     property string selectionAnchor: ""
@@ -101,7 +109,10 @@ Item {
     BulkActions { id: bulkActions; pane: pane; shell: pane.shell }
     function bulkAction(action) { bulkActions.run(action); }
     function focusSearch() {
-        if (tab !== "Songs" && !collectionId) {
+        if (tab === "Folders" && !collectionId) {
+            folderFilter.forceActiveFocus();
+            folderFilter.selectAll();
+        } else if (tab !== "Songs" && !collectionId) {
             collectionFilter.forceActiveFocus();
             collectionFilter.selectAll();
         } else {
@@ -130,14 +141,14 @@ Item {
         let dir = songSortAsc ? 1 : -1;
         let list = (collectionId ? app.collectionTracks(collectionId) : library.tracks).slice();
         if (!collectionId) {
-            if (sort.currentIndex === 1)
+            if (songSortIndex === 1)
                 list.sort((a, b) => dir * (a.title || "").localeCompare(b.title || ""));
-            else if (sort.currentIndex === 2)
-                list.sort((a, b) => dir * (a.artist || "").localeCompare(b.artist || ""));
-            else if (sort.currentIndex === 3)
-                list.sort((a, b) => dir * ((a.duration || 0) - (b.duration || 0)));
-            else if (songSortAsc)
-                list.reverse();
+            else if (songSortIndex === 2)
+                list.sort((a, b) => (dir * (a.artist || "").localeCompare(b.artist || "")) || (a.title || "").localeCompare(b.title || ""));
+            else if (songSortIndex === 3)
+                list.sort((a, b) => (dir * ((a.duration || 0) - (b.duration || 0))) || (a.title || "").localeCompare(b.title || ""));
+            else
+                list.sort((a, b) => (dir * ((a.added || 0) - (b.added || 0))) || (a.title || "").localeCompare(b.title || ""));
         }
         // keep a plain JS snapshot so field patches remain available when a later search/sort rebuilds the view, without invalidating that view now
         return list.map(row => Object.assign({},row));
@@ -146,16 +157,33 @@ Item {
     property var matchingCollections: visibleCollections.filter(c => c.name.toLowerCase().includes(collectionFilter.text.toLowerCase()))
     property var visibleCollections: {
         let observed = revision;
-        if(tab === "Songs" || collectionId)return [];
+        if(tab === "Songs" || tab === "Folders" || collectionId)return [];
         let list = app.collections.filter(c => tab === "Playlists" ? c.kind === "playlist" : c.kind === (tab === "Artists" ? "artist" : albumView === "Generated" ? "generated" : "custom")).slice();
         if (tab === "Artists") {
             let dir = artistSortAsc ? 1 : -1;
-            if (artistSortIndex === 1)
-                list.sort((a, b) => (dir * ((a.count || 0) - (b.count || 0))) || (a.name || "").localeCompare(b.name || ""));
-            else
-                list.sort((a, b) => dir * (a.name || "").localeCompare(b.name || ""));
+            list.sort((a, b) => {
+                if (!!a.pinned !== !!b.pinned) return a.pinned ? -1 : 1;
+                if (artistSortIndex === 1)
+                    return (dir * ((a.count || 0) - (b.count || 0))) || (a.name || "").localeCompare(b.name || "");
+                return dir * (a.name || "").localeCompare(b.name || "");
+            });
         }
         return list;
+    }
+    property var folderData: {
+        let observed = revision;
+        if (tab !== "Folders" || collectionId) return ({ path: "", name: "Folders", parentPath: "", breadcrumbs: [], folders: [], tracks: [], allTracks: [] });
+        return app.folderView(folderPath);
+    }
+    property var filteredSubfolders: {
+        const q = folderFilter.text.trim().toLowerCase();
+        const subs = folderData.folders || [];
+        return q ? subs.filter(f => (f.name || "").toLowerCase().includes(q)) : subs;
+    }
+    property var filteredFolderTracks: {
+        const q = folderFilter.text.trim().toLowerCase();
+        const items = folderData.tracks || [];
+        return q ? items.filter(t => ((t.title || "") + " " + (t.artist || "") + " " + (t.album || "")).toLowerCase().includes(q)) : items;
     }
     Connections {
         target: app
@@ -196,7 +224,7 @@ Item {
                     id: musicNavigation
                     spacing: 6
                     Repeater {
-                        model: ["Songs", "Playlists", "Artists", "Albums"]
+                        model: ["Songs", "Playlists", "Artists", "Albums", "Folders"]
                         FlatButton {
                             required property string modelData
                             text: modelData
@@ -208,6 +236,7 @@ Item {
                             onClicked: {
                                 pane.tab = modelData;
                                 pane.collectionId = "";
+                                if (modelData === "Folders") pane.folderPath = "";
                                 filter.text = "";
                             }
                         }
@@ -255,6 +284,13 @@ Item {
                 elide: Text.ElideRight
             }
             FlatButton {
+                glyph: "pin"
+                hint: pane.selectedCollection.pinned ? "Unpin" : "Pin to top"
+                visible: pane.selectedCollection.kind === "playlist" || pane.selectedCollection.kind === "artist"
+                checked: !!pane.selectedCollection.pinned
+                onClicked: app.togglePin(pane.selectedCollection.kind, pane.selectedCollection.id)
+            }
+            FlatButton {
                 glyph: "plus"; hint: "Add songs"; visible: pane.editable
                 onClicked: shell.addSongs(pane.collectionId)
             }
@@ -279,11 +315,15 @@ Item {
         RowLayout {
             visible: pane.tab === "Songs" || !!pane.collectionId
             Layout.fillWidth: true
+            spacing: 8
             FlatButton {
                 id: selectToggle
                 objectName: "selectSongs"
                 text: pane.selectionMode ? "Done" : "Select songs"
                 glyph: pane.selectionMode ? "check" : "list-checks"
+                outlined: true
+                Layout.preferredHeight: 42
+                Layout.alignment: Qt.AlignVCenter
                 hint: pane.selectionMode ? "Finish selecting songs" : "Select songs for bulk actions. Ctrl-click toggles a song; Shift-click selects a range."
                 checked: pane.selectionMode
                 onClicked: { if (pane.selectionMode) pane.clearSelection(); else { pane.selectionMode = true; pane.cancelReorder(); songs.forceActiveFocus(); } }
@@ -294,30 +334,43 @@ Item {
                 onTextChanged: { pane.selectionAnchor = ""; pane.cancelReorder(); songs.contentY = 0; if (!text) { searchDelay.stop(); pane.appliedQuery = ""; } else searchDelay.restart(); }
                 search: true
                 Layout.fillWidth: true
+                Layout.preferredHeight: 42
+                Layout.alignment: Qt.AlignVCenter
                 placeholderText: pane.collectionId ? (pane.editable || pane.collectionId === "liked" || pane.collectionId === "recent" ? "Search this playlist" : "Search this collection") : "Search your music"
                 selectByMouse: true
             }
             AppCombo {
                 id: sort
-                onCurrentIndexChanged: {
+                currentIndex: pane.songSortIndex
+                onActivated: idx => {
                     pane.clearSelection();
                     pane.cancelReorder();
-                    pane.songSortAsc = (currentIndex === 1 || currentIndex === 2);
+                    pane.songSortIndex = idx;
+                    pane.songSortAsc = (idx === 1 || idx === 2);
                 }
                 model: ["Recently added", "Title", "Artist", "Duration"]
-                Layout.preferredWidth: Math.min(150, pane.width * 0.28)
+                Layout.minimumWidth: 156
+                Layout.preferredWidth: 168
+                Layout.preferredHeight: 42
+                Layout.alignment: Qt.AlignVCenter
                 visible: !pane.collectionId
             }
             FlatButton {
+                objectName: "songSortDirection"
                 visible: !pane.collectionId
                 outlined: true
-                glyph: pane.songSortAsc ? "chevron-up" : "chevron-down"
-                hint: pane.songSortAsc ? "Ascending order (click to flip)" : "Descending order (click to flip)"
+                Layout.preferredWidth: 42
+                Layout.preferredHeight: 42
+                Layout.alignment: Qt.AlignVCenter
+                glyph: pane.songSortAsc ? "arrow-up" : "arrow-down"
+                hint: pane.songSortAsc
+                    ? (["Oldest first", "Title A–Z", "Artist A–Z", "Shortest first"][pane.songSortIndex] + " (click to reverse)")
+                    : (["Newest first", "Title Z–A", "Artist Z–A", "Longest first"][pane.songSortIndex] + " (click to reverse)")
                 onClicked: pane.songSortAsc = !pane.songSortAsc
             }
         }
         RowLayout {
-            visible: pane.tab !== "Songs" && !pane.collectionId
+            visible: pane.tab !== "Songs" && pane.tab !== "Folders" && !pane.collectionId
             Layout.fillWidth: true
             spacing: 8
             AppField {
@@ -326,24 +379,155 @@ Item {
                 search: true
                 placeholderText: pane.tab === "Playlists" ? "Find a playlist" : pane.tab === "Artists" ? "Find an artist" : "Find an album"
                 Layout.fillWidth: true
+                Layout.preferredHeight: 42
+                Layout.alignment: Qt.AlignVCenter
             }
             AppCombo {
                 id: artistSortCombo
                 visible: pane.tab === "Artists"
                 model: ["Name", "Songs"]
                 currentIndex: pane.artistSortIndex
-                Layout.preferredWidth: Math.min(120, pane.width * 0.24)
-                onCurrentIndexChanged: {
-                    pane.artistSortIndex = currentIndex;
-                    pane.artistSortAsc = (currentIndex === 0);
+                Layout.minimumWidth: 112
+                Layout.preferredWidth: 122
+                Layout.preferredHeight: 42
+                Layout.alignment: Qt.AlignVCenter
+                onActivated: idx => {
+                    pane.artistSortIndex = idx;
+                    pane.artistSortAsc = (idx === 0);
                 }
             }
             FlatButton {
+                objectName: "artistSortDirection"
                 visible: pane.tab === "Artists"
                 outlined: true
-                glyph: pane.artistSortAsc ? "chevron-up" : "chevron-down"
-                hint: pane.artistSortAsc ? "Ascending order (click to flip)" : "Descending order (click to flip)"
+                Layout.preferredWidth: 42
+                Layout.preferredHeight: 42
+                Layout.alignment: Qt.AlignVCenter
+                glyph: pane.artistSortAsc ? "arrow-up" : "arrow-down"
+                hint: pane.artistSortAsc
+                    ? (pane.artistSortIndex === 1 ? "Fewest songs first (click to reverse)" : "Name A–Z (click to reverse)")
+                    : (pane.artistSortIndex === 1 ? "Most songs first (click to reverse)" : "Name Z–A (click to reverse)")
                 onClicked: pane.artistSortAsc = !pane.artistSortAsc
+            }
+        }
+        ColumnLayout {
+            visible: pane.tab === "Folders" && !pane.collectionId
+            Layout.fillWidth: true
+            Layout.fillHeight: true
+            spacing: 12
+            RowLayout {
+                visible: !!pane.folderPath
+                Layout.fillWidth: true
+                spacing: 6
+                FlatButton {
+                    glyph: "arrow-left"
+                    hint: "Up one folder"
+                    onClicked: { pane.folderPath = pane.folderData.parentPath || ""; folderFilter.text = ""; }
+                }
+                Flickable {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 36
+                    contentWidth: breadcrumbRow.implicitWidth
+                    contentHeight: 36
+                    clip: true
+                    boundsBehavior: Flickable.StopAtBounds
+                    flickableDirection: Flickable.HorizontalFlick
+                    Row {
+                        id: breadcrumbRow
+                        height: 36
+                        spacing: 2
+                        Repeater {
+                            model: pane.folderData.breadcrumbs || []
+                            Row {
+                                required property var modelData
+                                required property int index
+                                height: 36
+                                spacing: 2
+                                AppIcon {
+                                    visible: index > 0
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    glyph: "chevron-right"
+                                    width: 14; height: 14
+                                    color: Theme.muted
+                                }
+                                FlatButton {
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    text: modelData.name
+                                    leftPadding: 8; rightPadding: 8
+                                    checked: index === (pane.folderData.breadcrumbs || []).length - 1
+                                    onClicked: { pane.folderPath = modelData.path; folderFilter.text = ""; }
+                                }
+                            }
+                        }
+                    }
+                }
+                FlatButton {
+                    text: "Play all"
+                    glyph: "play"
+                    outlined: true
+                    visible: (pane.folderData.allTracks || []).length > 0
+                    onClicked: {
+                        const list = pane.folderData.allTracks || [];
+                        if (list.length > 0)
+                            app.playTrack(list[0].id, list, "Folder: " + (pane.folderData.name || "Folders"), "folder:" + pane.folderPath);
+                    }
+                }
+            }
+            AppField {
+                id: folderFilter
+                objectName: "folderSearch"
+                search: true
+                placeholderText: pane.folderPath ? "Filter this folder" : "Filter music folders"
+                Layout.fillWidth: true
+                Layout.preferredHeight: 42
+            }
+            ListView {
+                id: folderList
+                objectName: "folderTreeList"
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                clip: true
+                spacing: 3
+                model: StableListModel {
+                    id: folderTrackModel
+                    rows: pane.filteredFolderTracks
+                }
+                ScrollBar.vertical: ScrollBar {}
+                header: Column {
+                    width: folderList.width
+                    Repeater {
+                        model: pane.filteredSubfolders
+                        CollectionRow {
+                            required property var modelData
+                            width: parent.width
+                            title: modelData.name
+                            subtitle: (modelData.subfolderCount > 0
+                                ? modelData.subfolderCount + (modelData.subfolderCount === 1 ? " folder · " : " folders · ")
+                                : "") + modelData.trackCount + (modelData.trackCount === 1 ? " song" : " songs")
+                            glyph: "folder"
+                            onClicked: { pane.folderPath = modelData.path; folderFilter.text = ""; folderList.contentY = 0; }
+                        }
+                    }
+                }
+                delegate: TrackRow {
+                    required property var record
+                    width: folderList.width
+                    track: record
+                    shell: pane.shell
+                    sourceTracks: pane.filteredFolderTracks
+                    sourceName: "Folder: " + (pane.folderData.name || "Folders")
+                    sourceId: "folder:" + pane.folderPath
+                }
+                Label {
+                    anchors.centerIn: parent
+                    width: parent.width - 30
+                    horizontalAlignment: Text.AlignHCenter
+                    wrapMode: Text.WordWrap
+                    visible: pane.filteredSubfolders.length === 0 && pane.filteredFolderTracks.length === 0
+                    text: folderFilter.text ? "No matching folders or songs" : "No folders yet.\nAdd a music folder to browse by directory."
+                    color: Theme.muted
+                    lineHeight: 1.5
+                }
             }
         }
         FocusScope {
@@ -390,6 +574,8 @@ Item {
             model: StableListModel {
                 id: songModel
                 rows: pane.visibleTracks
+                // reset viewport after sorting so persistent index tracking doesnt jump to the bottom
+                onRowsChanged: if (pane.pendingSongsTop) { pane.pendingSongsTop = false; Qt.callLater(() => songs.positionViewAtBeginning()); }
             }
             ScrollBar.vertical: ScrollBar {
             }
@@ -471,12 +657,14 @@ Item {
         }
         ListView {
             id: collections
-            visible: pane.tab !== "Songs" && !pane.collectionId
+            visible: pane.tab !== "Songs" && pane.tab !== "Folders" && !pane.collectionId
             Layout.fillWidth: true
             Layout.fillHeight: true
             clip: true
             model: StableListModel {
+                id: collectionsModel
                 rows: pane.matchingCollections
+                onRowsChanged: if (pane.pendingCollectionsTop) { pane.pendingCollectionsTop = false; Qt.callLater(() => collections.positionViewAtBeginning()); }
             }
             ScrollBar.vertical: ScrollBar {
             }
@@ -527,9 +715,10 @@ Item {
                 required property var record
                 width: collections.width
                 title: record.name
-                subtitle: (record.owner ? record.owner + " · " : "") + record.count + " songs"
+                subtitle: (record.owner ? record.owner + " · " : "") + record.count + (record.count === 1 ? " song" : " songs")
                 cover: record.cover || ""
-                actions: !["generated", "artist"].includes(record.kind)
+                pinned: !!record.pinned
+                actions: record.kind !== "generated"
                 onClicked: { pane.collectionId = record.id; pane.collectionName = record.name; }
                 onMenuRequested: anchor => shell.collectionMenu(record, anchor)
             }

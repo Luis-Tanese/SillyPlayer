@@ -225,12 +225,15 @@ data class Preferences(
     val pauseFade: Boolean = false,
     val fadeMs: Int = 300,
     val crossfadeMs: Int = 0,
+    val smartShuffle: Boolean = false,
     val duckAudio: Boolean = true,
     val musicDir: String = "",
     val queue: QueueState = QueueState(),
     val sleepEnd: Long = 0,
     val updateNotifications: Boolean = true,
     val lastNotifiedVersion: String = "",
+    val pinnedPlaylists: List<String> = emptyList(),
+    val pinnedArtists: List<String> = emptyList(),
 )
 
 @Serializable

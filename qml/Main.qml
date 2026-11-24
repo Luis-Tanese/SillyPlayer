@@ -252,6 +252,7 @@ ApplicationWindow {
     }
 
     function showSleepTimer() { sleepDialog.open(); }
+    function openEqualizer() { eqDialog.open(); }
     SleepDialog { id: sleepDialog }
     PlaylistDownloadDialog { id: playlistDownloadDialog }
     LibraryToolsDialog { id: libraryToolsDialog }
@@ -383,6 +384,8 @@ ApplicationWindow {
             Image {
                 source: "qrc:/assets/sillyplayer.png"
                 sourceSize: Qt.size(128, 128)
+                smooth: true
+                mipmap: true
                 Layout.preferredWidth: 44
                 Layout.preferredHeight: 44
                 fillMode: Image.PreserveAspectFit
@@ -829,7 +832,7 @@ ApplicationWindow {
         AppMenuItem {
             text: "Remove from collection"
             glyph: "x"
-            visible: root.page !== "Me!" && !!musicPane.collectionId && musicPane.collectionId !== "liked" && musicPane.collectionId !== "recent" && !musicPane.collectionId.startsWith("album:") && !musicPane.collectionId.startsWith("artist:")
+            visible: root.page !== "Me!" && !!musicPane.collectionId && musicPane.collectionId !== "liked" && musicPane.collectionId !== "recent" && !musicPane.collectionId.startsWith("album:") && !musicPane.collectionId.startsWith("artist:") && !musicPane.collectionId.startsWith("folder:")
             height: visible ? implicitHeight : 0
             onTriggered: app.removeMember(musicPane.collectionId, root.selectedTrack.memberId)
         }
@@ -898,8 +901,19 @@ ApplicationWindow {
     AppMenu {
         id: collectionActions
         AppMenuItem {
+            text: root.selectedCollection.kind === "artist"
+                ? (root.selectedCollection.pinned ? "Unpin Artist" : "Pin Artist")
+                : (root.selectedCollection.pinned ? "Unpin Playlist" : "Pin Playlist")
+            glyph: "pin"
+            visible: root.selectedCollection.kind === "playlist" || root.selectedCollection.kind === "artist"
+            height: visible ? implicitHeight : 0
+            onTriggered: app.togglePin(root.selectedCollection.kind, root.selectedCollection.id)
+        }
+        AppMenuItem {
             text: "Edit Playlist"
             glyph: "pencil"
+            visible: root.selectedCollection.kind !== "artist"
+            height: visible ? implicitHeight : 0
             onTriggered: {
                 root.renameMode = true;
                 nameInput.text = root.selectedCollection.name;
@@ -909,11 +923,15 @@ ApplicationWindow {
         AppMenuItem {
             text: "Change Cover"
             glyph: "image"
+            visible: root.selectedCollection.kind !== "artist"
+            height: visible ? implicitHeight : 0
             onTriggered: app.coverCollection(root.selectedCollection.id)
         }
         AppMenuItem {
             text: "Export playlist (.m3u8)"
             glyph: "download"
+            visible: root.selectedCollection.kind !== "artist"
+            height: visible ? implicitHeight : 0
             onTriggered: {
                 const res = app.exportPlaylistM3u(root.selectedCollection.id);
                 if (res && res.message) musicPane.resultMessage = res.message;
@@ -922,6 +940,8 @@ ApplicationWindow {
         AppMenuItem {
             text: "Delete Playlist"
             glyph: "trash-2"
+            visible: root.selectedCollection.kind !== "artist"
+            height: visible ? implicitHeight : 0
             onTriggered: deleteDialog.open()
         }
     }
@@ -1459,9 +1479,13 @@ ApplicationWindow {
         title: "Equalizer"
         standardButtons: Dialog.Close
         property var gains: app.settings.eqGains
-        function apply(values) {
+        onAboutToShow: {
+            const idx = eqPreset.model.indexOf(app.settings.eqPreset || "Flat");
+            eqPreset.currentIndex = idx >= 0 ? idx : 0;
+        }
+        function apply(values, presetName) {
             gains = values;
-            app.applyEq(eqEnabled.checked, values);
+            app.applyEq(eqEnabled.checked, values, presetName || "Custom");
         }
         ColumnLayout {
             width: parent.width
@@ -1471,7 +1495,7 @@ ApplicationWindow {
                     id: eqEnabled
                     text: "Enabled"
                     checked: app.settings.eqEnabled
-                    onToggled: app.applyEq(checked, eqDialog.gains)
+                    onToggled: app.applyEq(checked, eqDialog.gains, eqPreset.currentText)
                 }
                 AppCombo {
                     id: eqPreset
@@ -1479,7 +1503,7 @@ ApplicationWindow {
                     onActivated: {
                         const presets = [[0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [6, 5, 4, 2, 0, 0, 0, 0, 0, 0], [4, 3, 1, -1, -2, 1, 3, 4, 4, 3], [-1, 1, 3, 4, 3, 0, -1, -1, 1, 2], [3, 2, 0, 0, -1, -1, 0, 2, 3, 4]];
                         if (currentIndex < 5)
-                            eqDialog.apply(presets[currentIndex]);
+                            eqDialog.apply(presets[currentIndex], currentText);
                     }
                 }
                 Item {
@@ -1489,7 +1513,7 @@ ApplicationWindow {
                     text: "Reset"
                     onClicked: {
                         eqPreset.currentIndex = 0;
-                        eqDialog.apply([0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+                        eqDialog.apply([0, 0, 0, 0, 0, 0, 0, 0, 0, 0], "Flat");
                     }
                 }
             }

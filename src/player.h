@@ -45,7 +45,7 @@ public:
   bool loaded() const { return hasFile; }
   void load(const QString &path, const QString &audio = {},
             const QVariantMap &headers = {}, double resume = 0,
-            bool paused = false);
+            bool paused = false, bool fadeIn = false);
   Q_INVOKABLE void play();
   Q_INVOKABLE void pausePlayback();
   Q_INVOKABLE void pauseWithFade();
@@ -55,6 +55,9 @@ public:
   void setTrackVolume(double percent);
   void setSpeed(double speed, bool nightcore);
   void setPauseFade(bool enabled, int milliseconds);
+  void setCrossfadeMs(int milliseconds);
+  int crossfadeMs() const { return transitionMs; }
+  double transitionGainValue() const { return transitionGain; }
   void setEq(bool enabled, const QVariantList &gains);
   QVariantMap bufferStats() const;
   void stop();
@@ -72,7 +75,7 @@ signals:
 private:
   mpv_handle *m = nullptr;
   QTimer timer;
-  QTimer fadeTimer, volumeTimer, speedTimer;
+  QTimer fadeTimer, transitionTimer, volumeTimer, speedTimer;
   int speedInFlight = 0, filtersInFlight = 0;
   bool startAfterSpeed = false;
   double sentSpeed = 1;
@@ -84,10 +87,12 @@ private:
   bool volumeInFlight = false, volumeApplied = false;
   double sentVolume = 0, appliedVolume = 0;
   static constexpr quint64 volumeRequest = quint64(1) << 63;
-  QElapsedTimer fadeClock;
+  QElapsedTimer fadeClock, transitionClock;
   bool fadeEnabled = false;
   int fadeMilliseconds = 300;
-  double fadeGain = 1, playbackSpeed = 1, songVolume = 100;
+  int transitionMs = 0;
+  bool pendingFadeIn = false, fadingIn = false;
+  double fadeGain = 1, transitionGain = 1, playbackSpeed = 1, songVolume = 100;
   double pos = 0, dur = 0, vol = 70, resumeAt = 0;
   bool pause = true, canSeek = false, stalled = false, hasFile = false,
        resumePaused = false;
@@ -98,6 +103,9 @@ private:
   QElapsedTimer seekClock;
   void updateFilters();
   void resetFade();
+  void resetTransitionFade();
+  void startTransitionFadeIn();
+  void updateTransitionFadeOut();
   void writeVolume();
   void flushVolume();
   void poll();

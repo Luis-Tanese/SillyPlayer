@@ -39,9 +39,27 @@ fun MusicScreen(
     val tracks by g.library.tracks.collectAsStateWithLifecycle()
     val collections by g.library.collections.collectAsStateWithLifecycle()
     val members by g.library.members.collectAsStateWithLifecycle()
+    val roots by g.library.roots.collectAsStateWithLifecycle()
     var tab by rememberSaveable { mutableStateOf("Songs") }
     var collectionId by rememberSaveable { mutableStateOf("") }
     var collectionName by rememberSaveable { mutableStateOf("") }
+    var folderPath by rememberSaveable { mutableStateOf("") }
+    val pinnedPlaylists = remember(prefs.pinnedPlaylists) { prefs.pinnedPlaylists.toSet() }
+    val pinnedArtists = remember(prefs.pinnedArtists) { prefs.pinnedArtists.toSet() }
+    fun togglePinPlaylist(id: String) {
+        g.task {
+            g.prefs.update { p ->
+                p.copy(pinnedPlaylists = if (id in p.pinnedPlaylists) p.pinnedPlaylists - id else p.pinnedPlaylists + id)
+            }
+        }
+    }
+    fun togglePinArtist(id: String) {
+        g.task {
+            g.prefs.update { p ->
+                p.copy(pinnedArtists = if (id in p.pinnedArtists) p.pinnedArtists - id else p.pinnedArtists + id)
+            }
+        }
+    }
     val needsLikes = collectionId == "liked" || (collectionId.isBlank() && tab == "Playlists")
     val likesSource = remember(needsLikes) { if(needsLikes) g.library.likes else flowOf(emptySet<String>()) }
     val likes by likesSource.collectAsStateWithLifecycle(emptySet())
@@ -63,6 +81,7 @@ fun MusicScreen(
     var rename by remember { mutableStateOf<dev.sillyplayer.data.Collection?>(null) }
     var delete by remember { mutableStateOf<dev.sillyplayer.data.Collection?>(null) }
     var collectionMenu by remember { mutableStateOf<dev.sillyplayer.data.Collection?>(null) }
+    var artistMenu by remember { mutableStateOf<Pair<String, String>?>(null) }
     var addTo by remember { mutableStateOf(false) }
     var duplicate by remember { mutableStateOf<Pair<String, List<String>>?>(null) }
     var showSongPicker by rememberSaveable { mutableStateOf(false) }
@@ -74,7 +93,6 @@ fun MusicScreen(
     var batchCover by remember { mutableStateOf("") }
     var cleanPreview by remember { mutableStateOf<List<Triple<String, String, String>>?>(null) }
     val scope = rememberCoroutineScope()
-    val list = rememberSaveable(tab, collectionId, saver = LazyListState.Saver) { LazyListState() }
     val trackById = remember(tracks) { tracks.associateBy { it.id } }
     val collectionById = remember(collections) { collections.associateBy { it.id } }
     val membersByCollection = remember(members) { members.groupBy { it.collection } }
@@ -90,10 +108,19 @@ fun MusicScreen(
         editing = false
         showSongPicker = false
     }
-    BackHandler(selecting || collectionId.isNotEmpty()) {
-        if (selecting) closeSelection() else open("", "")
+    BackHandler(selecting || collectionId.isNotEmpty() || (tab == "Folders" && folderPath.isNotEmpty())) {
+        when {
+            selecting -> closeSelection()
+            collectionId.isNotEmpty() -> open("", "")
+            tab == "Folders" && folderPath.isNotEmpty() -> {
+                folderPath = folderPath.substringBeforeLast('/', "")
+                query = ""
+            }
+        }
     }
-    val orderedRows by produceState<List<SongRow>>(emptyList(), tracks, members, likes, recent, collectionId, sort, sortAsc) {
+    val orderedState by produceState<Pair<String, List<SongRow>>>(
+        "" to emptyList(), tracks, members, likes, recent, collectionId, sort, sortAsc,
+    ) {
         value = withContext(Dispatchers.Default) {
             val values: List<SongRow> =
                 when {
@@ -111,18 +138,12 @@ fun MusicScreen(
                             }
                             .map { SongRow(it.id, it) }
                     }
-                    collectionId.startsWith("album:") ->
+                    collectionId.startsWith("album:") -> {
+                        val targetAlbum = collectionId.removePrefix("album:").substringAfter('|').trim().lowercase(Locale.ROOT)
                         tracks
-                            .filter {
-                                (it.albumArtist
-                                    .ifBlank { it.artist }
-                                    .trim()
-                                    .lowercase(Locale.ROOT) +
-                                    "|" +
-                                    it.album.trim().lowercase(Locale.ROOT)) ==
-                                    collectionId.removePrefix("album:")
-                            }
+                            .filter { it.album.trim().lowercase(Locale.ROOT) == targetAlbum }
                             .map { SongRow(it.id, it) }
+                    }
                     collectionId.isNotBlank() ->
                         (membersByCollection[collectionId] ?: emptyList())
                             .mapNotNull { m -> trackById[m.track]?.let { SongRow(m.id, it, m) } }
@@ -136,26 +157,32 @@ fun MusicScreen(
                             if (sortAsc) values.sortedBy { it.track.title.lowercase(Locale.ROOT) }
                             else values.sortedByDescending { it.track.title.lowercase(Locale.ROOT) }
                         "Artist" ->
-                            if (sortAsc) values.sortedBy { it.track.artist.lowercase(Locale.ROOT) }
-                            else values.sortedByDescending { it.track.artist.lowercase(Locale.ROOT) }
+                            if (sortAsc) values.sortedWith(compareBy<SongRow> { it.track.artist.lowercase(Locale.ROOT) }.thenBy { it.track.title.lowercase(Locale.ROOT) })
+                            else values.sortedWith(compareByDescending<SongRow> { it.track.artist.lowercase(Locale.ROOT) }.thenBy { it.track.title.lowercase(Locale.ROOT) })
                         "Duration" ->
-                            if (sortAsc) values.sortedBy { it.track.duration }
-                            else values.sortedByDescending { it.track.duration }
+                            if (sortAsc) values.sortedWith(compareBy<SongRow> { it.track.duration }.thenBy { it.track.title.lowercase(Locale.ROOT) })
+                            else values.sortedWith(compareByDescending<SongRow> { it.track.duration }.thenBy { it.track.title.lowercase(Locale.ROOT) })
                         else ->
-                            if (sortAsc) values.reversed() else values
+                            if (sortAsc) values.sortedWith(compareBy<SongRow> { it.track.added }.thenBy { it.track.title.lowercase(Locale.ROOT) })
+                            else values.sortedWith(compareByDescending<SongRow> { it.track.added }.thenBy { it.track.title.lowercase(Locale.ROOT) })
                     }
-            ordered
+            "$collectionId|$sort|$sortAsc" to ordered
         }
     }
-    val rows by produceState(orderedRows, orderedRows, query) {
+    val orderedRows = orderedState.second
+    val rowsState by produceState(orderedState, orderedState, query) {
         if (query.isNotBlank()) delay(120)
         value = withContext(Dispatchers.Default) {
-            if (query.isBlank()) orderedRows else orderedRows.filter {
-                it.track.title.contains(query, true) || it.track.artist.contains(query, true) ||
-                    it.track.album.contains(query, true)
-            }
+            val filtered =
+                if (query.isBlank()) orderedState.second
+                else orderedState.second.filter {
+                    it.track.title.contains(query, true) || it.track.artist.contains(query, true) ||
+                        it.track.album.contains(query, true)
+                }
+            orderedState.first to filtered
         }
     }
+    val rows = rowsState.second
     val playbackContext =
         when {
             collectionId.isBlank() -> "Songs"
@@ -190,18 +217,19 @@ fun MusicScreen(
         if (prefs.musicDir.isBlank()) PermissionNotice(pickers, compact = true)
         Row(
             Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 8.dp),
-            horizontalArrangement = Arrangement.spacedBy(4.dp),
+            horizontalArrangement = Arrangement.spacedBy(2.dp),
         ) {
-            for (item in listOf("Songs", "Playlists", "Artists", "Albums")) {
+            for (item in listOf("Songs", "Playlists", "Artists", "Albums", "Folders")) {
                 val active = tab == item
                 Column(
                     Modifier
                         .clip(RoundedCornerShape(8.dp))
                         .clickable {
                             tab = item
+                            if (item == "Folders") folderPath = ""
                             open("", "")
                         }
-                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                        .padding(horizontal = 10.dp, vertical = 8.dp),
                     horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
                     Text(
@@ -234,12 +262,33 @@ fun MusicScreen(
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
+                if (collectionId.startsWith("artist:")) {
+                    val isPinned = collectionId in pinnedArtists
+                    IconAction(
+                        "pin",
+                        if (isPinned) "Unpin artist" else "Pin artist",
+                        tint = if (isPinned) MaterialTheme.colorScheme.primary else LocalContentColor.current,
+                    ) {
+                        togglePinArtist(collectionId)
+                    }
+                }
                 if (orderedRows.isNotEmpty() && (collectionId == "liked" || collectionId == "recent" || collections.any { it.id == collectionId })) {
                     IconAction("download", "Export playlist (.m3u8)") {
                         pickers.exportPlaylist(collectionId, collectionName)
                     }
                 }
                 if (collections.any { it.id == collectionId }) {
+                    val isPlaylist = collections.firstOrNull { it.id == collectionId }?.kind == "playlist"
+                    if (isPlaylist) {
+                        val isPinned = collectionId in pinnedPlaylists
+                        IconAction(
+                            "pin",
+                            if (isPinned) "Unpin playlist" else "Pin playlist",
+                            tint = if (isPinned) MaterialTheme.colorScheme.primary else LocalContentColor.current,
+                        ) {
+                            togglePinPlaylist(collectionId)
+                        }
+                    }
                     Action(if (editing) "Done" else "Edit tracks") {
                         editing = !editing
                         closeSelection()
@@ -250,14 +299,19 @@ fun MusicScreen(
                 }
             }
         if (tab == "Albums" && collectionId.isBlank())
-            Row(Modifier.padding(horizontal = 12.dp, vertical = 2.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                Action("Generated", enabled = albumType != "Generated") { albumType = "Generated" }
-                Action("Custom", enabled = albumType != "Custom") { albumType = "Custom" }
+            Row(Modifier.padding(horizontal = 12.dp, vertical = 4.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                ToolPillButton("Generated", active = albumType == "Generated") { albumType = "Generated" }
+                ToolPillButton("Custom", active = albumType == "Custom") { albumType = "Custom" }
             }
         SearchBarField(
             value = query,
             onChange = { query = it },
-            placeholder = if (showingSongs) "Search songs" else "Find ${tab.lowercase(Locale.ROOT)}",
+            placeholder =
+                when {
+                    showingSongs -> "Search songs"
+                    tab == "Folders" -> if (folderPath.isNotEmpty()) "Filter this folder" else "Filter folders"
+                    else -> "Find ${tab.lowercase(Locale.ROOT)}"
+                },
             modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
         )
         if (showingSongs) {
@@ -268,9 +322,9 @@ fun MusicScreen(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     if (collections.any { it.id == collectionId && it.kind in listOf("playlist", "custom") }) {
-                        Action("Add", "plus") { showSongPicker = true }
+                        ToolPillButton("Add", "plus") { showSongPicker = true }
                     }
-                    Action("Select", "list-checks", rows.isNotEmpty()) { selecting = true }
+                    ToolPillButton("Select", "list-checks", enabled = rows.isNotEmpty()) { selecting = true }
                     Spacer(Modifier.weight(1f))
                     if (collectionId.isBlank()) {
                         SortControl(
@@ -278,9 +332,7 @@ fun MusicScreen(
                             ascending = sortAsc,
                             options = listOf("Recently added", "Title", "Artist", "Duration"),
                             onPick = { picked ->
-                                if (picked == sort) {
-                                    sortAsc = !sortAsc
-                                } else {
+                                if (picked != sort) {
                                     sort = picked
                                     sortAsc = picked == "Title" || picked == "Artist"
                                 }
@@ -417,10 +469,12 @@ fun MusicScreen(
             val canDragReorder = editing && query.isBlank() && collectionId.isNotBlank() && collections.any { it.id == collectionId }
             var liveOrder by remember(rows, canDragReorder) { mutableStateOf(rows) }
             val displayedRows = if (canDragReorder) liveOrder else rows
+            // fresh list state per sort key keeps the view at the top instead of following item 0 to the bottom
+            val songListState = rememberSaveable(tab, collectionId, rowsState.first, saver = LazyListState.Saver) { LazyListState() }
             val reorderState =
-                remember(list, scope, collectionId) {
+                remember(songListState, scope, collectionId) {
                     DragReorderState(
-                        listState = list,
+                        listState = songListState,
                         scope = scope,
                         canSwapTo = { idx -> idx in liveOrder.indices && liveOrder[idx].member != null },
                         onMove = { from, to ->
@@ -438,7 +492,7 @@ fun MusicScreen(
                 }
             LazyColumn(
                 Modifier.weight(1f),
-                state = list,
+                state = songListState,
                 contentPadding = PaddingValues(bottom = 12.dp),
             ) {
                 itemsIndexed(displayedRows, key = { _, row -> row.key }) { index, row ->
@@ -497,11 +551,160 @@ fun MusicScreen(
                         )
                     }
             }
-        } else {
-            val groups by produceState<List<Triple<String, String, List<Track>>>>(
-                emptyList(), tab, albumType, tracks, membersByCollection, collections, likes, recent, artistSort, artistSortAsc) {
+        } else if (tab == "Folders") {
+            val folderData by produceState(
+                FolderViewData(), tracks, roots, folderPath,
+            ) {
                 value = withContext(Dispatchers.Default) {
-                when (tab) {
+                    buildAndroidFolderView(tracks, roots, folderPath)
+                }
+            }
+            val visibleSubfolders = remember(folderData.folders, query) {
+                if (query.isBlank()) folderData.folders
+                else folderData.folders.filter { it.name.contains(query, true) }
+            }
+            val visibleFolderTracks = remember(folderData.tracks, query) {
+                if (query.isBlank()) folderData.tracks
+                else folderData.tracks.filter {
+                    it.title.contains(query, true) || it.artist.contains(query, true) || it.album.contains(query, true)
+                }
+            }
+            val folderListState = rememberSaveable(folderPath, saver = LazyListState.Saver) { LazyListState() }
+            if (folderPath.isNotEmpty()) {
+                Row(
+                    Modifier.fillMaxWidth().padding(start = 4.dp, end = 12.dp, top = 2.dp, bottom = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    IconAction("arrow-left", "Up one folder") {
+                        folderPath = folderData.parentPath
+                        query = ""
+                    }
+                    Row(
+                        Modifier.weight(1f).horizontalScroll(rememberScrollState()),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(2.dp),
+                    ) {
+                        for ((idx, crumb) in folderData.breadcrumbs.withIndex()) {
+                            if (idx > 0) {
+                                Glyph("chevron-right", modifier = Modifier.size(14.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                            val currentCrumb = idx == folderData.breadcrumbs.lastIndex
+                            Text(
+                                crumb.name,
+                                fontSize = 13.sp,
+                                fontWeight = if (currentCrumb) FontWeight.SemiBold else FontWeight.Normal,
+                                color = if (currentCrumb) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(6.dp))
+                                    .clickable {
+                                        folderPath = crumb.path
+                                        query = ""
+                                    }
+                                    .padding(horizontal = 6.dp, vertical = 4.dp),
+                                maxLines = 1,
+                            )
+                        }
+                    }
+                    if (folderData.allTracks.isNotEmpty()) {
+                        ToolPillButton("Play all", "play") {
+                            g.engine.value?.playTrack(
+                                folderData.allTracks.first(),
+                                folderData.allTracks,
+                                "Folder: ${folderData.name}",
+                                0,
+                            )
+                        }
+                    }
+                }
+            }
+            LazyColumn(
+                Modifier.weight(1f),
+                state = folderListState,
+                contentPadding = PaddingValues(bottom = 12.dp),
+            ) {
+                items(visibleSubfolders, key = { "folder:${it.path}" }) { sub ->
+                    Row(
+                        Modifier.fillMaxWidth()
+                            .clickable {
+                                folderPath = sub.path
+                                query = ""
+                            }
+                            .padding(horizontal = 12.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Box(
+                            Modifier.size(44.dp)
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(MaterialTheme.colorScheme.surfaceContainerHigh)
+                                .border(1.dp, MaterialTheme.colorScheme.outlineVariant, RoundedCornerShape(12.dp)),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Glyph("folder", tint = MaterialTheme.colorScheme.primary)
+                        }
+                        Spacer(Modifier.width(12.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                sub.name,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.Medium,
+                            )
+                            val subLabel =
+                                buildString {
+                                    if (sub.subfolderCount > 0) {
+                                        append(if (sub.subfolderCount == 1) "1 folder · " else "${sub.subfolderCount} folders · ")
+                                    }
+                                    append(if (sub.trackCount == 1) "1 song" else "${sub.trackCount} songs")
+                                }
+                            Text(
+                                subLabel,
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        Glyph("chevron-right", modifier = Modifier.size(18.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+                itemsIndexed(visibleFolderTracks, key = { _, t -> "ftrack:${t.id}" }) { index, track ->
+                    TrackListRow(
+                        track = track,
+                        onPlay = {
+                            g.engine.value?.playTrack(
+                                track,
+                                visibleFolderTracks,
+                                "Folder: ${folderData.name}",
+                                index,
+                            )
+                        },
+                        onExpand = {
+                            g.engine.value?.playTrack(
+                                track,
+                                visibleFolderTracks,
+                                "Folder: ${folderData.name}",
+                                index,
+                            )
+                            onExpand()
+                        },
+                        onAction = { onAction(track, it) },
+                    )
+                }
+                if (visibleSubfolders.isEmpty() && visibleFolderTracks.isEmpty()) {
+                    item {
+                        Hint(
+                            if (query.isNotBlank()) "No matching folders or songs"
+                            else "Add a music folder in Settings to browse by directory."
+                        )
+                    }
+                }
+            }
+        } else {
+            val groupsState by produceState<Pair<String, List<Triple<String, String, List<Track>>>>>(
+                "" to emptyList(), tab, albumType, tracks, membersByCollection, collections, likes, recent, artistSort, artistSortAsc, pinnedPlaylists, pinnedArtists,
+            ) {
+                value = withContext(Dispatchers.Default) {
+                val computed = when (tab) {
                     "Artists" -> {
                         val buckets = LinkedHashMap<String, Pair<String, MutableList<Track>>>()
                         for (track in tracks) {
@@ -515,14 +718,19 @@ fun MusicScreen(
                             buckets.map { (key, entry) ->
                                 Triple("artist:$key", entry.first, entry.second.toList())
                             }
-                        when (artistSort) {
-                            "Songs" ->
-                                if (artistSortAsc) listItems.sortedWith(compareBy<Triple<String, String, List<Track>>> { it.third.size }.thenBy { it.second.lowercase(Locale.ROOT) })
-                                else listItems.sortedWith(compareByDescending<Triple<String, String, List<Track>>> { it.third.size }.thenBy { it.second.lowercase(Locale.ROOT) })
-                            else ->
-                                if (artistSortAsc) listItems.sortedBy { it.second.lowercase(Locale.ROOT) }
-                                else listItems.sortedByDescending { it.second.lowercase(Locale.ROOT) }
-                        }
+                        val baseComp: Comparator<Triple<String, String, List<Track>>> =
+                            when (artistSort) {
+                                "Songs" ->
+                                    if (artistSortAsc) compareBy<Triple<String, String, List<Track>>> { it.third.size }.thenBy { it.second.lowercase(Locale.ROOT) }
+                                    else compareByDescending<Triple<String, String, List<Track>>> { it.third.size }.thenBy { it.second.lowercase(Locale.ROOT) }
+                                else ->
+                                    if (artistSortAsc) compareBy { it.second.lowercase(Locale.ROOT) }
+                                    else compareByDescending { it.second.lowercase(Locale.ROOT) }
+                            }
+                        listItems.sortedWith(
+                            compareByDescending<Triple<String, String, List<Track>>> { it.first in pinnedArtists }
+                                .then(baseComp)
+                        )
                     }
                     "Albums" ->
                         if (albumType == "Custom")
@@ -537,27 +745,19 @@ fun MusicScreen(
                                     )
                                 }
                         else
+                            // group generated albums by album title so featuring artists dont create duplicate albums
                             tracks
                                 .filter { it.album.isNotBlank() }
-                                .groupBy {
-                                    it.albumArtist
-                                        .ifBlank { it.artist }
-                                        .trim()
-                                        .lowercase(Locale.ROOT) +
-                                        "|" +
-                                        it.album.trim().lowercase(Locale.ROOT)
-                                }
+                                .groupBy { it.album.trim().lowercase(Locale.ROOT) }
                                 .map { (key, values) ->
-                                    Triple("album:" + key, values.first().album, values)
+                                    Triple("album:$key", values.first().album.trim(), values)
                                 }
-                                .sortedBy { it.second.lowercase() }
-                    else ->
-                        listOf(
-                            Triple("liked", "Liked Songs", tracks.filter { it.id in likes }),
-                            Triple("recent", "Recently Played", recent.mapNotNull { trackById[it] }),
-                        ) +
+                                .sortedBy { it.second.lowercase(Locale.ROOT) }
+                    else -> {
+                        val playlists =
                             collections
                                 .filter { it.kind == "playlist" }
+                                .sortedByDescending { it.id in pinnedPlaylists }
                                 .map { c ->
                                     Triple(
                                         c.id,
@@ -566,9 +766,17 @@ fun MusicScreen(
                                             .mapNotNull { trackById[it.track] },
                                     )
                                 }
+                        listOf(
+                            Triple("liked", "Liked Songs", tracks.filter { it.id in likes }),
+                            Triple("recent", "Recently Played", recent.mapNotNull { trackById[it] }),
+                        ) + playlists
+                    }
                 }
+                "$tab|$albumType|$artistSort|$artistSortAsc" to computed
                 }
             }
+            val groups = groupsState.second
+            val collectionListState = rememberSaveable(tab, albumType, groupsState.first, saver = LazyListState.Saver) { LazyListState() }
             if (tab == "Artists") {
                 Row(
                     Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
@@ -585,9 +793,7 @@ fun MusicScreen(
                         ascending = artistSortAsc,
                         options = listOf("Name", "Songs"),
                         onPick = { picked ->
-                            if (picked == artistSort) {
-                                artistSortAsc = !artistSortAsc
-                            } else {
+                            if (picked != artistSort) {
                                 artistSort = picked
                                 artistSortAsc = picked == "Name"
                             }
@@ -596,7 +802,7 @@ fun MusicScreen(
                     )
                 }
             }
-            LazyColumn(Modifier.weight(1f), state = list) {
+            LazyColumn(Modifier.weight(1f), state = collectionListState) {
                 if (tab == "Playlists" || tab == "Albums" && albumType == "Custom")
                     item {
                         Row(
@@ -658,6 +864,9 @@ fun MusicScreen(
                     key = { it.first },
                 ) { (id, title, values) ->
                     val collection = collectionById[id]
+                    val isPinned =
+                        (collection?.kind == "playlist" && id in pinnedPlaylists) ||
+                            (id.startsWith("artist:") && id in pinnedArtists)
                     Row(
                         Modifier.fillMaxWidth()
                             .clickable { open(id, title) }
@@ -671,12 +880,18 @@ fun MusicScreen(
                         )
                         Spacer(Modifier.width(12.dp))
                         Column(Modifier.weight(1f)) {
-                            Text(
-                                title,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                fontSize = 14.sp,
-                            )
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                                Text(
+                                    title,
+                                    Modifier.weight(1f, fill = false),
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    fontSize = 14.sp,
+                                )
+                                if (isPinned) {
+                                    Glyph("pin", "Pinned", Modifier.size(13.dp), tint = MaterialTheme.colorScheme.primary)
+                                }
+                            }
                             Text(
                                 if (values.size == 1) "1 song" else "${values.size} songs",
                                 fontSize = 12.sp,
@@ -686,6 +901,10 @@ fun MusicScreen(
                         if (collection != null)
                             IconAction("ellipsis", "Collection actions") {
                                 collectionMenu = collection
+                            }
+                        else if (id.startsWith("artist:"))
+                            IconAction("ellipsis", "Artist actions") {
+                                artistMenu = id to title
                             }
                     }
                 }
@@ -728,11 +947,18 @@ fun MusicScreen(
             },
         )
     collectionMenu?.let { c ->
+        val pinned = c.kind == "playlist" && c.id in pinnedPlaylists
         AlertDialog(
             onDismissRequest = { collectionMenu = null },
             title = { Text(c.name) },
             text = {
                 Column {
+                    if (c.kind == "playlist") {
+                        Action(if (pinned) "Unpin playlist" else "Pin playlist", "pin") {
+                            togglePinPlaylist(c.id)
+                            collectionMenu = null
+                        }
+                    }
                     Action("Edit playlist", "pencil") {
                         name = c.name
                         rename = c
@@ -757,9 +983,30 @@ fun MusicScreen(
             confirmButton = { Action("Close") { collectionMenu = null } },
         )
     }
+    artistMenu?.let { (artistId, artistName) ->
+        val pinned = artistId in pinnedArtists
+        AlertDialog(
+            onDismissRequest = { artistMenu = null },
+            title = { Text(artistName) },
+            text = {
+                Column {
+                    Action(if (pinned) "Unpin artist" else "Pin artist", "pin") {
+                        togglePinArtist(artistId)
+                        artistMenu = null
+                    }
+                }
+            },
+            confirmButton = { Action("Close") { artistMenu = null } },
+        )
+    }
     delete?.let { c ->
         Confirmation("Delete ${c.name}?", "Audio files are kept.", "Delete", { delete = null }) {
-            g.task { g.library.deleteCollection(c.id) }
+            g.task {
+                g.library.deleteCollection(c.id)
+                if (c.id in pinnedPlaylists) {
+                    g.prefs.update { it.copy(pinnedPlaylists = it.pinnedPlaylists - c.id) }
+                }
+            }
             if (collectionId == c.id) open("", "")
         }
     }

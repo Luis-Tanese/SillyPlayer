@@ -114,6 +114,8 @@ class PlaybackEngine(private val g: Graph) {
     private var transitionGain = 1f
     private var transitionFadeJob: Job? = null
     private var crossfadeMs = 0
+    private var smartShuffle = false
+    private var lastPlayedByTrack: Map<String, Long> = emptyMap()
     private var duckAudio = true
     private var previewGain: Pair<String, Float>? = null
     private var sleepFired = 0L
@@ -252,7 +254,18 @@ class PlaybackEngine(private val g: Graph) {
                     } else null
                 }
                 if (requestedMode == p.mode) requestedMode = null
+                val smartChanged = smartShuffle != p.smartShuffle
+                smartShuffle = p.smartShuffle
                 applyPlaybackMode(requestedMode ?: p.mode)
+                if (smartChanged && mode == 2 && local.entries.size > 1) {
+                    val previous = upcomingPlaybackQueue(local.entries, local.index, mode, local.shuffleOrder).map { it.id }
+                    changingQueue = true
+                    try {
+                        applyShuffleOrder(buildShuffleOrder(previous))
+                    } finally { changingQueue = false }
+                    refreshQueueOrder()
+                    save()
+                }
                 crossfadeMs = p.crossfadeMs.coerceIn(0, 8000)
                 if (crossfadeMs == 0) resetTransitionFade()
                 if (duckAudio != p.duckAudio) {
@@ -272,6 +285,17 @@ class PlaybackEngine(private val g: Graph) {
                 eq.settings.set(EqSettings(p.eqEnabled, p.eq))
                 writeVolume()
                 publish()
+            }
+        }
+        scope.launch {
+            g.dao.observeCounters().collect { counters ->
+                val latest = HashMap<String, Long>()
+                for (c in counters) {
+                    if (c.track.isBlank()) continue
+                    val prev = latest[c.track] ?: 0L
+                    if (c.lastPlayed > prev) latest[c.track] = c.lastPlayed
+                }
+                lastPlayedByTrack = latest
             }
         }
         scope.launch {
@@ -305,6 +329,10 @@ class PlaybackEngine(private val g: Graph) {
         }
     }
 
+    private fun buildShuffleOrder(previous: List<String>): List<String> =
+        if (smartShuffle) smartShuffledQueueOrder(local.entries, local.index, previous, lastPlayedByTrack)
+        else shuffledQueueOrder(local.entries, local.index, previous)
+
     private fun applyPlaybackMode(value: Int) {
         val wasShuffle = player.shuffleModeEnabled
         mode = value.coerceIn(0, 2)
@@ -313,7 +341,7 @@ class PlaybackEngine(private val g: Graph) {
         try {
             if (mode == 2 && !wasShuffle) {
                 val previous=upcomingPlaybackQueue(local.entries,local.index,0,local.shuffleOrder).map { it.id }
-                applyShuffleOrder(shuffledQueueOrder(local.entries, local.index, previous))
+                applyShuffleOrder(buildShuffleOrder(previous))
             }
             if (player.repeatMode != repeat) player.repeatMode = repeat
             // repeat-one changes only end-of-song behavior, preserving the visible order

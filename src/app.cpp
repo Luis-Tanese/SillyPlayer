@@ -1,6 +1,8 @@
 #include "app.h"
 #include "artistsplit.h"
+#include "foldertree.h"
 #include "m3u.h"
+#include "smartshuffle.h"
 #include "tagcleanup.h"
 #ifdef Q_OS_WIN
 #include <QProcess>
@@ -86,9 +88,9 @@ App::App(Store *store, const QString &cacheDir, QObject *parent)
   });
   connect(&music, &Player::ended, this, [this] {
     if (m_mode == 1 && index >= 0)
-      playIndex(index, true);
+      playIndex(index, true, true);
     else
-      next();
+      advance(true);
   });
   connect(
       &online, &Online::streamReady, &youtube,
@@ -147,6 +149,7 @@ App::App(Store *store, const QString &cacheDir, QObject *parent)
   music.setSpeed(opts["speed"].toDouble(), opts["nightcore"].toBool());
   music.setEq(opts["eqEnabled"].toBool(), opts["eqGains"].toList());
   music.setPauseFade(opts["pauseFadeEnabled"].toBool(), opts["pauseFadeMs"].toInt());
+  music.setCrossfadeMs(opts["crossfadeMs"].toInt());
   youtube.setPauseFade(opts["pauseFadeEnabled"].toBool(), opts["pauseFadeMs"].toInt());
   discord.setEnabled(opts["discordRpcEnabled"].toBool());
   connect(this, &App::currentChanged, this, [this] { syncDiscordPresence(true); });
@@ -168,12 +171,17 @@ QVariantMap App::settings() const {
       {"light", false},
       {"pauseFadeEnabled", false},
       {"pauseFadeMs", 300},
+      {"crossfadeMs", 0},
+      {"smartShuffle", false},
       {"speed", 1.0},
       {"nightcore", false},
       {"volume", 70},
       {"youtubeVolume", s->setting("videoVolume", 70)},
       {"eqEnabled", false},
       {"eqGains", QVariantList{0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+      {"eqPreset", "Flat"},
+      {"pinnedPlaylists", QStringList{}},
+      {"pinnedArtists", QStringList{}},
       {"windowWidth", 1160},
       {"windowHeight", 800},
       {"windowX", -1},
@@ -197,11 +205,28 @@ void App::setSetting(const QString &key, const QVariant &value) {
   if (key == "pauseFadeMs" && (!std::isfinite(value.toDouble()) || value.toDouble()<50 || value.toDouble()>5000)) {
     emit error("Pause fade must be between 0.05 and 5.00 seconds"); return;
   }
+  if (key == "crossfadeMs") {
+    const double ms = value.toDouble();
+    if (!std::isfinite(ms) || ms < 0 || ms > 8000) {
+      emit error("Transition fade must be between 0 and 8.0 seconds"); return;
+    }
+  }
   s->setSetting(key, value);
   if (key == "pauseFadeEnabled" || key == "pauseFadeMs") {
     const auto opts = settings();
     music.setPauseFade(opts["pauseFadeEnabled"].toBool(),opts["pauseFadeMs"].toInt());
     youtube.setPauseFade(opts["pauseFadeEnabled"].toBool(),opts["pauseFadeMs"].toInt());
+  }
+  if (key == "crossfadeMs") {
+    music.setCrossfadeMs(value.toInt());
+  }
+  if (key == "smartShuffle" && m_mode == 2 && !entries.isEmpty()) {
+    rebuildShuffle();
+    emit queueChanged();
+    save();
+  }
+  if (key == "pinnedPlaylists" || key == "pinnedArtists") {
+    emit collectionsChanged();
   }
   if (key == "discordRpcEnabled") {
     discord.setEnabled(value.toBool());
@@ -367,10 +392,35 @@ void App::rebuildShuffle() {
   QVariant playing;
   if (index >= 0 && index < entries.size())
     playing = entries.takeAt(index);
-  const auto previousOrder=entries;
-  std::shuffle(entries.begin(), entries.end(), *QRandomGenerator::global());
-  if(entries.size()>1 && entries==previousOrder)
-    std::rotate(entries.begin(),entries.begin()+1,entries.end());
+  const auto previousOrder = entries;
+  if (s->setting("smartShuffle", false).toBool() && entries.size() > 1) {
+    QHash<QString, QPair<QString, qint64>> meta;
+    for (const auto &v : s->rows(
+             "SELECT t.id, t.artist, COALESCE(l.lastPlayed, 0) AS lastPlayed "
+             "FROM tracks t LEFT JOIN track_listens l ON l.track = t.id WHERE t.deleted = 0")) {
+      const auto row = v.toMap();
+      meta.insert(row["id"].toString(),
+                  {row["artist"].toString(), row["lastPlayed"].toLongLong()});
+    }
+    const QString currentArtist = playing.isValid()
+        ? meta.value(playing.toMap().value("trackId").toString()).first
+        : QString();
+    QVector<SmartShuffleItem> pool;
+    pool.reserve(entries.size());
+    for (int i = 0; i < entries.size(); ++i) {
+      const auto info = meta.value(entries[i].toMap().value("trackId").toString());
+      pool.append({i, info.first, info.second});
+    }
+    const auto order = smartShuffleOrder(pool, currentArtist, *QRandomGenerator::global());
+    QVariantList reordered;
+    reordered.reserve(entries.size());
+    for (int pos : order) reordered << entries[pos];
+    entries = reordered;
+  } else {
+    std::shuffle(entries.begin(), entries.end(), *QRandomGenerator::global());
+  }
+  if (entries.size() > 1 && entries == previousOrder)
+    std::rotate(entries.begin(), entries.begin() + 1, entries.end());
   if (playing.isValid()) {
     entries.prepend(playing);
     index = 0;
@@ -412,6 +462,7 @@ void App::playTrack(const QString &id, const QVariantList &ids,
   else if (collection.startsWith("stats:")) kind="statistics";
   else if (collection.startsWith("artist:")) kind = "artist";
   else if (collection.startsWith("album:")) kind = "generated";
+  else if (collection.startsWith("folder:")) kind = "folder";
   else if (!collection.isEmpty()) {
     const auto rows = s->rows("SELECT kind FROM collections WHERE id=?", {collection});
     if (!rows.isEmpty()) kind = rows.first().toMap()["kind"].toString();
@@ -422,7 +473,7 @@ void App::playTrack(const QString &id, const QVariantList &ids,
   if (sameTrack) { music.play(); emit queueChanged(); save(); }
   else playIndex(index, true);
 }
-void App::playIndex(int i, bool force) {
+void App::playIndex(int i, bool force, bool autoTransition) {
   if (i < 0 || i >= entries.size())
     return;
   if (i == index && !force) {
@@ -441,12 +492,12 @@ void App::playIndex(int i, bool force) {
   music.setTrackVolume(t.value("volumePercent",100.0).toDouble());
   music.setSpeed(t.value("speed", 1.0).toDouble(), t.value("nightcore", false).toBool());
   listening.begin(t["id"].toString());
-  music.load(t["path"].toString());
+  music.load(t["path"].toString(), {}, {}, 0, false, autoTransition);
   emit currentChanged();
   emit queueChanged();
   save();
 }
-void App::next() {
+void App::advance(bool autoTransition) {
   if (entries.isEmpty())
     return;
   if (m_mode == 2 && index == entries.size() - 1)
@@ -455,12 +506,15 @@ void App::next() {
     int i = (index + n) % entries.size();
     auto t = library.track(entries[i].toMap()["trackId"].toString());
     if (t["available"].toBool() && QFileInfo(t["path"].toString()).isFile()) {
-      playIndex(i, true);
+      playIndex(i, true, autoTransition);
       return;
     }
   }
   music.stop();
   emit error("No available tracks in this queue");
+}
+void App::next() {
+  advance(false);
 }
 void App::previous() {
   if (entries.isEmpty())
@@ -677,25 +731,91 @@ void App::like(const QString &id) {
 }
 QVariantList App::collections() const {
   if(collectionSerial==s->catalogueSerial())return collectionSnapshot;
-  auto out = s->rows(
+  const QStringList pinnedPlaylistsList = s->setting("pinnedPlaylists").toStringList();
+  const QStringList pinnedArtistsList = s->setting("pinnedArtists").toStringList();
+  const QSet<QString> pinnedPlaylists(pinnedPlaylistsList.begin(), pinnedPlaylistsList.end());
+  const QSet<QString> pinnedArtists(pinnedArtistsList.begin(), pinnedArtistsList.end());
+
+  QVariantList rawCollections = s->rows(
       "SELECT c.*,COUNT(CASE WHEN mt.deleted=0 THEN m.id END) AS count,COALESCE(NULLIF(c.art,''),(SELECT t.art "
       "FROM members mm JOIN tracks t ON t.id=mm.track WHERE mm.collection=c.id "
       "AND t.deleted=0 AND t.art<>'' ORDER BY mm.position LIMIT 1),'') AS cover FROM "
       "collections c LEFT JOIN members m ON m.collection=c.id LEFT JOIN tracks mt ON mt.id=m.track GROUP BY c.id "
       "ORDER BY c.rowid");
-  for (auto v :
-       s->rows("SELECT album,COALESCE(NULLIF(albumArtist,''),artist) AS "
-               "owner,COUNT(*) AS count,MAX(art) AS cover FROM tracks WHERE "
-               "deleted=0 AND TRIM(album)<>'' GROUP BY "
-               "LOWER(TRIM(album)),LOWER(TRIM(COALESCE(NULLIF(albumArtist,''),"
-               "artist))) ORDER BY album COLLATE NOCASE")) {
-    auto a = v.toMap();
-    a["id"] = "album:" + a["album"].toString().trimmed() + "\n" +
-              a["owner"].toString().trimmed();
-    a["name"] = a["album"];
-    a["kind"] = "generated";
-    out << a;
+  QVariantList out;
+  QVariantList pinnedPlaylistRows, regularCollectionRows;
+  for (auto &v : rawCollections) {
+    auto row = v.toMap();
+    const bool isPlaylist = row["kind"].toString() == "playlist";
+    const bool pinned = isPlaylist && pinnedPlaylists.contains(row["id"].toString());
+    row["pinned"] = pinned;
+    if (pinned) pinnedPlaylistRows << row;
+    else regularCollectionRows << row;
   }
+  out.append(pinnedPlaylistRows);
+  out.append(regularCollectionRows);
+
+  // group generated albums by album title so featuring artists dont split one album into duplicates
+  struct AlbumBucket {
+    QString title;
+    int count = 0;
+    QString cover;
+    QSet<QString> albumArtists;
+    QString firstAlbumArtist;
+    QHash<QString, int> artistHits;
+    QHash<QString, QString> artistDisplay;
+  };
+  QHash<QString, AlbumBucket> albumBuckets;
+  for (const auto &v : s->rows("SELECT album,albumArtist,artist,art FROM tracks WHERE deleted=0 AND TRIM(album)<>''")) {
+    const auto row = v.toMap();
+    const QString albumName = row["album"].toString().trimmed();
+    const QString key = albumName.toLower();
+    auto &b = albumBuckets[key];
+    if (b.title.isEmpty()) b.title = albumName;
+    b.count++;
+    const QString cover = row["art"].toString();
+    if (b.cover.isEmpty() && !cover.isEmpty()) b.cover = cover;
+    const QString aa = row["albumArtist"].toString().trimmed();
+    if (!aa.isEmpty()) {
+      b.albumArtists.insert(aa.toLower());
+      if (b.firstAlbumArtist.isEmpty()) b.firstAlbumArtist = aa;
+    }
+    for (const auto &artistName : splitArtists(row["artist"].toString())) {
+      const QString ak = artistName.toLower();
+      b.artistHits[ak]++;
+      if (!b.artistDisplay.contains(ak)) b.artistDisplay.insert(ak, artistName);
+    }
+  }
+  QVariantList albumRows;
+  albumRows.reserve(albumBuckets.size());
+  for (auto it = albumBuckets.cbegin(); it != albumBuckets.cend(); ++it) {
+    const auto &b = it.value();
+    QString owner;
+    if (b.albumArtists.size() == 1) {
+      owner = b.firstAlbumArtist;
+    } else if (b.artistHits.size() == 1) {
+      owner = b.artistDisplay.value(b.artistHits.cbegin().key());
+    } else if (!b.artistHits.isEmpty()) {
+      QString bestKey;
+      int bestCount = 0;
+      for (auto ait = b.artistHits.cbegin(); ait != b.artistHits.cend(); ++ait) {
+        if (ait.value() > bestCount) { bestCount = ait.value(); bestKey = ait.key(); }
+      }
+      owner = bestCount * 2 >= b.count ? b.artistDisplay.value(bestKey) : QStringLiteral("Various artists");
+    }
+    albumRows << QVariantMap{{"id", "album:" + it.key()},
+                             {"album", b.title},
+                             {"name", b.title},
+                             {"owner", owner},
+                             {"count", b.count},
+                             {"cover", b.cover},
+                             {"kind", "generated"}};
+  }
+  std::sort(albumRows.begin(), albumRows.end(), [](const QVariant &a, const QVariant &b) {
+    return a.toMap()["name"].toString().compare(b.toMap()["name"].toString(), Qt::CaseInsensitive) < 0;
+  });
+  out.append(albumRows);
+
   struct ArtistBucket { QString name; int count = 0; QString cover; };
   QHash<QString, ArtistBucket> artistBuckets;
   for (const auto &v : s->rows("SELECT artist,art FROM tracks WHERE deleted=0 AND TRIM(artist)<>''")) {
@@ -712,15 +832,19 @@ QVariantList App::collections() const {
   QVariantList artistRows;
   artistRows.reserve(artistBuckets.size());
   for (auto it = artistBuckets.cbegin(); it != artistBuckets.cend(); ++it) {
-    artistRows << QVariantMap{{"id", "artist:" + it.key()},
+    const QString artistId = "artist:" + it.key();
+    artistRows << QVariantMap{{"id", artistId},
                               {"artistKey", it.key()},
                               {"name", it.value().name},
                               {"count", it.value().count},
                               {"cover", it.value().cover},
+                              {"pinned", pinnedArtists.contains(artistId)},
                               {"kind", "artist"}};
   }
   std::sort(artistRows.begin(), artistRows.end(), [](const QVariant &a, const QVariant &b) {
-    return a.toMap()["name"].toString().compare(b.toMap()["name"].toString(), Qt::CaseInsensitive) < 0;
+    const auto ma = a.toMap(), mb = b.toMap();
+    if (ma["pinned"].toBool() != mb["pinned"].toBool()) return ma["pinned"].toBool();
+    return ma["name"].toString().compare(mb["name"].toString(), Qt::CaseInsensitive) < 0;
   });
   out.append(artistRows);
   collectionSnapshot=out;collectionSerial=s->catalogueSerial();return collectionSnapshot;
@@ -746,14 +870,13 @@ QVariantList App::collectionTracks(const QString &id) const {
     return matched;
   }
   if (id.startsWith("album:")) {
-    QString key = id.mid(6);
+    const QString key = id.mid(6).section('\n', 0, 0).trimmed().toLower();
     return s->rows(
         "SELECT t.*,EXISTS(SELECT 1 FROM likes WHERE track=t.id) AS liked FROM "
-        "tracks t WHERE deleted=0 AND LOWER(TRIM(album))=LOWER(TRIM(?)) AND "
-        "LOWER(TRIM(COALESCE(NULLIF(albumArtist,''),artist)))=LOWER(TRIM(?)) "
+        "tracks t WHERE deleted=0 AND LOWER(TRIM(album))=? "
         "ORDER BY "
         "disc,number,title COLLATE NOCASE",
-        {key.section('\n', 0, 0), key.section('\n', 1)});
+        {key});
   }
   return s->rows("SELECT t.*,m.id AS memberId,EXISTS(SELECT 1 FROM likes WHERE "
                  "track=t.id) AS liked FROM members m JOIN tracks t ON "
@@ -784,7 +907,40 @@ void App::renameCollection(const QString &id, const QString &name) {
 void App::deleteCollection(const QString &id) {
   if(id=="recent" || id=="liked") return;
   s->exec("DELETE FROM collections WHERE id=?", {id});
+  auto pinned = s->setting("pinnedPlaylists").toStringList();
+  if (pinned.removeAll(id) > 0) {
+    s->setSetting("pinnedPlaylists", pinned);
+    emit settingsChanged();
+  }
   emit collectionsChanged();
+}
+bool App::isPinned(const QString &kind, const QString &id) const {
+  if (id.isEmpty()) return false;
+  const QString key = kind == "artist" ? QStringLiteral("pinnedArtists") : QStringLiteral("pinnedPlaylists");
+  return s->setting(key).toStringList().contains(id);
+}
+void App::togglePin(const QString &kind, const QString &id) {
+  if (id.isEmpty()) return;
+  const QString key = kind == "artist" ? QStringLiteral("pinnedArtists") : QStringLiteral("pinnedPlaylists");
+  auto list = s->setting(key).toStringList();
+  if (list.contains(id)) list.removeAll(id);
+  else list.append(id);
+  s->setSetting(key, list);
+  collectionSerial = quint64(-1);
+  emit collectionsChanged();
+  emit settingsChanged();
+}
+QVariantMap App::folderView(const QString &path) const {
+  return buildFolderView(library.tracks(), library.folders(),
+                         settings().value("musicDir").toString(), path);
+}
+void App::addFiles() {
+  const auto files = QFileDialog::getOpenFileNames(
+      nullptr, "Add audio files", {},
+      "Audio files (*.mp3 *.flac *.ogg *.oga *.opus *.m4a *.aac *.wav *.webm *.mp4)");
+  for (const auto &path : files) {
+    if (!path.isEmpty()) library.importFile(path);
+  }
 }
 void App::coverCollection(const QString &id) {
   if(id=="recent" || id=="liked") return;
@@ -1188,10 +1344,11 @@ void App::openTrash() {
   if (!QDesktopServices::openUrl(QUrl("trash:///"))) emit error("Could not open the system Trash");
 #endif
 }
-void App::applyEq(bool enabled, const QVariantList &gains) {
+void App::applyEq(bool enabled, const QVariantList &gains, const QString &preset) {
   music.setEq(enabled, gains);
   s->setSetting("eqEnabled", enabled);
   s->setSetting("eqGains", gains);
+  if (!preset.isEmpty()) s->setSetting("eqPreset", preset);
   emit settingsChanged();
 }
 QString App::time(double value) const {

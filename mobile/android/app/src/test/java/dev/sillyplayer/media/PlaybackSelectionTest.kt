@@ -31,4 +31,39 @@ class PlaybackSelectionTest {
             }
         }
     }
+
+    @Test fun smartShuffleAvoidsConsecutiveSameArtistAndKeepsCurrentFirst() {
+        val tracks =
+            listOf(
+                Track(id = "a1", artist = "Artist A"),
+                Track(id = "a2", artist = "Artist A"),
+                Track(id = "a3", artist = "Artist A"),
+                Track(id = "b1", artist = "Artist B"),
+                Track(id = "b2", artist = "Artist B"),
+                Track(id = "b3", artist = "Artist B"),
+                Track(id = "c1", artist = "Artist C"),
+                Track(id = "c2", artist = "Artist C"),
+                Track(id = "c3", artist = "Artist C"),
+            )
+        val entries = tracks.mapIndexed { idx, t -> QueueEntry(id = "e$idx", track = t) }
+        val order =
+            smartShuffledQueueOrder(
+                entries = entries,
+                index = 0,
+                previous = emptyList(),
+                lastPlayedByTrack = emptyMap(),
+                nowMs = 1_000_000_000L,
+                random = kotlin.random.Random(123),
+            )
+        assertEquals(entries.size, order.size)
+        assertEquals("e0", order.first())
+        val byId = entries.associateBy { it.id }
+        var consecutiveSame = 0
+        for (i in 1 until order.size) {
+            if (byId.getValue(order[i]).track.artist == byId.getValue(order[i - 1]).track.artist) {
+                consecutiveSame++
+            }
+        }
+        assertEquals(0, consecutiveSame)
+    }
 }

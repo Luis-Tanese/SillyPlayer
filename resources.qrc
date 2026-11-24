@@ -37,10 +37,13 @@
   <file>qml/YouTubePane.qml</file>
   <file>qml/qmldir</file>
   <file>assets/sillyplayer.png</file>
+  <file>assets/icons/arrow-down.svg</file>
   <file>assets/icons/arrow-left.svg</file>
+  <file>assets/icons/arrow-up.svg</file>
   <file>assets/icons/check.svg</file>
   <file>assets/icons/clock.svg</file>
   <file>assets/icons/chevron-down.svg</file>
+  <file>assets/icons/chevron-right.svg</file>
   <file>assets/icons/chevron-up.svg</file>
   <file>assets/icons/download.svg</file>
   <file>assets/icons/ellipsis.svg</file>
@@ -58,6 +61,7 @@
   <file>assets/icons/music-2.svg</file>
   <file>assets/icons/pause.svg</file>
   <file>assets/icons/pencil.svg</file>
+  <file>assets/icons/pin.svg</file>
   <file>assets/icons/play.svg</file>
   <file>assets/icons/plus.svg</file>
   <file>assets/icons/repeat-1.svg</file>

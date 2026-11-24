@@ -176,17 +176,42 @@ Item {
                     anchors.margins: 18
                     spacing: 14
                     Label {
-                        text: "Timer & transitions"
+                        text: "Audio & transitions"
                         color: Theme.text
                         font.pixelSize: 15
                         font.weight: Font.Medium
                     }
-                    FlatButton {
-                        text: app.sleepTimer.active ? "Sleep timer · " + app.time(app.sleepTimer.remainingSeconds) : "Sleep timer"
-                        glyph: "clock"
-                        outlined: true
-                        checked: app.sleepTimer.active
-                        onClicked: pane.shell.showSleepTimer()
+                    Flow {
+                        Layout.fillWidth: true
+                        spacing: 10
+                        FlatButton {
+                            text: "Equalizer"
+                            glyph: "settings"
+                            outlined: true
+                            checked: !!app.settings.eqEnabled
+                            onClicked: pane.shell.openEqualizer()
+                        }
+                        FlatButton {
+                            text: app.sleepTimer.active ? "Sleep timer · " + app.time(app.sleepTimer.remainingSeconds) : "Sleep timer"
+                            glyph: "clock"
+                            outlined: true
+                            checked: app.sleepTimer.active
+                            onClicked: pane.shell.showSleepTimer()
+                        }
+                    }
+                    Rectangle { Layout.fillWidth: true; implicitHeight: 1; color: Theme.separator }
+                    AppCheck {
+                        objectName: "smartShuffleEnabled"
+                        text: "Smart shuffle"
+                        checked: !!app.settings.smartShuffle
+                        onToggled: app.setSetting("smartShuffle", checked)
+                    }
+                    Label {
+                        text: "Avoids playing the same artist back to back and favors songs you haven't heard recently."
+                        color: Theme.muted
+                        font.pixelSize: 12
+                        Layout.fillWidth: true
+                        wrapMode: Text.WordWrap
                     }
                     Rectangle { Layout.fillWidth: true; implicitHeight: 1; color: Theme.separator }
                     AppCheck {
@@ -221,6 +246,42 @@ Item {
                                 else text = (app.settings.pauseFadeMs / 1000).toFixed(2);
                             }
                             Accessible.name: "Fade duration in seconds"
+                        }
+                        Label { text: "s"; color: Theme.muted }
+                    }
+                    Rectangle { Layout.fillWidth: true; implicitHeight: 1; color: Theme.separator }
+                    AppCheck {
+                        objectName: "crossfadeEnabled"
+                        text: "Smooth transition fade between songs"
+                        checked: (app.settings.crossfadeMs || 0) > 0
+                        onToggled: app.setSetting("crossfadeMs", checked ? 3000 : 0)
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 12
+                        enabled: (app.settings.crossfadeMs || 0) > 0
+                        opacity: enabled ? 1 : 0.45
+                        Label { text: "Transition fade"; color: Theme.muted; Layout.preferredWidth: 110 }
+                        AppSlider {
+                            objectName: "crossfadeDuration"
+                            from: 1.0; to: 8.0; stepSize: 0.5; decimals: 1; suffix: " s"
+                            value: Math.max(1.0, (app.settings.crossfadeMs || 3000) / 1000)
+                            Layout.fillWidth: true; Layout.maximumWidth: 260
+                            onMoved: if (!pressed) app.setSetting("crossfadeMs", Math.round(value * 1000))
+                            onPressedChanged: if (!pressed) app.setSetting("crossfadeMs", Math.round(value * 1000))
+                            Accessible.name: "Song transition fade duration"
+                        }
+                        AppField {
+                            objectName: "crossfadeSeconds"
+                            Layout.preferredWidth: 80
+                            text: (Math.max(1000, app.settings.crossfadeMs || 3000) / 1000).toFixed(1)
+                            validator: DoubleValidator { bottom: 1.0; top: 8.0; decimals: 1; locale: "C" }
+                            onEditingFinished: {
+                                const value = Number(text);
+                                if (isFinite(value) && value >= 1.0 && value <= 8.0) app.setSetting("crossfadeMs", Math.round(value * 1000));
+                                else text = (Math.max(1000, app.settings.crossfadeMs || 3000) / 1000).toFixed(1);
+                            }
+                            Accessible.name: "Song transition fade in seconds"
                         }
                         Label { text: "s"; color: Theme.muted }
                     }
@@ -370,13 +431,19 @@ Item {
                         spacing: 10
                         FlatButton {
                             text: "Add folder"
-                            glyph: "plus"
+                            glyph: "folder"
                             outlined: true
                             onClicked: {
                                 let path = app.chooseFolder();
                                 if (path)
                                     library.addFolder(path);
                             }
+                        }
+                        FlatButton {
+                            text: "Add files"
+                            glyph: "plus"
+                            outlined: true
+                            onClicked: app.addFiles()
                         }
                         FlatButton {
                             text: "Rescan"
@@ -615,6 +682,9 @@ Item {
                         spacing: 18
                         Image {
                             source: "qrc:/assets/brand/silly-cat.png"
+                            sourceSize: Qt.size(256, 256)
+                            smooth: true
+                            mipmap: true
                             Layout.preferredWidth: 80
                             Layout.preferredHeight: 80
                             fillMode: Image.PreserveAspectFit
