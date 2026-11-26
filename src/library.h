@@ -5,12 +5,16 @@
 #include <QObject>
 #include <QTimer>
 #include <QHash>
+#include <atomic>
+#include <memory>
 
 class Library : public QObject {
   Q_OBJECT
   Q_PROPERTY(QVariantList tracks READ tracks NOTIFY changed)
+  Q_PROPERTY(int trackCount READ trackCount NOTIFY changed)
   Q_PROPERTY(QVariantList folders READ folders NOTIFY changed)
   Q_PROPERTY(int likedCount READ likedCount NOTIFY likesChanged)
+  Q_PROPERTY(QString likedCover READ likedCover NOTIFY likesChanged)
   Q_PROPERTY(bool trashing READ trashing NOTIFY statusChanged)
   Q_PROPERTY(bool scanning READ scanning NOTIFY statusChanged)
   Q_PROPERTY(QString status READ status NOTIFY statusChanged)
@@ -18,8 +22,11 @@ public:
   Library(Store *store, const QString &cache, QObject *parent = nullptr);
   ~Library();
   QVariantList tracks() const;
+  int trackCount() const;
   QVariantList folders() const;
   int likedCount() const;
+  QString likedCover() const;
+  void requestStop();
   void patchTracks(const QVariantMap &patches);
   bool scanning() const { return m_busy; }
   QString status() const { return m_status; }
@@ -54,12 +61,14 @@ private:
   Store *s;
   QString cache, m_status;
   mutable bool tracksValid=false,foldersValid=false;
-  mutable int cachedLikedCount=-1;
+  mutable int cachedLikedCount=-1,cachedTrackCount=-1;
+  mutable quint64 trackCountSerial=quint64(-1);
   mutable QVariantList cachedTracks,cachedFolders;
   mutable QHash<QString,int> trackPositions;
   mutable quint64 tracksSerial=0,tracksCatalogueSerial=0,foldersSerial=0;
   bool m_busy = false, pending = false, m_trashing = false;
   bool maintenance=false;
+  std::shared_ptr<std::atomic_bool> stopFlag = std::make_shared<std::atomic_bool>(false);
   QList<QPair<QString,QVariantMap>> deferredImports;
   QFutureWatcher<QVariantMap> trashWorker;
   bool pendingForce = false;

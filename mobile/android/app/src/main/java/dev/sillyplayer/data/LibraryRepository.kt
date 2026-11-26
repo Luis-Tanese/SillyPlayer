@@ -29,6 +29,19 @@ fun InputStream.sha256(): String {
     return digest.digest().joinToString("") { "%02x".format(it) }
 }
 
+// copy stream while computing SHA-256 in one pass to avoid double file/SAF reads
+fun InputStream.copyAndSha256(out: OutputStream, bufferSize: Int = 256 * 1024): String {
+    val digest = MessageDigest.getInstance("SHA-256")
+    val buffer = ByteArray(bufferSize)
+    while (true) {
+        val n = read(buffer)
+        if (n < 0) break
+        out.write(buffer, 0, n)
+        digest.update(buffer, 0, n)
+    }
+    return digest.digest().joinToString("") { "%02x".format(it) }
+}
+
 fun Graph.input(value: String): InputStream =
     if (value.startsWith("content:"))
         context.contentResolver.openInputStream(Uri.parse(value)) ?: error("Cannot read file")
@@ -54,7 +67,7 @@ class LibraryRepository(private val g: Graph) {
             .map { it.map { e -> e.track }.toSet() }
             .stateIn(g.scope, SharingStarted.WhileSubscribed(5000), emptySet())
     val roots = g.dao.observeRoots().stateIn(g.scope, SharingStarted.Eagerly, emptyList())
-    val trash = g.dao.observeTrash().stateIn(g.scope, SharingStarted.Eagerly, emptyList())
+    val trash = g.dao.observeTrash().stateIn(g.scope, SharingStarted.WhileSubscribed(5000), emptyList())
     val status = MutableStateFlow("")
     private val scanning = AtomicBoolean(false)
     private val audio =
@@ -89,7 +102,17 @@ class LibraryRepository(private val g: Graph) {
                         android.database.ContentObserver(
                             android.os.Handler(android.os.Looper.getMainLooper())
                         ) {
-                        override fun onChange(selfChange: Boolean) {
+                        private fun isRecoveryWriteEvent(uri: Uri?): Boolean {
+                            if (recovery.saving.value) return true
+                            val completedAt = recovery.lastWriteCompletedAt
+                            if (completedAt > 0L && android.os.SystemClock.elapsedRealtime() - completedAt in 0L..3000L)
+                                return true
+                            return uri?.toString()?.contains(".sillyplayer-library-") == true
+                        }
+
+                        private fun handleChange(uri: Uri?) {
+                            // ignore our own portable sqlite mirror writes so saving doesn't trigger a full SAF rescan
+                            if (isRecoveryWriteEvent(uri)) return
                             scanPending.set(true)
                             if (!g.foreground.value) return
                             scanRequest?.cancel()
@@ -99,6 +122,10 @@ class LibraryRepository(private val g: Graph) {
                                     g.task { reconcile() }
                                 }
                         }
+
+                        override fun onChange(selfChange: Boolean) = handleChange(null)
+
+                        override fun onChange(selfChange: Boolean, uri: Uri?) = handleChange(uri)
                     }
                 observation = observer
                 for (root in registered) runCatching {
@@ -191,10 +218,12 @@ class LibraryRepository(private val g: Graph) {
             for (root in g.dao.roots()) {
                 val folder = DocumentFile.fromTreeUri(g.context, Uri.parse(root.uri))
                 suspend fun unavailable() {
-                    g.dao.putRoot(root.copy(available = false))
-                    for (t in g.dao.tracks().filter { it.root == root.id }) g.dao.putTrack(
-                        t.copy(available = false)
-                    )
+                    g.db.withTransaction {
+                        g.dao.putRoot(root.copy(available = false))
+                        for (t in g.dao.tracks().filter { it.root == root.id }) g.dao.putTrack(
+                            t.copy(available = false)
+                        )
+                    }
                 }
                 if (folder == null || !folder.canRead()) {
                     unavailable()
@@ -204,6 +233,7 @@ class LibraryRepository(private val g: Graph) {
                 val seen = mutableSetOf<String>()
                 val visited = mutableSetOf<String>()
                 var count = 0
+                var lastStatusAt = 0L
                 suspend fun walk(uri: Uri, depth: Int = 0) {
                     require(depth < 64 && visited.add(documentKey(uri.toString()))) {
                         "Folder cycle or excessive nesting"
@@ -213,11 +243,14 @@ class LibraryRepository(private val g: Graph) {
                             uri,
                             DocumentsContract.getDocumentId(uri),
                         )
+                    // include size and last_modified in the directory walk so unchanged files skip per-file SAF queries
                     val projection =
                         arrayOf(
                             DocumentsContract.Document.COLUMN_DOCUMENT_ID,
                             DocumentsContract.Document.COLUMN_DISPLAY_NAME,
                             DocumentsContract.Document.COLUMN_MIME_TYPE,
+                            DocumentsContract.Document.COLUMN_SIZE,
+                            DocumentsContract.Document.COLUMN_LAST_MODIFIED,
                         )
                     val cursor =
                         g.context.contentResolver.query(children, projection, null, null, null)
@@ -236,6 +269,8 @@ class LibraryRepository(private val g: Graph) {
                                 name.substringAfterLast('.').lowercase() in audio ||
                                     mime.startsWith("audio/")
                             ) {
+                                val fileSize = if (c.isNull(3)) null else c.getLong(3)
+                                val fileModified = if (c.isNull(4)) null else c.getLong(4)
                                 val key = documentKey(child.toString())
                                 seen += key
                                 try {
@@ -247,6 +282,9 @@ class LibraryRepository(private val g: Graph) {
                                             knownTrack = known[key],
                                             knownHashes = knownHashes,
                                             knownTrash = knownTrash,
+                                            knownName = name.ifBlank { null },
+                                            knownSize = fileSize,
+                                            knownModified = fileModified,
                                         )
                                         known[key] = indexed
                                         knownHashes[indexed.hash]?.removeAll { it.id == indexed.id }
@@ -256,7 +294,12 @@ class LibraryRepository(private val g: Graph) {
                                 } catch (e: Exception) {
                                     errors += "$name: ${e.message}"
                                 }
-                                status.value = "Indexed ${++count} files"
+                                ++count
+                                val now = android.os.SystemClock.elapsedRealtime()
+                                if (count == 1 || count % 20 == 0 || now - lastStatusAt >= 120L) {
+                                    lastStatusAt = now
+                                    status.value = "Indexed $count files"
+                                }
                             }
                         }
                     }
@@ -304,13 +347,15 @@ class LibraryRepository(private val g: Graph) {
             indexUnlocked(uri, source, force, knownTrack = known)
         }
 
-    private fun persistentArt(bytes: ByteArray): String {
+    private fun persistentArtWithHash(bytes: ByteArray): Pair<String, String> {
         val hash =
             MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
         val target = File(g.context.filesDir, "art/indexed/$hash.img").also { it.parentFile?.mkdirs() }
         if (!target.isFile) target.writeBytes(bytes)
-        return target.toURI().toString()
+        return target.toURI().toString() to hash
     }
+
+    private fun persistentArt(bytes: ByteArray): String = persistentArtWithHash(bytes).first
 
     private fun existingArtFile(uri: String): File? {
         if (!uri.startsWith("file:")) return null
@@ -333,26 +378,32 @@ class LibraryRepository(private val g: Graph) {
         knownTrack: Track? = null,
         knownHashes: Map<String, List<Track>>? = null,
         knownTrash: Set<String>? = null,
+        knownName: String? = null,
+        knownSize: Long? = null,
+        knownModified: Long? = null,
     ): Track {
         check(!g.resetting.value) { "Library reset is in progress" }
         // A folder scan already has the complete URI/hash snapshot, including removal tombstones
         var old = knownTrack ?: if (knownHashes == null) g.dao.byUri(uri) else null
         if (old?.isRemovalTombstone() == true) return old
-        var name = Uri.parse(uri).lastPathSegment ?: "Audio"
-        var size = 0L
-        var modified = 0L
+        var name = knownName ?: Uri.parse(uri).lastPathSegment ?: "Audio"
+        var size = knownSize ?: 0L
+        var modified = knownModified ?: 0L
         if (uri.startsWith("content:")) {
-            g.context.contentResolver.query(Uri.parse(uri), null, null, null, null)?.use { c ->
-                if (c.moveToFirst()) {
-                    c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                        .takeIf { it >= 0 }
-                        ?.let { name = c.getString(it) }
-                    c.getColumnIndex(OpenableColumns.SIZE)
-                        .takeIf { it >= 0 }
-                        ?.let { size = c.getLong(it) }
-                    c.getColumnIndex(DocumentsContract.Document.COLUMN_LAST_MODIFIED)
-                        .takeIf { it >= 0 }
-                        ?.let { modified = c.getLong(it) }
+            // skip per-file SAF Binder IPC when the parent directory walk already gave us display name, size, and mtime
+            if (knownName == null || knownSize == null || knownModified == null) {
+                g.context.contentResolver.query(Uri.parse(uri), null, null, null, null)?.use { c ->
+                    if (c.moveToFirst()) {
+                        c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                            .takeIf { it >= 0 }
+                            ?.let { name = c.getString(it) }
+                        c.getColumnIndex(OpenableColumns.SIZE)
+                            .takeIf { it >= 0 }
+                            ?.let { size = c.getLong(it) }
+                        c.getColumnIndex(DocumentsContract.Document.COLUMN_LAST_MODIFIED)
+                            .takeIf { it >= 0 }
+                            ?.let { modified = c.getLong(it) }
+                    }
                 }
             }
         } else {
@@ -387,16 +438,24 @@ class LibraryRepository(private val g: Graph) {
         }
         var tags = JSONObject()
         var art = if (oldArtMissing) "" else oldArt
+        var artHash = if (oldArtMissing) "" else old?.artHash.orEmpty()
+        var taglibSucceeded = false
         try {
+            // read both tags and embedded artwork in a single TagLib::FileRef open
             g.context.contentResolver.openFileDescriptor(Uri.parse(uri), "r")?.use { fd ->
-                tags = JSONObject(NativeMedia.tags(fd.fd, name))
-                val bytes = NativeMedia.artwork(fd.fd, name)
+                val artOut = arrayOfNulls<ByteArray>(1)
+                tags = JSONObject(NativeMedia.inspect(fd.fd, name, artOut))
+                taglibSucceeded = tags.length() > 0
+                val bytes = artOut[0]
                 if (bytes != null && bytes.size <= 8 * 1024 * 1024) {
-                    art = persistentArt(bytes)
+                    val saved = persistentArtWithHash(bytes)
+                    art = saved.first
+                    artHash = saved.second
                 }
             }
         } catch (_: Exception) {}
-        if (tags.optString("title").isBlank() || art.isEmpty())
+        // only fall back to MediaMetadataRetriever when TagLib couldn't parse tags (skip heavy IPC for coverless songs)
+        if (!taglibSucceeded || (tags.optString("title").isBlank() && tags.optDouble("duration", 0.0) <= 0.0))
             runCatching {
                 val retriever = MediaMetadataRetriever()
                 try {
@@ -416,7 +475,11 @@ class LibraryRepository(private val g: Graph) {
                     if (art.isEmpty())
                         retriever.embeddedPicture
                             ?.takeIf { it.size <= 8 * 1024 * 1024 }
-                            ?.let { bytes -> art = persistentArt(bytes) }
+                            ?.let { bytes ->
+                                val saved = persistentArtWithHash(bytes)
+                                art = saved.first
+                                artHash = saved.second
+                            }
                 } finally {
                     retriever.release()
                 }
@@ -459,6 +522,7 @@ class LibraryRepository(private val g: Graph) {
                 number = tags.optInt("number"),
                 duration = tags.optDouble("duration", tags.optDouble("durationMs", 0.0) / 1000),
                 art = art,
+                artHash = artHash,
                 available = true,
                 deleted = false,
                 modified = modified,
@@ -1113,13 +1177,11 @@ class LibraryRepository(private val g: Graph) {
         val target = destination(name, mime, folder)
         try {
             created(target.uri.toString())
-            g.output(target.uri.toString()).use { out ->
-                file.inputStream().use { it.copyTo(out, 256 * 1024) }
-            }
-            require(
-                g.input(target.uri.toString()).use { it.sha256() } ==
-                    file.inputStream().use { it.sha256() }
-            ) {
+            val sourceHash =
+                g.output(target.uri.toString()).use { out ->
+                    file.inputStream().use { it.copyAndSha256(out) }
+                }
+            require(g.input(target.uri.toString()).use { it.sha256() } == sourceHash) {
                 "Published file failed checksum verification"
             }
             return target.uri.toString()
@@ -1135,18 +1197,19 @@ class LibraryRepository(private val g: Graph) {
     internal suspend fun replaceContentUnlocked(uri: String, file: File) {
         val stage = File(g.context.filesDir, "edits/" + uuid()).also { it.mkdirs() }
         val original = File(stage, "original")
-        g.input(uri).use { input -> original.outputStream().use { input.copyTo(it) } }
+        val originalHash = g.input(uri).use { input -> original.outputStream().use { input.copyAndSha256(it) } }
         File(stage, "recovery.json")
             .writeText(
                 buildJsonObject {
                         put("uri", uri)
-                        put("hash", original.inputStream().use { it.sha256() })
+                        put("hash", originalHash)
                     }
                     .toString()
             )
         try {
-            g.output(uri).use { out -> file.inputStream().use { it.copyTo(out, 256 * 1024) } }
-            require(g.input(uri).use { it.sha256() } == file.inputStream().use { it.sha256() }) {
+            val replacementHash =
+                g.output(uri).use { out -> file.inputStream().use { it.copyAndSha256(out) } }
+            require(g.input(uri).use { it.sha256() } == replacementHash) {
                 "Replacement checksum mismatch"
             }
             stage.deleteRecursively()
@@ -1172,7 +1235,7 @@ class LibraryRepository(private val g: Graph) {
             val original = File(stage, "original")
             val edited =
                 File(stage, "edited." + (document(t.uri)?.name?.substringAfterLast('.') ?: "mp3"))
-            g.input(t.uri).use { input -> original.outputStream().use { input.copyTo(it) } }
+            val originalHash = g.input(t.uri).use { input -> original.outputStream().use { input.copyAndSha256(it) } }
             original.copyTo(edited)
             val coverFile =
                 if (cover.isNotEmpty())
@@ -1195,17 +1258,16 @@ class LibraryRepository(private val g: Graph) {
                 .writeText(
                     buildJsonObject {
                             put("uri", t.uri)
-                            put("hash", original.inputStream().use { it.sha256() })
+                            put("hash", originalHash)
                         }
                         .toString()
                 )
             try {
-                g.output(t.uri).use { out ->
-                    edited.inputStream().use { it.copyTo(out, 256 * 1024) }
-                }
-                require(
-                    g.input(t.uri).use { it.sha256() } == edited.inputStream().use { it.sha256() }
-                ) {
+                val editedHash =
+                    g.output(t.uri).use { out ->
+                        edited.inputStream().use { it.copyAndSha256(out) }
+                    }
+                require(g.input(t.uri).use { it.sha256() } == editedHash) {
                     "Tag write verification failed"
                 }
                 val updated = indexUnlocked(t.uri, force = true)
@@ -1457,11 +1519,12 @@ class LibraryRepository(private val g: Graph) {
                     ) ?: error("Cannot create Trash file")
                 var originalRemoved = false
                 try {
-                    g.input(t.uri).use { input ->
-                        g.output(stored.uri.toString()).use { input.copyTo(it, 256 * 1024) }
-                    }
+                    val sourceHash =
+                        g.input(t.uri).use { input ->
+                            g.output(stored.uri.toString()).use { input.copyAndSha256(it) }
+                        }
                     val hash = g.input(stored.uri.toString()).use { it.sha256() }
-                    require(hash == g.input(t.uri).use { it.sha256() })
+                    require(hash == sourceHash)
                     g.dao.putTrash(TrashEntry(id, t.uri, stored.uri.toString(), originalName, hash))
                     require(original.delete()) {
                         "Provider refused to remove the original; it was left in place"
@@ -1564,17 +1627,17 @@ class LibraryRepository(private val g: Graph) {
         }
         for (id in remove) {
             g.db.withTransaction {
-                for (m in g.dao.members().filter { it.track == id }) {
+                for (m in g.dao.membersForTrack(id)) {
                     val value = m.copy(track = keep)
                     g.dao.putMember(value)
                     journal("members", value.id, JsonCodec.encodeToJsonElement(value))
                 }
-                if (g.dao.likes().any { it.track == id }) {
-                    if (g.dao.likes().none { it.track == keep }) like(keep)
+                if (g.dao.isLiked(id)) {
+                    if (!g.dao.isLiked(keep)) like(keep)
                     g.dao.deleteLike(id)
                     journal("likes", id, null)
                 }
-                for (c in g.dao.counters().filter { it.track == id }) {
+                for (c in g.dao.countersForTrack(id)) {
                     val value = c.copy(track = keep)
                     g.dao.putCounter(value)
                     if (value.device == g.prefs.deviceId)
@@ -1584,7 +1647,7 @@ class LibraryRepository(private val g: Graph) {
                             JsonCodec.encodeToJsonElement(value),
                         )
                 }
-                for (play in g.dao.plays().filter { it.track == id }) {
+                for (play in g.dao.playsForTrack(id)) {
                     val value = play.copy(track = keep)
                     g.dao.putPlay(value)
                     journal("plays", value.session, JsonCodec.encodeToJsonElement(value))

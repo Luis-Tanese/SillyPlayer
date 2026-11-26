@@ -18,9 +18,9 @@ Item {
     }
     property var insightsData: {
         const observed = revision;
-        return pane.visible ? app.statistics.insights(period) : ({buckets: [], maxBucket: 0, totalPlays: 0, activeDays: 0, streakDays: 0, topArtist: ({}), topTrack: ({}), peakSummary: "", chartTitle: ""});
+        return (pane.visible && pane.insightsOpen) ? app.statistics.insights(period) : ({buckets: [], maxBucket: 0, totalPlays: 0, activeDays: 0, streakDays: 0, topArtist: ({}), topTrack: ({}), peakSummary: "", chartTitle: ""});
     }
-    onVisibleChanged: { if (!visible) dismissTimeTooltip(); else revision++; }
+    onVisibleChanged: { if (!visible) dismissTimeTooltip(); }
     Connections {
         target: app.statistics
         function onRankingsChanged() { pane.revision++; }

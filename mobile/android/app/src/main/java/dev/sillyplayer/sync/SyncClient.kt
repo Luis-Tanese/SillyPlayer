@@ -84,8 +84,8 @@ class SyncClient(private val g: Graph) {
     private val acceptedChanges = mutableSetOf<Pair<String, String>>()
     private val pendingMediaSyncPeers = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     val pendingLink = MutableStateFlow("")
-    val peers = g.dao.observePeers().stateIn(g.scope, SharingStarted.Eagerly, emptyList())
-    val conflicts = g.dao.observeConflicts().stateIn(g.scope, SharingStarted.Eagerly, emptyList())
+    val peers = g.dao.observePeers().stateIn(g.scope, SharingStarted.WhileSubscribed(5000), emptyList())
+    val conflicts = g.dao.observeConflicts().stateIn(g.scope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     private fun secretKey(): javax.crypto.SecretKey {
         val store = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
@@ -113,16 +113,20 @@ class SyncClient(private val g: Graph) {
             Base64.encodeToString(cipher.doFinal(value.toByteArray()), Base64.NO_WRAP)
     }
 
-    private fun reveal(value: String): String {
-        val parts = value.split(':')
-        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(
-            Cipher.DECRYPT_MODE,
-            secretKey(),
-            GCMParameterSpec(128, Base64.decode(parts[0], Base64.NO_WRAP)),
-        )
-        return cipher.doFinal(Base64.decode(parts[1], Base64.NO_WRAP)).toString(Charsets.UTF_8)
-    }
+    private val credentialCache = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    private fun reveal(value: String): String =
+        // cache decrypted peer credentials in memory so chunked sync transfers dont hit AndroidKeyStore TEE on every HTTP request
+        credentialCache.computeIfAbsent(value) { encoded ->
+            val parts = encoded.split(':')
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(
+                Cipher.DECRYPT_MODE,
+                secretKey(),
+                GCMParameterSpec(128, Base64.decode(parts[0], Base64.NO_WRAP)),
+            )
+            cipher.doFinal(Base64.decode(parts[1], Base64.NO_WRAP)).toString(Charsets.UTF_8)
+        }
 
     private val clients = java.util.concurrent.ConcurrentHashMap<String, OkHttpClient>()
 
@@ -214,26 +218,39 @@ class SyncClient(private val g: Graph) {
         }
     }
 
-    private suspend fun seed(peer: Peer) =
+    private suspend fun seed(peer: Peer) {
+        // precompute track and collection wire payloads outside the SQLite write transaction so art file I/O never holds the DB write lock
+        val tracks = g.dao.tracks()
+        val collections = g.dao.collections()
+        val trackPayloads = HashMap<String, String>(tracks.size)
+        for (t in tracks) {
+            if (g.dao.replica(peer.id, "tracks", t.id) == null) {
+                trackPayloads[t.id] = g.library.trackWire(t, rehashArt = t.artHash.isBlank()).toString()
+            }
+        }
+        val collectionPayloads = HashMap<String, String>(collections.size)
+        for (c in collections) {
+            collectionPayloads[c.id] = collectionWire(c, rehashArt = c.artHash.isBlank()).toString()
+        }
         g.db.withTransaction {
             g.dao.adoptUnpairedOutbox(peer.id)
-            for (t in g.dao.tracks()) if (g.dao.replica(peer.id, "tracks", t.id) == null)
+            for ((id, payload) in trackPayloads) if (g.dao.replica(peer.id, "tracks", id) == null)
                 g.dao.putOutbox(
                     Outbox(
                         peer = peer.id,
                         entity = "tracks",
-                        key = t.id,
+                        key = id,
                         base = 0,
-                        payload = g.library.trackWire(t).toString(),
+                        payload = payload,
                     )
                 )
-            for (c in g.dao.collections()) g.dao.putOutbox(
+            for (c in collections) g.dao.putOutbox(
                 Outbox(
                     peer = peer.id,
                     entity = "collections",
                     key = c.id,
                     base = g.dao.replica(peer.id, "collections", c.id)?.revision ?: 0,
-                    payload = collectionWire(c).toString(),
+                    payload = collectionPayloads[c.id] ?: collectionWire(c, rehashArt = false).toString(),
                 )
             )
             for (m in g.dao.members()) g.dao.putOutbox(
@@ -245,7 +262,7 @@ class SyncClient(private val g: Graph) {
                     payload = JsonCodec.encodeToJsonElement(m).toString(),
                 )
             )
-            for (c in g.dao.collections()) if (g.dao.pending(peer.id, "orders", c.id) == null)
+            for (c in collections) if (g.dao.pending(peer.id, "orders", c.id) == null)
                 g.dao.putOutbox(
                     Outbox(
                         peer = peer.id,
@@ -291,10 +308,11 @@ class SyncClient(private val g: Graph) {
                 )
             )
         }
+    }
 
-    private suspend fun collectionWire(c: dev.sillyplayer.data.Collection): JsonObject {
+    private suspend fun collectionWire(c: dev.sillyplayer.data.Collection, rehashArt: Boolean = true): JsonObject {
         val hash =
-            if (c.art.isNotBlank())
+            if (rehashArt && c.art.isNotBlank())
                 runCatching { g.input(c.art).use { it.sha256() } }.getOrDefault(c.artHash)
             else c.artHash
         return buildJsonObject {
@@ -862,6 +880,17 @@ class SyncClient(private val g: Graph) {
         }
         val base = previous?.payload?.let { JsonCodec.parseToJsonElement(it).jsonObject } ?: buildJsonObject {}
         val shown = visibleSyncPayload(remote, base, pending)
+        // precompute local audio SHA-256 outside the SQLite write transaction when needed
+        val precheckedLocalMatch: Boolean? =
+            if (shown != null && entity == "tracks") {
+                val oldPre = g.dao.track(key)
+                val pPre = shown.jsonObject
+                val advertisedHash = pPre["audioHash"]?.jsonPrimitive?.content.orEmpty()
+                val desiredHash = advertisedHash.ifBlank { oldPre?.hash.orEmpty() }
+                if (oldPre == null || oldPre.uri.isBlank() || desiredHash.isBlank()) false
+                else if (oldPre.available && oldPre.hash == desiredHash) true
+                else runCatching { g.input(oldPre.uri).use { it.sha256() } == desiredHash }.getOrDefault(false)
+            } else null
         g.db.withTransaction {
             if (shown == null) {
                 when (entity) {
@@ -893,9 +922,10 @@ class SyncClient(private val g: Graph) {
                             )
                         val advertisedHash = p["audioHash"]?.jsonPrimitive?.content.orEmpty()
                         val desiredHash = advertisedHash.ifBlank { old?.hash.orEmpty() }
-                        val localMatches = old != null && old.uri.isNotBlank() && desiredHash.isNotBlank() &&
-                            (old.available && old.hash == desiredHash ||
-                                runCatching { g.input(old.uri).use { it.sha256() } == desiredHash }.getOrDefault(false))
+                        val localMatches =
+                            precheckedLocalMatch
+                                ?: (old != null && old.uri.isNotBlank() && desiredHash.isNotBlank() &&
+                                    old.available && old.hash == desiredHash)
                         values["hash"] = JsonPrimitive(advertisedHash.ifBlank { old?.hash.orEmpty() })
                         values["size"] = p["audioSize"] ?: JsonPrimitive(old?.size ?: 0)
                         values["artHash"] = p["artHash"] ?: JsonPrimitive("")
@@ -988,17 +1018,17 @@ class SyncClient(private val g: Graph) {
                         )
                     )
                     g.dao.putTrack(old.copy(deleted = true, mergedInto = canonical))
-                    for (m in g.dao.members().filter { it.track == remote }) g.dao.putMember(
+                    for (m in g.dao.membersForTrack(remote)) g.dao.putMember(
                         m.copy(track = canonical)
                     )
-                    if (g.dao.likes().any { it.track == remote }) {
+                    if (g.dao.isLiked(remote)) {
                         g.dao.deleteLike(remote)
                         g.dao.putLike(Like(canonical))
                     }
-                    for (c in g.dao.counters().filter { it.track == remote }) g.dao.putCounter(
+                    for (c in g.dao.countersForTrack(remote)) g.dao.putCounter(
                         c.copy(track = canonical)
                     )
-                    for (play in g.dao.plays().filter { it.track == remote }) g.dao.putPlay(
+                    for (play in g.dao.playsForTrack(remote)) g.dao.putPlay(
                         play.copy(track = canonical)
                     )
                     withContext(Dispatchers.Main) {

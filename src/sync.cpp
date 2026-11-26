@@ -96,17 +96,22 @@ SyncManager::SyncManager(Store *store, QObject *parent, quint16 port)
   debounce.setInterval(1000);
   debounce.setSingleShot(true);
   connect(&debounce, &QTimer::timeout, this, &SyncManager::prepare);
+  // start expiry timer only while a pairing link is active instead of waking every 5s while idle
   expiry.setInterval(5000);
   connect(&expiry, &QTimer::timeout, this, [this] {
-    if (pairUntil > 0 && pairUntil < QDateTime::currentMSecsSinceEpoch()) {
+    if (pairUntil <= 0) {
+      expiry.stop();
+      return;
+    }
+    if (pairUntil < QDateTime::currentMSecsSinceEpoch()) {
       pairToken.clear();
       pairUntil = 0;
       link.clear();
       qr.clear();
+      expiry.stop();
       emit changed();
     }
   });
-  expiry.start();
   connect(&worker, &QFutureWatcher<QVariantMap>::finished, this, [this] {
     if (closing || !worker.future().isValid())
       return;
@@ -134,6 +139,7 @@ SyncManager::SyncManager(Store *store, QObject *parent, quint16 port)
                  {b["hash"], b["path"], b["size"], b["mtime"], b["kind"]}) &&
              ok;
       }
+      const QString localAuthor = s->setting("libraryIdentity").toString();
       for (auto value : result["items"].toList()) {
         const auto item = value.toMap();
         const auto dirty =
@@ -174,7 +180,7 @@ SyncManager::SyncManager(Store *store, QObject *parent, quint16 port)
           payload = p;
         }
         commitEntity(item["entity"].toString(), item["key"].toString(), payload,
-                     s->setting("libraryIdentity").toString());
+                     localAuthor);
         ok = s->exec("DELETE FROM sync_dirty WHERE entity=? AND key=? AND "
                      "generation=?",
                      {item["entity"], item["key"], item["generation"]}) &&
@@ -333,6 +339,9 @@ void SyncManager::setEnabled(bool value) {
     for (auto socket : QSet<QSslSocket *>(sockets))
       socket->disconnectFromHost();
     pairToken.clear();
+    pairUntil = 0;
+    expiry.stop();
+    legacyRepairRan = false;
     link.clear();
     qr.clear();
     message = "Sync is off";
@@ -351,6 +360,7 @@ void SyncManager::pair(const QString &address, const QString &replacement) {
   pairReplacement = replacement;
   pairToken = randomToken();
   pairUntil = QDateTime::currentMSecsSinceEpoch() + 300000;
+  expiry.start();
   QUrl url;
   url.setScheme("sillyplayer");
   url.setHost("pair");
@@ -474,11 +484,14 @@ QVariantMap SyncManager::wire(const QString &entity, const QString &key,
 void SyncManager::prepare() {
   if (closing || preparing || exchanging || resolving || maintenance())
     return;
-  // repair uploads recorded by older builds which kept an already verified file unavailable
-  for (const auto &value : s->rows("SELECT t.id,b.path,b.size,b.mtime FROM tracks t JOIN sync_entities e ON e.entity='tracks' AND e.key=t.id JOIN sync_blobs b ON b.hash=json_extract(e.payload,'$.audioHash') AND b.kind='audio' WHERE t.available=0 AND t.deleted=0 AND t.path=b.path")) {
-    const auto row=value.toMap(); const QFileInfo file(row["path"].toString());
-    if (file.isFile() && file.size()==row["size"].toLongLong() && file.lastModified().toMSecsSinceEpoch()==row["mtime"].toLongLong())
-      s->exec("UPDATE tracks SET available=1 WHERE id=?", {row["id"]});
+  // run the legacy upload availability repair pass once instead of on every 100-item batch
+  if (!legacyRepairRan) {
+    legacyRepairRan = true;
+    for (const auto &value : s->rows("SELECT t.id,b.path,b.size,b.mtime FROM tracks t JOIN sync_entities e ON e.entity='tracks' AND e.key=t.id JOIN sync_blobs b ON b.hash=json_extract(e.payload,'$.audioHash') AND b.kind='audio' WHERE t.available=0 AND t.deleted=0 AND t.path=b.path")) {
+      const auto row=value.toMap(); const QFileInfo file(row["path"].toString());
+      if (file.isFile() && file.size()==row["size"].toLongLong() && file.lastModified().toMSecsSinceEpoch()==row["mtime"].toLongLong())
+        s->exec("UPDATE tracks SET available=1 WHERE id=?", {row["id"]});
+    }
   }
   auto dirty = s->rows("SELECT * FROM sync_dirty ORDER BY CASE entity WHEN "
                        "'tracks' THEN 0 WHEN 'collections' THEN 1 WHEN "
@@ -1788,24 +1801,53 @@ void SyncManager::route(QSslSocket *socket, const QString &method,
       reply(socket, 400, {{"error", "Too many hashes in one check"}});
       return;
     }
-    QVariantList missing;
+    struct BlobCheckItem {
+      QString hash;
+      QString path;
+      qint64 size = -1;
+      qint64 mtime = -1;
+      bool found = false;
+    };
+    QVector<BlobCheckItem> checks;
+    checks.reserve(hashes.size());
     QSqlQuery q(s->db());
     q.prepare("SELECT path,size,mtime FROM sync_blobs WHERE hash=?");
     for (const auto &value : hashes) {
       const auto hash = value.toString();
       if (!validHash(hash))
         continue;
+      BlobCheckItem item{hash, {}, -1, -1, false};
       q.bindValue(0, hash);
-      bool ok = false;
       if (q.exec() && q.next()) {
-        QFileInfo fi(q.value(0).toString());
-        ok = fi.isFile() && fi.size() == q.value(1).toLongLong() &&
-             fi.lastModified().toMSecsSinceEpoch() == q.value(2).toLongLong();
+        item.path = q.value(0).toString();
+        item.size = q.value(1).toLongLong();
+        item.mtime = q.value(2).toLongLong();
+        item.found = true;
       }
-      if (!ok)
-        missing << hash;
+      checks.append(std::move(item));
     }
-    reply(socket, 200, {{"missing", missing}});
+    // stat up to 5000 blob files off the UI thread
+    QPointer<QSslSocket> sock(socket);
+    auto *watcher = new QFutureWatcher<QVariantList>(this);
+    connect(watcher, &QFutureWatcher<QVariantList>::finished, this, [this, watcher, sock] {
+      const auto missing = watcher->result();
+      watcher->deleteLater();
+      if (closing || !sock || sock->state() != QAbstractSocket::ConnectedState) return;
+      reply(sock, 200, {{"missing", missing}});
+    });
+    watcher->setFuture(QtConcurrent::run([checks = std::move(checks)] {
+      QVariantList missing;
+      for (const auto &item : checks) {
+        bool ok = false;
+        if (item.found) {
+          QFileInfo fi(item.path);
+          ok = fi.isFile() && fi.size() == item.size &&
+               fi.lastModified().toMSecsSinceEpoch() == item.mtime;
+        }
+        if (!ok) missing << item.hash;
+      }
+      return missing;
+    }));
     return;
   }
   if (path.startsWith("/sync/v1/blobs/")) {

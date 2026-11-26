@@ -6,6 +6,7 @@ Image {
     id: thumbnail
     property var candidates: []
     property int attempt: 0
+    property bool completed: false
     function loadCandidate() {
         // clear failed image state even when a recycled row receives the same URL
         deadline.stop();
@@ -17,10 +18,14 @@ Image {
         source = candidates.length > attempt ? candidates[attempt] : "";
         if (source.toString().length && status === Image.Loading) deadline.restart();
     }
-    onCandidatesChanged: { retry.stop(); attempt = 0; loadCandidate(); }
-    Component.onCompleted: loadCandidate()
+    // avoid double-loading when initial candidates binding runs before Component.onCompleted
+    onCandidatesChanged: { retry.stop(); attempt = 0; if (completed) loadCandidate(); }
+    Component.onCompleted: { completed = true; loadCandidate(); }
     Component.onDestruction: Requests.release(thumbnail)
-    sourceSize: Qt.size(Math.min(512, Math.max(64, Math.ceil(width * Screen.devicePixelRatio / 64) * 64)), Math.min(512, Math.max(64, Math.ceil(height * Screen.devicePixelRatio / 64) * 64)))
+    sourceSize: width > 0 && height > 0
+        ? Qt.size(Math.min(512, Math.max(128, Math.ceil(width * Screen.devicePixelRatio / 64) * 64)),
+                  Math.min(512, Math.max(128, Math.ceil(height * Screen.devicePixelRatio / 64) * 64)))
+        : Qt.size(256, 256)
     asynchronous: true
     fillMode: Image.PreserveAspectCrop
     onStatusChanged: {

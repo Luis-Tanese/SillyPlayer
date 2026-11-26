@@ -6,7 +6,7 @@ root=Path(__file__).resolve().parents[1]
 project=root/'mobile/android';outputs=project/'app/build/outputs/apk/release'
 metadata=json.loads((outputs/'output-metadata.json').read_text())
 version=metadata['elements'][0]['versionName']
-tools=root/'.deps/android-sdk/build-tools/35.0.0';dist=root/'dist/android'/version;dist.mkdir(parents=True,exist_ok=True)
+tools=root/'.deps/android-sdk/build-tools/35.0.0';dist=root/'dist'/f'v{version}'/'android';sha_dir=root/'dist'/f'v{version}'/'SHAs';dist.mkdir(parents=True,exist_ok=True);sha_dir.mkdir(parents=True,exist_ok=True)
 manifest={'applicationId':metadata['applicationId'],'kind':'release','minSdk':26,'targetSdk':36,'artifacts':[]}
 for entry in metadata['elements']:
  abi=next(item['value'] for item in entry['filters'] if item['filterType']=='ABI')
@@ -27,10 +27,8 @@ for entry in metadata['elements']:
    assert alignment and (abi!='arm64-v8a' or min(alignment)>=16384),'Native library is not 16-KiB aligned: '+name
    native.append({'name':name,'bytes':len(data),'loadAlignment':min(alignment)})
  target=dist/f"SillyPlayer-{entry['versionName']}-android-{abi}.apk";shutil.copy2(source,target)
- digest=hashlib.sha256(target.read_bytes()).hexdigest();Path(str(target)+'.sha256').write_text(digest+'  '+target.name+'\n')
+ digest=hashlib.sha256(target.read_bytes()).hexdigest();(sha_dir/(target.name+'.sha256')).write_text(digest+'  '+target.name+'\n')
  certificate=re.search(r'Signer #1 certificate SHA-256 digest: (.+)',verification)
  manifest['artifacts'].append({'name':target.name,'bytes':target.stat().st_size,'sha256':digest,'abi':abi,'version':entry['versionName'],'versionCode':entry['versionCode'],'signerSha256':certificate.group(1) if certificate else None,'native':native,'zipAligned16KiB':True})
  print(f'{target.name}: {target.stat().st_size/1048576:.1f} MiB; signature and alignment verified')
-(dist/f'SillyPlayer-{version}-android-artifacts.json').write_text(json.dumps(manifest,indent=2)+'\n')
-shutil.copy2(project/'README.md',dist/f'SillyPlayer-{version}-android-README.md')
-shutil.copy2(project/'NOTICE.md',dist/f'SillyPlayer-{version}-android-NOTICE.md')
+(root/'build'/f'SillyPlayer-{version}-android-artifacts.json').write_text(json.dumps(manifest,indent=2)+'\n')

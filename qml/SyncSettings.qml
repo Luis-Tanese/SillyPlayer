@@ -211,12 +211,15 @@ ColumnLayout {
         model: syncSettings.conflictRows
         ScrollBar.vertical: ScrollBar {}
         delegate: ColumnLayout {
+            id: conflictRow
             required property var modelData
+            // compute parsed field diffs once per conflict delegate instead of calling JSON.parse repeatedly
+            readonly property var parsedDiffs: syncSettings.fieldDiffs(modelData)
             width: conflictList.width
             spacing: 6
             Label { text: syncSettings.title(modelData); color: Theme.text; font.weight: Font.Medium; Layout.fillWidth: true; wrapMode: Text.WordWrap }
             Repeater {
-                model: syncSettings.fieldDiffs(modelData)
+                model: conflictRow.parsedDiffs
                 RowLayout {
                     required property var modelData
                     Layout.fillWidth: true
@@ -253,7 +256,7 @@ ColumnLayout {
                     }
                 }
             }
-            Label { visible: syncSettings.fieldDiffs(modelData).length === 0; text: syncSettings.details(modelData); color: Theme.muted; font.pixelSize: 11; Layout.fillWidth: true; wrapMode: Text.WrapAnywhere }
+            Label { visible: conflictRow.parsedDiffs.length === 0; text: visible ? syncSettings.details(modelData) : ""; color: Theme.muted; font.pixelSize: 11; Layout.fillWidth: true; wrapMode: Text.WrapAnywhere }
             Label { text: "Keep desktop: " + syncSettings.consequence(modelData, false) + "\nKeep phone: " + syncSettings.consequence(modelData, true); color: Theme.muted; font.pixelSize: 11; wrapMode: Text.WordWrap; Layout.fillWidth: true }
             AppCheck {
                 visible: modelData.entity === "tracks"

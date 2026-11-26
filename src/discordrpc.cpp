@@ -6,6 +6,7 @@
 #include <QDateTime>
 #include <QDir>
 #include <QFileInfo>
+#include <QFutureWatcher>
 #include <QHttpMultiPart>
 #include <QImage>
 #include <QJsonArray>
@@ -17,6 +18,7 @@
 #include <QUrl>
 #include <QUrlQuery>
 #include <QUuid>
+#include <QtConcurrent>
 #include <QtEndian>
 #include <cmath>
 
@@ -81,15 +83,28 @@ QString localArtPath(const QString &art) {
 
 DiscordRpc::DiscordRpc(Store *store, QObject *parent)
     : QObject(parent), s(store), socket(this), net(this), reconnectTimer(this),
+      connectTimeout(this),
       m_clientId(kDefaultClientId),
       m_itunesBaseUrl(QStringLiteral("https://itunes.apple.com/search")),
       m_deezerBaseUrl(QStringLiteral("https://api.deezer.com/search")),
       m_uploadBaseUrl(QStringLiteral("https://litterbox.catbox.moe/resources/internals/api.php")) {
   reconnectTimer.setInterval(15000);
   connect(&reconnectTimer, &QTimer::timeout, this, &DiscordRpc::tryConnect);
-  connect(&socket, &QLocalSocket::connected, this, &DiscordRpc::sendHandshake);
+  connectTimeout.setSingleShot(true);
+  connectTimeout.setInterval(250);
+  connect(&connectTimeout, &QTimer::timeout, this, [this] {
+    if (m_closing || m_ready) return;
+    socket.abort();
+    connectNextPipe();
+  });
+  connect(&socket, &QLocalSocket::connected, this, [this] {
+    connectTimeout.stop();
+    pendingPipes.clear();
+    sendHandshake();
+  });
   connect(&socket, &QLocalSocket::readyRead, this, &DiscordRpc::onReadyRead);
   connect(&socket, &QLocalSocket::disconnected, this, [this] {
+    connectTimeout.stop();
     const bool wasReady = m_ready;
     m_ready = false;
     readBuffer.clear();
@@ -105,7 +120,12 @@ DiscordRpc::DiscordRpc(Store *store, QObject *parent)
           [this](QLocalSocket::LocalSocketError) {
             if (!m_enabled || m_closing)
               return;
+            connectTimeout.stop();
             m_ready = false;
+            if (!pendingPipes.isEmpty()) {
+              QTimer::singleShot(0, this, &DiscordRpc::connectNextPipe);
+              return;
+            }
             setStatus("Waiting for Discord");
             if (!reconnectTimer.isActive())
               reconnectTimer.start();
@@ -530,59 +550,66 @@ void DiscordRpc::startUploadFallback(quint64 gen, const QVariantMap &track) {
     finishCoverResolution(gen, trackId, QString(), QStringLiteral("upload-miss"));
     return;
   }
-  QImage img(path);
-  if (img.isNull()) {
-    finishCoverResolution(gen, trackId, QString(), QStringLiteral("upload-miss"));
-    return;
-  }
-  QByteArray jpeg;
-  QBuffer buf(&jpeg);
-  buf.open(QIODevice::WriteOnly);
-  img.scaled(512, 512, Qt::KeepAspectRatio, Qt::SmoothTransformation).save(&buf, "JPG", 85);
-  if (jpeg.isEmpty()) {
-    finishCoverResolution(gen, trackId, QString(), QStringLiteral("upload-miss"));
-    return;
-  }
-
-  auto *multi = new QHttpMultiPart(QHttpMultiPart::FormDataType);
-  QHttpPart reqType;
-  reqType.setHeader(QNetworkRequest::ContentDispositionHeader, QVariant("form-data; name=\"reqtype\""));
-  reqType.setBody("fileupload");
-  multi->append(reqType);
-
-  QHttpPart expiry;
-  expiry.setHeader(QNetworkRequest::ContentDispositionHeader, QVariant("form-data; name=\"time\""));
-  expiry.setBody("72h");
-  multi->append(expiry);
-
-  QHttpPart filePart;
-  filePart.setHeader(QNetworkRequest::ContentTypeHeader, QVariant("image/jpeg"));
-  filePart.setHeader(QNetworkRequest::ContentDispositionHeader,
-                     QVariant("form-data; name=\"fileToUpload\"; filename=\"cover.jpg\""));
-  filePart.setBody(jpeg);
-  multi->append(filePart);
-
-  QNetworkRequest req{QUrl(m_uploadBaseUrl)};
-  req.setHeader(QNetworkRequest::UserAgentHeader, QStringLiteral("SillyPlayer/1.2"));
-  req.setTransferTimeout(10000);
-  auto *reply = net.post(req, multi);
-  multi->setParent(reply);
-  activeReply = reply;
-  connect(reply, &QNetworkReply::finished, this, [this, reply, gen, trackId] {
-    reply->deleteLater();
-    if (activeReply == reply) activeReply = nullptr;
+  // scale and jpeg-encode off the UI thread so large covers never hitch playback
+  auto *watcher = new QFutureWatcher<QByteArray>(this);
+  connect(watcher, &QFutureWatcher<QByteArray>::finished, this, [this, watcher, gen, trackId] {
+    const QByteArray jpeg = watcher->result();
+    watcher->deleteLater();
     if (m_closing || gen != lookupGen) return;
-    QString uploaded;
-    if (reply->error() == QNetworkReply::NoError) {
-      const QString body = QString::fromUtf8(reply->readAll()).trimmed();
-      if (body.startsWith(QLatin1String("https://"), Qt::CaseInsensitive) ||
-          body.startsWith(QLatin1String("http://"), Qt::CaseInsensitive)) {
-        uploaded = body;
-      }
+    if (jpeg.isEmpty()) {
+      finishCoverResolution(gen, trackId, QString(), QStringLiteral("upload-miss"));
+      return;
     }
-    finishCoverResolution(gen, trackId, uploaded,
-                          uploaded.isEmpty() ? QStringLiteral("upload-miss") : QStringLiteral("litterbox"));
+
+    auto *multi = new QHttpMultiPart(QHttpMultiPart::FormDataType);
+    QHttpPart reqType;
+    reqType.setHeader(QNetworkRequest::ContentDispositionHeader, QVariant("form-data; name=\"reqtype\""));
+    reqType.setBody("fileupload");
+    multi->append(reqType);
+
+    QHttpPart expiry;
+    expiry.setHeader(QNetworkRequest::ContentDispositionHeader, QVariant("form-data; name=\"time\""));
+    expiry.setBody("72h");
+    multi->append(expiry);
+
+    QHttpPart filePart;
+    filePart.setHeader(QNetworkRequest::ContentTypeHeader, QVariant("image/jpeg"));
+    filePart.setHeader(QNetworkRequest::ContentDispositionHeader,
+                       QVariant("form-data; name=\"fileToUpload\"; filename=\"cover.jpg\""));
+    filePart.setBody(jpeg);
+    multi->append(filePart);
+
+    QNetworkRequest req{QUrl(m_uploadBaseUrl)};
+    req.setHeader(QNetworkRequest::UserAgentHeader, QStringLiteral("SillyPlayer/1.2"));
+    req.setTransferTimeout(10000);
+    auto *reply = net.post(req, multi);
+    multi->setParent(reply);
+    activeReply = reply;
+    connect(reply, &QNetworkReply::finished, this, [this, reply, gen, trackId] {
+      reply->deleteLater();
+      if (activeReply == reply) activeReply = nullptr;
+      if (m_closing || gen != lookupGen) return;
+      QString uploaded;
+      if (reply->error() == QNetworkReply::NoError) {
+        const QString body = QString::fromUtf8(reply->readAll()).trimmed();
+        if (body.startsWith(QLatin1String("https://"), Qt::CaseInsensitive) ||
+            body.startsWith(QLatin1String("http://"), Qt::CaseInsensitive)) {
+          uploaded = body;
+        }
+      }
+      finishCoverResolution(gen, trackId, uploaded,
+                            uploaded.isEmpty() ? QStringLiteral("upload-miss") : QStringLiteral("litterbox"));
+    });
   });
+  watcher->setFuture(QtConcurrent::run([path]() -> QByteArray {
+    QImage img(path);
+    if (img.isNull()) return {};
+    QByteArray jpeg;
+    QBuffer buf(&jpeg);
+    buf.open(QIODevice::WriteOnly);
+    img.scaled(512, 512, Qt::KeepAspectRatio, Qt::SmoothTransformation).save(&buf, "JPG", 85);
+    return jpeg;
+  }));
 }
 
 void DiscordRpc::finishCoverResolution(quint64 gen, const QString &trackId, const QString &url,
@@ -686,21 +713,41 @@ void DiscordRpc::tryConnect() {
     return;
   }
   if (socket.state() == QLocalSocket::ConnectedState ||
-      socket.state() == QLocalSocket::ConnectingState)
+      socket.state() == QLocalSocket::ConnectingState ||
+      !pendingPipes.isEmpty())
     return;
-  const auto pipes = candidatePipePaths();
-  for (const auto &pipe : pipes) {
-    socket.abort();
-    readBuffer.clear();
-    socket.connectToServer(pipe, QIODevice::ReadWrite);
-    if (socket.waitForConnected(250)) {
-      return;
-    }
+  // probe candidate discord ipc pipes asynchronously so the UI thread never blocks on waitForConnected
+  pendingPipes = candidatePipePaths();
+  if (pendingPipes.isEmpty()) {
+    setStatus("Waiting for Discord");
+    return;
   }
-  setStatus("Waiting for Discord");
+  connectNextPipe();
+}
+
+void DiscordRpc::connectNextPipe() {
+  if (!m_enabled || m_closing || m_ready) {
+    pendingPipes.clear();
+    connectTimeout.stop();
+    return;
+  }
+  if (pendingPipes.isEmpty()) {
+    connectTimeout.stop();
+    setStatus("Waiting for Discord");
+    if (!reconnectTimer.isActive())
+      reconnectTimer.start();
+    return;
+  }
+  const QString pipe = pendingPipes.takeFirst();
+  socket.abort();
+  readBuffer.clear();
+  connectTimeout.start();
+  socket.connectToServer(pipe, QIODevice::ReadWrite);
 }
 
 void DiscordRpc::disconnectSocket() {
+  connectTimeout.stop();
+  pendingPipes.clear();
   m_ready = false;
   readBuffer.clear();
   if (socket.state() != QLocalSocket::UnconnectedState) {

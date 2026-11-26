@@ -43,6 +43,6 @@ Slider {
         color: Theme.accent
     }
     ToolTip.visible: hovered && enabled
-    ToolTip.text: app.time(displayedPosition) + " / " + app.time(backend.duration)
+    ToolTip.text: hovered ? (app.time(displayedPosition) + " / " + app.time(backend.duration)) : ""
     Accessible.name: "Seek position"
 }

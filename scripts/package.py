@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bundle the build and its ELF/QML dependencies, then create a ZIP."""
+"""Bundle the build and its ELF/QML dependencies, then create a max-compressed .tar.xz."""
 import hashlib
 import json
 import os
@@ -8,16 +8,17 @@ import re
 import shutil
 import subprocess
 import sys
-import zipfile
-from extractor_bundle import DENO, YT_DLP, install_extractor
+from extractor_bundle import QUICKJS, YT_DLP, install_extractor
 
 root = Path(__file__).resolve().parent.parent
 patchelf = shutil.which("patchelf") or str(root / ".deps/root/usr/bin/patchelf")
 if not Path(patchelf).is_file():
     raise SystemExit("Release building requires patchelf; run scripts/bootstrap-dev.sh or install patchelf")
 version = re.search(r"project\(SillyPlayer VERSION ([\d.]+)", (root / "CMakeLists.txt").read_text()).group(1)
-release_dir = root / "dist/linux" / version
+release_dir = root / "dist" / f"v{version}" / "linux"
+sha_dir = root / "dist" / f"v{version}" / "SHAs"
 release_dir.mkdir(parents=True, exist_ok=True)
+sha_dir.mkdir(parents=True, exist_ok=True)
 output = root / "build/release/linux" / f"SillyPlayer-{version}-linux-x86_64"
 if output.exists():
     shutil.rmtree(output)
@@ -161,10 +162,10 @@ for name, source in origins.items():
         shutil.copy2(copyright_file, output / "licenses" / (package + ".txt"))
 for copyright_file in (sdk / "share/doc").glob("*/copyright"):
     shutil.copy2(copyright_file, output / "licenses" / (copyright_file.parent.name + ".txt"))
-for name in ("Deno.txt", "yt-dlp.txt"):
+for name in ("QuickJS.txt", "yt-dlp.txt"):
     shutil.copy2(root / "packaging/licenses" / name, output / "licenses" / name)
 
-manifest = {"application": version, "baseline": "Linux Mint 22 / Ubuntu 24.04, x86-64, native Wayland and X11", "yt-dlp": YT_DLP, "deno": DENO, "libraries": sorted(copied)}
+manifest = {"application": version, "baseline": "Linux Mint 22 / Ubuntu 24.04, x86-64, native Wayland and X11", "yt-dlp": YT_DLP, "quickjs": QUICKJS, "libraries": sorted(copied)}
 versions=subprocess.run(["dpkg-query","-W","-f=${Package}\t${Version}\n"],text=True,capture_output=True,check=True)
 version_map=dict(line.split('\t',1) for line in versions.stdout.splitlines() if '\t' in line)
 used_packages=set()
@@ -175,13 +176,18 @@ for name,source in origins.items():
 manifest["system_library_packages"]={p:version_map[p] for p in sorted(used_packages) if p in version_map}
 manifest["local_sdk_packages"]=[p.name for p in sorted((root/".deps/debs").glob('*.deb'))]
 if (media / "bin/ffmpeg").exists():
-    manifest["ffmpeg"]="6.1.5 (SillyPlayer selected-codec build)"
+    manifest["ffmpeg"]="6.1.5 (SillyPlayer audio+artwork selected-codec build)"
     shutil.copy2(root / "scripts/build-media.sh",output / "licenses/FFmpeg-build.sh")
     shutil.copy2(root / ".deps/ffmpeg-6.1.5/COPYING.LGPLv2.1",output / "licenses/FFmpeg.txt")
     (output / "licenses/FFmpeg-source.txt").write_text("Source: https://ffmpeg.org/releases/ffmpeg-6.1.5.tar.xz\nSHA256: 05fbe9db1f5452a3605bb1d9bf91da9d4bb08162891692e4f172b58c49109412\nExact configure/build recipe: FFmpeg-build.sh\n")
+if (media / "lib/libmpv.so.2").exists():
+    manifest["mpv"]="0.36.0 (SillyPlayer audio-only minimal build)"
+    mpv_license = root / ".deps/mpv-0.36.0/LICENSE.GPL"
+    if mpv_license.exists():
+        shutil.copy2(mpv_license, output / "licenses/mpv.txt")
 (output / "DEPENDENCIES.json").write_text(json.dumps(manifest, indent=2) + "\n")
-(output / "licenses/NOTICE.txt").write_text("Qt, libmpv, FFmpeg, TagLib and other runtime libraries retain their upstream licenses. Sources: https://download.qt.io/archive/qt/6.4/6.4.2/submodules/ ; https://github.com/mpv-player/mpv ; https://ffmpeg.org/releases/ ; https://taglib.org/releases/ ; https://libarchive.org/downloads/ . Runtime libraries remain dynamically linked.\n")
-# One compressed notice file avoids redundant license texts and ZIP entry overhead.
+(output / "licenses/NOTICE.txt").write_text("Qt, libmpv, FFmpeg, TagLib, QuickJS-NG and other runtime libraries retain their upstream licenses. Sources: https://download.qt.io/archive/qt/6.4/6.4.2/submodules/ ; https://github.com/mpv-player/mpv ; https://ffmpeg.org/releases/ ; https://taglib.org/releases/ ; https://libarchive.org/downloads/ ; https://github.com/quickjs-ng/quickjs . Runtime libraries remain dynamically linked.\n")
+# One compressed notice file avoids redundant license texts and archive entry overhead.
 notices = []
 seen_notices = set()
 for notice in sorted((output / "licenses").glob("*.txt")):
@@ -192,13 +198,25 @@ for notice in sorted((output / "licenses").glob("*.txt")):
         seen_notices.add(digest)
     notice.unlink()
 (output / "licenses/NOTICE.txt").write_text("".join(notices))
-archive = release_dir / (output.name + ".zip")
-with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
-    for f in sorted(output.rglob("*")):
-        if f.is_file():
-            z.write(f, f.relative_to(output.parent))
+archive = release_dir / (output.name + ".tar.xz")
+# solid tar.xz with x86 BCJ filter + LZMA2 preset 9e (64 MiB dict) gives max standard-tar compression
+with open(archive, "wb") as out_fh:
+    tar_proc = subprocess.Popen(
+        ["tar", "--sort=name", "-cf", "-", "-C", str(output.parent), output.name],
+        stdout=subprocess.PIPE,
+    )
+    xz_proc = subprocess.Popen(
+        ["xz", "--x86", "--lzma2=preset=9e,dict=64MiB"],
+        stdin=tar_proc.stdout,
+        stdout=out_fh,
+    )
+    tar_proc.stdout.close()
+    xz_rc = xz_proc.wait()
+    tar_rc = tar_proc.wait()
+    if tar_rc != 0 or xz_rc != 0:
+        raise SystemExit(f"Archive creation failed (tar={tar_rc}, xz={xz_rc})")
 digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-Path(str(archive) + ".sha256").write_text(digest + "  " + archive.name + "\n")
-print(f"ZIP: {archive.stat().st_size / 1048576:.1f} MiB")
+(sha_dir / (archive.name + ".sha256")).write_text(digest + "  " + archive.name + "\n")
+print(f"TAR.XZ: {archive.stat().st_size / 1048576:.1f} MiB")
 print(f"Installed: {sum(f.stat().st_size for f in output.rglob('*') if f.is_file()) / 1048576:.1f} MiB")
 print(archive)

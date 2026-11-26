@@ -26,10 +26,10 @@ ItemDelegate {
         Item {
             Layout.preferredWidth: 46
             Layout.preferredHeight: 46
-            Art { anchors.fill: parent; source: row.cover; visible: !row.glyph }
+            Art { anchors.fill: parent; source: row.cover; visible: !!row.cover || !row.glyph }
             Rectangle {
                 anchors.fill: parent
-                visible: !!row.glyph
+                visible: !!row.glyph && !row.cover
                 radius: 8
                 color: Theme.surface
                 border.width: 1

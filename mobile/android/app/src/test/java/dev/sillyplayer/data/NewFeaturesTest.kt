@@ -295,4 +295,152 @@ class NewFeaturesTest {
         assertEquals(1f, dev.sillyplayer.media.perceptualFadeGain(1f), 0.0001f)
         assertEquals(1f, dev.sillyplayer.media.perceptualFadeGain(2f), 0.0001f)
     }
+
+    @Test
+    fun migration1To2DeclaresAllSecondaryIndexes() {
+        assertEquals(1, LibraryDatabase.MIGRATION_1_2.startVersion)
+        assertEquals(2, LibraryDatabase.MIGRATION_1_2.endVersion)
+        val statements = LibraryDatabase.MIGRATION_1_2_STATEMENTS
+        val expected = listOf(
+            "index_tracks_deleted_mergedInto_added",
+            "index_tracks_uri",
+            "index_tracks_hash",
+            "index_plays_qualified_playedAt",
+            "index_plays_qualified_track_playedAt",
+            "index_outbox_peer_entity_key",
+            "index_outbox_peer_created",
+            "index_outbox_key",
+            "index_replicas_key",
+            "index_conflicts_peer_entity_key",
+            "index_conflicts_key",
+        )
+        assertEquals(expected.size, statements.size)
+        for (name in expected) {
+            assertTrue("Missing index $name", statements.any { it.contains("`$name`") && it.startsWith("CREATE INDEX IF NOT EXISTS ") })
+        }
+    }
+
+    @Test
+    fun smartShuffleLargeLibraryAndSingleArtistAreExactPermutations() {
+        val now = 1_700_000_000_000L
+        val entries =
+            List(1500) { i ->
+                val t = Track(id = "t$i", title = "Song $i", artist = "Artist ${i % 30}")
+                QueueEntry(id = "e$i", track = t, trackId = t.id)
+            }
+        val lastPlayed = entries.associate { it.trackId to (now - (it.trackId.removePrefix("t").toLong() % 10L) * 86_400_000L) }
+        val order =
+            dev.sillyplayer.media.smartShuffledQueueOrder(
+                entries = entries,
+                index = 0,
+                previous = emptyList(),
+                lastPlayedByTrack = lastPlayed,
+                nowMs = now,
+                random = kotlin.random.Random(42),
+            )
+        assertEquals(1500, order.size)
+        assertEquals("e0", order.first())
+        assertEquals(1500, order.toSet().size)
+        val byId = entries.associateBy { it.id }
+        for (i in 1 until order.size) {
+            assertNotEquals(byId.getValue(order[i]).track.artist, byId.getValue(order[i - 1]).track.artist)
+        }
+
+        val mono = List(200) { i ->
+            val t = Track(id = "m$i", title = "Song $i", artist = "Solo Artist")
+            QueueEntry(id = "me$i", track = t, trackId = t.id)
+        }
+        val monoOrder =
+            dev.sillyplayer.media.smartShuffledQueueOrder(
+                entries = mono,
+                index = 0,
+                previous = emptyList(),
+                lastPlayedByTrack = emptyMap(),
+                nowMs = now,
+                random = kotlin.random.Random(7),
+            )
+        assertEquals(200, monoOrder.size)
+        assertEquals(200, monoOrder.toSet().size)
+    }
+
+    @Test
+    fun thumbnailCandidatesFastPathsLocalUrisAndInsightsReusesCalendar() {
+        assertEquals(
+            listOf("file:///data/user/0/dev.sillyplayer/files/art/indexed/abc.img"),
+            dev.sillyplayer.online.thumbnailCandidates("file:///data/user/0/dev.sillyplayer/files/art/indexed/abc.img"),
+        )
+        assertEquals(
+            listOf("content://media/external/audio/albumart/1"),
+            dev.sillyplayer.online.thumbnailCandidates("content://media/external/audio/albumart/1"),
+        )
+
+        val tz = java.util.TimeZone.getTimeZone("UTC")
+        val now = 1_700_050_000_000L // midday UTC
+        val track = Track(id = "t1", title = "Track 1", artist = "Artist A")
+        val plays =
+            List(600) { i ->
+                Play(session = "s$i", track = "t1", playedAt = now - (i % 5) * 86_400_000L, heardMs = 60_000L, qualified = true)
+            }
+        val insights = computeListeningInsights("week", plays, emptyList(), listOf(track), nowMs = now, timeZone = tz)
+        assertEquals(600L, insights.totalPlays)
+        assertEquals(5, insights.activeDays)
+        assertEquals(5, insights.streakDays)
+        assertEquals("Artist A", insights.topArtistName)
+    }
+
+    @Test
+    fun equalizerProcessorPassthroughGainOnlyAndStereoEqWorkCleanly() {
+        val proc = dev.sillyplayer.media.EqualizerProcessor()
+        val format = androidx.media3.common.audio.AudioProcessor.AudioFormat(48000, 2, androidx.media3.common.C.ENCODING_PCM_16BIT)
+        proc.configure(format)
+        proc.flush()
+
+        fun makePcm(samples: ShortArray): java.nio.ByteBuffer =
+            java.nio.ByteBuffer.allocateDirect(samples.size * 2)
+                .order(java.nio.ByteOrder.nativeOrder())
+                .apply {
+                    for (s in samples) putShort(s)
+                    flip()
+                }
+
+        fun readShorts(buf: java.nio.ByteBuffer): ShortArray {
+            val out = ShortArray(buf.remaining() / 2)
+            buf.order(java.nio.ByteOrder.nativeOrder()).asShortBuffer().get(out)
+            return out
+        }
+
+        val input = ShortArray(128) { i -> (kotlin.math.sin(i * 0.15) * 10000.0).toInt().toShort() }
+        // 1. passthrough path
+        proc.settings.set(dev.sillyplayer.media.EqSettings(enabled = false))
+        proc.signalGain = 1f
+        proc.queueInput(makePcm(input))
+        val passOut = readShorts(proc.output)
+        assertArrayEquals(input, passOut)
+
+        // 2. gain-only path (2x boost with clipping clamp)
+        proc.signalGain = 2f
+        val gainInput = shortArrayOf(1000, -1000, 20000, -20000)
+        proc.queueInput(makePcm(gainInput))
+        val gainOut = readShorts(proc.output)
+        assertArrayEquals(shortArrayOf(2000, -2000, 32767, -32768), gainOut)
+
+        // 3. stereo 10-band EQ path
+        proc.signalGain = 1f
+        proc.settings.set(dev.sillyplayer.media.EqSettings(enabled = true, gains = listOf(6f, 4f, 2f, 0f, -2f, 0f, 3f, 4f, 2f, 0f)))
+        proc.queueInput(makePcm(input))
+        val eqOut = readShorts(proc.output)
+        assertEquals(input.size, eqOut.size)
+        assertTrue(eqOut.any { it.toInt() != 0 })
+        proc.flush()
+    }
+
+    @Test
+    fun copyAndSha256MatchesStandaloneSha256AndPreservesBytes() {
+        val payload = ByteArray(300 * 1024) { i -> ((i * 31 + 7) and 0xff).toByte() }
+        val expected = java.io.ByteArrayInputStream(payload).sha256()
+        val copied = java.io.ByteArrayOutputStream()
+        val actual = java.io.ByteArrayInputStream(payload).copyAndSha256(copied)
+        assertEquals(expected, actual)
+        assertArrayEquals(payload, copied.toByteArray())
+    }
 }

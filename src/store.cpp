@@ -15,6 +15,11 @@ Store::Store(const QString &path) {
     throw std::runtime_error(m_db.lastError().text().toStdString());
   exec("PRAGMA foreign_keys=ON");
   exec("PRAGMA journal_mode=WAL");
+  // safe with WAL and avoids full fsync stalls on every small commit
+  exec("PRAGMA synchronous=NORMAL");
+  exec("PRAGMA temp_store=MEMORY");
+  exec("PRAGMA cache_size=-16000");
+  exec("PRAGMA mmap_size=67108864");
   exec("PRAGMA busy_timeout=5000");
   const int version = rows("PRAGMA user_version")
                           .value(0)
@@ -184,6 +189,20 @@ Store::Store(const QString &path) {
   if(!exec("CREATE TABLE IF NOT EXISTS sync_media_pending(track TEXT PRIMARY KEY,desired TEXT NOT NULL,actual TEXT NOT NULL)"))throw std::runtime_error("Cannot initialize pending media state");
   // cache public discord rpc cover urls for local songs so we dont spam metadata apis
   if(!exec("CREATE TABLE IF NOT EXISTS rpc_covers(track TEXT PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE,url TEXT NOT NULL,provider TEXT NOT NULL DEFAULT '',checkedAt INTEGER NOT NULL)"))throw std::runtime_error("Cannot initialize rpc cover cache");
+  // indexes for hot lookup paths (playlist dedupe, root scans, recents, sync conflicts, downloads)
+  for (const auto &idx : QStringList{
+           "CREATE INDEX IF NOT EXISTS idx_members_col_track ON members(collection,track)",
+           "CREATE INDEX IF NOT EXISTS idx_members_track ON members(track)",
+           "CREATE INDEX IF NOT EXISTS idx_track_roots_root ON track_roots(root)",
+           "CREATE INDEX IF NOT EXISTS idx_tracks_identity ON tracks(identity,size,mtime)",
+           "CREATE INDEX IF NOT EXISTS idx_tracks_videoId ON tracks(videoId)",
+           "CREATE INDEX IF NOT EXISTS idx_track_listens_recent ON track_listens(lastPlayed DESC)",
+           "CREATE INDEX IF NOT EXISTS idx_sync_conflicts_ek ON sync_conflicts(entity,key)",
+           "CREATE INDEX IF NOT EXISTS idx_playlist_dl_path ON playlist_download_items(path)",
+           "CREATE INDEX IF NOT EXISTS idx_playlist_dl_job ON playlist_download_items(job)",
+       }) {
+    exec(idx);
+  }
   // order is a collection-wide revision, independent from membership edits
   if(version<11) {
     if(version) {
@@ -248,6 +267,7 @@ QVariantList Store::rows(const QString &sql, const QVariantList &args) const {
   return result;
 }
 bool Store::exec(const QString &sql, const QVariantList &args) {
+  m_affected = 0;
   QSqlQuery q(m_db);
   q.prepare(sql);
   for (const auto &arg : args)
@@ -256,8 +276,18 @@ bool Store::exec(const QString &sql, const QVariantList &args) {
     m_error = q.lastError().text();
     return false;
   }
-  if(!q.isSelect() && q.numRowsAffected()>0){
+  m_affected = q.isSelect() ? 0 : qMax(0, q.numRowsAffected());
+  if(!q.isSelect() && m_affected>0){
     ++serial;
+    // keep per-table serials so 5s listening flushes and 15s position saves dont blow away track/settings caches
+    const bool touchesTracks = sql.contains("tracks",Qt::CaseInsensitive) || sql.contains("likes",Qt::CaseInsensitive);
+    if (touchesTracks) ++tracksRev;
+    if (sql.contains("roots",Qt::CaseInsensitive) && !sql.contains("track_roots",Qt::CaseInsensitive)) ++rootsRev;
+    if (sql.contains("settings",Qt::CaseInsensitive)) {
+      const QString key = args.isEmpty() ? QString() : args.first().toString();
+      static const QStringList volatileKeys{"position","listeningSession","queue","queueOrder","queueIndex","queueContext","queueSource"};
+      if (key.isEmpty() || !volatileKeys.contains(key)) ++settingsRev;
+    }
     if((sql.contains("tracks",Qt::CaseInsensitive)||sql.contains("collections",Qt::CaseInsensitive)||sql.contains("members",Qt::CaseInsensitive)) &&
        !sql.startsWith("UPDATE tracks SET speed=",Qt::CaseInsensitive) &&
        !sql.startsWith("UPDATE tracks SET volumePercent=",Qt::CaseInsensitive))++catalogue;
@@ -270,6 +300,15 @@ QVariant Store::setting(const QString &key, const QVariant &fallback) const {
     return fallback;
   auto doc = QJsonDocument::fromJson(r[0].toMap()["value"].toByteArray());
   return doc.array().isEmpty() ? fallback : doc.array().first().toVariant();
+}
+QVariantMap Store::allSettings() const {
+  QVariantMap out;
+  for (const auto &row : rows("SELECT key,value FROM settings")) {
+    const auto m = row.toMap();
+    const auto doc = QJsonDocument::fromJson(m["value"].toByteArray());
+    if (!doc.array().isEmpty()) out.insert(m["key"].toString(), doc.array().first().toVariant());
+  }
+  return out;
 }
 void Store::setSetting(const QString &key, const QVariant &value) {
   exec("INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET "

@@ -150,6 +150,20 @@ Item {
                             onActivated: app.setSetting("light", currentIndex === 1)
                         }
                     }
+                    Rectangle { Layout.fillWidth: true; height: 1; color: Theme.separator }
+                    AppCheck {
+                        objectName: "cropArtworkToggle"
+                        text: "Fill artwork squares"
+                        checked: app.settings.cropArtwork !== undefined ? !!app.settings.cropArtwork : true
+                        onToggled: app.setSetting("cropArtwork", checked)
+                    }
+                    Label {
+                        text: "Center-crop rectangular thumbnails to fill square covers cleanly without side bars."
+                        color: Theme.muted
+                        font.pixelSize: 12
+                        wrapMode: Text.Wrap
+                        Layout.fillWidth: true
+                    }
                 }
             }
         }

@@ -1,7 +1,10 @@
 package dev.sillyplayer.data
 
 import android.database.sqlite.SQLiteDatabase
+import android.net.Uri
 import android.os.Build
+import android.os.SystemClock
+import android.provider.DocumentsContract
 import androidx.documentfile.provider.DocumentFile
 import androidx.room.withTransaction
 import dev.sillyplayer.Graph
@@ -21,6 +24,9 @@ private const val MAX_SQLITE_RECOVERY_BYTES = 128L * 1024 * 1024
 private const val RECOVERY_FORMAT = "SillyPlayer library recovery"
 private const val PORTABLE_DB_FORMAT = "SillyPlayer SQLite Library"
 private const val PORTABLE_DB_MIME = "application/vnd.sillyplayer.database"
+private const val STRUCTURAL_SAVE_DEBOUNCE_MS = 10_000L
+private const val STATS_SAVE_INTERVAL_MS = 15L * 60L * 1000L
+private val HEX_64_REGEX = Regex("[a-f0-9]{64}")
 private val SQLITE_SLOT_NAMES = listOf(".sillyplayer-library-0.sqlite3", ".sillyplayer-library-1.sqlite3")
 private val LEGACY_JSON_SLOT_NAMES = listOf(".sillyplayer-library-0.json", ".sillyplayer-library-1.json")
 
@@ -28,6 +34,7 @@ private val LEGACY_JSON_SLOT_NAMES = listOf(".sillyplayer-library-0.json", ".sil
 internal data class PortableSettings(
     val palette: String = "Catppuccin",
     val light: Boolean = false,
+    val cropArtwork: Boolean = true,
     val master: Float = 100f,
     val onlineVolume: Float = 100f,
     val mode: Int = 0,
@@ -50,6 +57,7 @@ internal data class PortableSettings(
         prefs.copy(
             palette = palette.ifBlank { prefs.palette },
             light = light,
+            cropArtwork = cropArtwork,
             master = master.takeIf { it.isFinite() }?.coerceIn(0f, 300f) ?: prefs.master,
             onlineVolume = onlineVolume.takeIf { it.isFinite() }?.coerceIn(0f, 300f) ?: prefs.onlineVolume,
             mode = mode.coerceIn(0, 2),
@@ -76,6 +84,7 @@ internal data class PortableSettings(
             PortableSettings(
                 palette = prefs.palette,
                 light = prefs.light,
+                cropArtwork = prefs.cropArtwork,
                 master = prefs.master,
                 onlineVolume = prefs.onlineVolume,
                 mode = prefs.mode,
@@ -155,7 +164,7 @@ internal fun validateRecoveryLibrary(library: RecoveryLibrary) {
     }
     require(library.tracks.all {
         it.speed.isFinite() && it.speed in .5f..2f && it.volumePercent.isFinite() &&
-            it.volumePercent in 0f..300f && (it.hash.isEmpty() || it.hash.matches(Regex("[a-f0-9]{64}")))
+            it.volumePercent in 0f..300f && (it.hash.isEmpty() || HEX_64_REGEX.matches(it.hash))
     }) { "Invalid recovered song settings" }
     require(library.members.all { it.track in trackIds && it.collection in collectionIds } &&
         library.likes.all { it.track in trackIds } && library.counters.all { it.track in trackIds } &&
@@ -176,6 +185,11 @@ class LibraryRecovery(private val g: Graph) {
     val status = MutableStateFlow("")
     val lastSavedAt = MutableStateFlow(0L)
     val saving = MutableStateFlow(false)
+    @Volatile var lastWriteCompletedAt: Long = 0L
+        private set
+    @Volatile private var dirty = false
+    @Volatile private var statsDirty = false
+    @Volatile private var lastStatsSaveAt = 0L
     private val gate = Mutex()
     private var cachedFolder = ""
     private var sqliteSlots = arrayOfNulls<DocumentFile>(2)
@@ -184,12 +198,16 @@ class LibraryRecovery(private val g: Graph) {
     private var newestCreated = 0L
     private val requests = MutableSharedFlow<Unit>(extraBufferCapacity = 1, onBufferOverflow = kotlinx.coroutines.channels.BufferOverflow.DROP_OLDEST)
 
-    fun requestSave() { requests.tryEmit(Unit) }
+    fun requestSave() {
+        dirty = true
+        requests.tryEmit(Unit)
+    }
 
     /** flush immediately (e.g. on app backgrounding or after clearing the folder) */
     fun flushNow(allowEmpty: Boolean = false) {
         g.scope.launch {
             if (g.resetting.value) return@launch
+            if (!allowEmpty && !dirty && !statsDirty && lastSavedAt.value > 0L) return@launch
             runCatching { save(allowEmpty) }.onFailure { error ->
                 if (error is CancellationException) throw error
                 status.value = "Library database sync: ${error.message}. ZIP backup is also available."
@@ -209,16 +227,22 @@ class LibraryRecovery(private val g: Graph) {
                 g.prefs.loaded.await()
                 val folder = g.prefs.state.value.musicDir
                 if (folder.isNotBlank()) {
+                    var needsInitialSave = false
                     gate.withLock {
-                        val existing = runCatching { open(folder, readExisting = true).second }.getOrNull()
-                        if (existing != null && existing.created > lastSavedAt.value) {
-                            lastSavedAt.value = existing.created
+                        // read only portable metadata on cold start instead of full integrity_check + loading all tables
+                        val existingCreated = runCatching { inspectCreated(folder) }.getOrNull()
+                        if (existingCreated != null && existingCreated > lastSavedAt.value) {
+                            lastSavedAt.value = existingCreated
+                        } else if (existingCreated == null) {
+                            needsInitialSave = g.dao.hasAnyTracks() || g.dao.hasAnyCollections()
                         }
                     }
+                    if (needsInitialSave) requestSave()
                 }
             }
         }
         g.scope.launch {
+            // drop the initial invalidation emission so cold launch doesn't immediately rewrite an unchanged mirror
             val dbChanges =
                 g.db.invalidationTracker
                     .createFlow(
@@ -226,23 +250,52 @@ class LibraryRecovery(private val g: Graph) {
                         "collections",
                         "members",
                         "likes",
-                        "plays",
-                        "counters",
                         "jobs",
                         "searches",
                         "restore_ids",
                     )
+                    .drop(1)
+                    .onEach { dirty = true }
                     .map { Unit }
             val prefChanges =
-                g.prefs.state.map { PortableSettings.from(it) }.distinctUntilChanged().drop(1).map { Unit }
+                g.prefs.state
+                    .map { PortableSettings.from(it) }
+                    .distinctUntilChanged()
+                    .drop(1)
+                    .onEach { dirty = true }
+                    .map { Unit }
             merge(dbChanges, prefChanges, requests)
-                .debounce(3000)
+                .debounce(STRUCTURAL_SAVE_DEBOUNCE_MS)
                 .collect {
                     while (g.library.isIndexing || g.backup.state.value.busy || g.sync.state.value.busy)
                         delay(1000)
                     if (!g.resetting.value) runCatching { save(allowEmpty = false) }.onFailure { error ->
                         if (error is CancellationException) throw error
                         status.value = "Library database sync: ${error.message}. ZIP backup is also available."
+                    }
+                }
+        }
+        g.scope.launch {
+            // listening stats change often during playback so mirror them on a low-frequency cadence (plus onStop flush)
+            g.db.invalidationTracker
+                .createFlow("plays", "counters")
+                .drop(1)
+                .collect {
+                    statsDirty = true
+                    dirty = true
+                    val now = SystemClock.elapsedRealtime()
+                    if (lastStatsSaveAt == 0L) {
+                        lastStatsSaveAt = now
+                        return@collect
+                    }
+                    if (now - lastStatsSaveAt < STATS_SAVE_INTERVAL_MS) return@collect
+                    while (g.library.isIndexing || g.backup.state.value.busy || g.sync.state.value.busy)
+                        delay(1000)
+                    if (!g.resetting.value && (dirty || statsDirty)) {
+                        runCatching { save(allowEmpty = false) }.onFailure { error ->
+                            if (error is CancellationException) throw error
+                            status.value = "Library database sync: ${error.message}. ZIP backup is also available."
+                        }
                     }
                 }
         }
@@ -455,24 +508,121 @@ class LibraryRecovery(private val g: Graph) {
         }
     }
 
+    private fun readSqliteCreated(file: DocumentFile): Long {
+        val temp = File(g.context.cacheDir, "db-meta-${uuid()}.sqlite3")
+        try {
+            var total = 0L
+            g.input(file.uri.toString()).use { input ->
+                temp.outputStream().use { out ->
+                    val block = ByteArray(128 * 1024)
+                    while (true) {
+                        val n = input.read(block)
+                        if (n < 0) break
+                        total += n
+                        require(total <= MAX_SQLITE_RECOVERY_BYTES) { "Library database file is too large" }
+                        out.write(block, 0, n)
+                    }
+                }
+            }
+            require(total >= 100) { "Library database file is incomplete" }
+            SQLiteDatabase.openDatabase(temp.absolutePath, null, SQLiteDatabase.OPEN_READONLY).use { db ->
+                val meta = mutableMapOf<String, String>()
+                db.rawQuery("SELECT key, value FROM sillyplayer_portable_meta", null).use { c ->
+                    while (c.moveToNext()) meta[c.getString(0)] = c.getString(1)
+                }
+                require(meta["format"] == PORTABLE_DB_FORMAT && meta["version"] == "1") {
+                    "Unsupported library database format"
+                }
+                return meta["created"]?.toLongOrNull() ?: error("Missing database timestamp")
+            }
+        } finally {
+            temp.delete()
+            File(temp.absolutePath + "-wal").delete()
+            File(temp.absolutePath + "-shm").delete()
+            File(temp.absolutePath + "-journal").delete()
+        }
+    }
+
+    private fun scanSlots(folder: String, root: DocumentFile) {
+        cachedFolder = folder
+        sqliteSlots = arrayOfNulls(2)
+        legacyJsonSlots = arrayOfNulls(2)
+        newestSlot = -1
+        newestCreated = 0
+        val uri = root.uri
+        if (uri.scheme == "content") {
+            // query document IDs and names in one SAF cursor instead of root.listFiles() (N+1 Binder IPCs)
+            val children =
+                runCatching {
+                    DocumentsContract.buildChildDocumentsUriUsingTree(uri, DocumentsContract.getDocumentId(uri))
+                }.getOrNull()
+            if (children != null) {
+                val projection =
+                    arrayOf(
+                        DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                        DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                    )
+                val queried =
+                    runCatching {
+                        g.context.contentResolver.query(children, projection, null, null, null)?.use { c ->
+                            while (c.moveToNext()) {
+                                val name = c.getString(1) ?: continue
+                                val sqliteIdx = SQLITE_SLOT_NAMES.indexOfFirst { name == it || name.startsWith("$it.") }
+                                val jsonIdx = if (sqliteIdx < 0) LEGACY_JSON_SLOT_NAMES.indexOf(name) else -1
+                                if (sqliteIdx < 0 && jsonIdx < 0) continue
+                                val childUri = DocumentsContract.buildDocumentUriUsingTree(uri, c.getString(0))
+                                val doc = DocumentFile.fromSingleUri(g.context, childUri) ?: continue
+                                if (sqliteIdx >= 0) sqliteSlots[sqliteIdx] = doc
+                                else legacyJsonSlots[jsonIdx] = doc
+                            }
+                            true
+                        } ?: false
+                    }.getOrDefault(false)
+                if (queried) return
+            }
+        }
+        root.listFiles().forEach { file ->
+            val name = file.name ?: return@forEach
+            SQLITE_SLOT_NAMES.indexOfFirst { name == it || name.startsWith("$it.") }
+                .takeIf { it >= 0 }
+                ?.let { sqliteSlots[it] = file }
+            LEGACY_JSON_SLOT_NAMES.indexOf(name)
+                .takeIf { it >= 0 }
+                ?.let { legacyJsonSlots[it] = file }
+        }
+    }
+
+    private fun inspectCreated(folder: String): Long? {
+        val root = g.library.requireMusicFolder(folder)
+        if (cachedFolder != folder) scanSlots(folder, root)
+        var newest = 0L
+        for ((index, file) in sqliteSlots.withIndex()) {
+            if (file == null) continue
+            val created = runCatching { readSqliteCreated(file) }.getOrNull() ?: continue
+            if (created > newest) {
+                newest = created
+                newestSlot = index
+                newestCreated = created
+            }
+        }
+        if (newest == 0L) {
+            for (file in legacyJsonSlots) {
+                if (file == null) continue
+                val library = runCatching { readLegacyJson(file) }.getOrNull() ?: continue
+                if (library.created > newest) {
+                    newest = library.created
+                    newestCreated = library.created
+                }
+            }
+        }
+        return newest.takeIf { it > 0L }
+    }
+
     private fun open(folder: String, readExisting: Boolean = false): Pair<DocumentFile, RecoveryLibrary?> {
         val root = g.library.requireMusicFolder(folder)
         if (cachedFolder == folder && !readExisting) return root to null
         if (cachedFolder != folder) {
-            cachedFolder = folder
-            sqliteSlots = arrayOfNulls(2)
-            legacyJsonSlots = arrayOfNulls(2)
-            newestSlot = -1
-            newestCreated = 0
-            root.listFiles().forEach { file ->
-                val name = file.name ?: return@forEach
-                SQLITE_SLOT_NAMES.indexOfFirst { name == it || name.startsWith("$it.") }
-                    .takeIf { it >= 0 }
-                    ?.let { sqliteSlots[it] = file }
-                LEGACY_JSON_SLOT_NAMES.indexOf(name)
-                    .takeIf { it >= 0 }
-                    ?.let { legacyJsonSlots[it] = file }
-            }
+            scanSlots(folder, root)
         }
         var newest: RecoveryLibrary? = null
         var invalid = false
@@ -515,7 +665,7 @@ class LibraryRecovery(private val g: Graph) {
         var restored = 0
         var didRestore = false
         g.db.withTransaction {
-            if (g.dao.recoveryTracks().isNotEmpty() || g.dao.collections().isNotEmpty()) return@withTransaction
+            if (g.dao.hasAnyTracks() || g.dao.hasAnyCollections()) return@withTransaction
             didRestore = true
             for (track in saved.tracks) {
                 val uri = track.uri.takeIf { it.startsWith("content:") } ?: "recovery://song/${track.id}"
@@ -613,7 +763,7 @@ class LibraryRecovery(private val g: Graph) {
             val (root, _) = open(folder) // validate any existing snapshot before selecting a write slot
             if (!allowEmpty) {
                 val hasData = g.db.withTransaction {
-                    g.dao.recoveryTracks().isNotEmpty() || g.dao.collections().isNotEmpty()
+                    g.dao.hasAnyTracks() || g.dao.hasAnyCollections()
                 }
                 // an empty new installation must not erase a surviving database before folder recovery
                 if (!hasData) return@withLock
@@ -640,6 +790,9 @@ class LibraryRecovery(private val g: Graph) {
                 newestSlot = targetIndex
                 newestCreated = created
                 lastSavedAt.value = created
+                dirty = false
+                statsDirty = false
+                lastStatsSaveAt = SystemClock.elapsedRealtime()
                 status.value = "Library database saved in your audio folder"
             } finally {
                 stage.delete()
@@ -648,6 +801,7 @@ class LibraryRecovery(private val g: Graph) {
                 File(stage.absolutePath + "-journal").delete()
             }
         } finally {
+            lastWriteCompletedAt = SystemClock.elapsedRealtime()
             saving.value = false
         }
     }

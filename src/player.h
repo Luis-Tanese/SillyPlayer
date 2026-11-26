@@ -10,7 +10,7 @@ class Player : public QObject {
   Q_OBJECT
   Q_PROPERTY(bool seekPending READ seekPending NOTIFY changed)
   Q_PROPERTY(quint64 generation READ generation NOTIFY changed)
-  Q_PROPERTY(double position READ position NOTIFY changed)
+  Q_PROPERTY(double position READ position NOTIFY positionChanged)
   Q_PROPERTY(double duration READ duration NOTIFY changed)
   Q_PROPERTY(bool paused READ paused NOTIFY changed)
   Q_PROPERTY(bool pausing READ pausing NOTIFY changed)
@@ -64,6 +64,7 @@ public:
   void shutdown();
 signals:
   void changed();
+  void positionChanged();
   void volumeChanged();
   void trackVolumeChanged();
   void effectiveVolumeChanged();
@@ -100,7 +101,8 @@ private:
   bool pitchFollows = false, pendingSeek = false, seekStarted = false;
   double seekTarget = 0, heldPosition = -1, resumeFloor = -1;
   quint64 mediaGeneration = 0, seekSerial = 0;
-  QElapsedTimer seekClock;
+  QElapsedTimer seekClock, positionClock;
+  double lastEmittedPos = -1.0;
   void updateFilters();
   void resetFade();
   void resetTransitionFade();

@@ -21,6 +21,8 @@ class PreferenceStore(private val context: Context, scope: CoroutineScope) {
     private val key = stringPreferencesKey("settings")
     private val queueKey = stringPreferencesKey("queue-occurrences")
     private val shuffleKey = stringPreferencesKey("queue-shuffle-order")
+    // keep volatile playback position outside DataStore so periodic saves don't emit full prefs snapshots
+    private val posPrefs = context.getSharedPreferences("playback_pos", Context.MODE_PRIVATE)
     private data class ShuffleCache(val text: String, val ids: List<String>)
     @Volatile private var shuffleCache = ShuffleCache("[]", emptyList())
 
@@ -77,11 +79,31 @@ class PreferenceStore(private val context: Context, scope: CoroutineScope) {
                     .also { prefs.edit().putString("id", it).commit() }
         }
 
+    fun savePosition(entryId: String, index: Int, position: Long) {
+        posPrefs.edit()
+            .putString("entryId", entryId)
+            .putInt("index", index)
+            .putLong("position", position.coerceAtLeast(0L))
+            .apply()
+    }
+
+    fun loadPosition(queue: QueueState): Long {
+        val currentId = queue.entries.getOrNull(queue.index)?.id ?: return queue.position
+        if (posPrefs.getString("entryId", null) == currentId && posPrefs.getInt("index", -1) == queue.index) {
+            return posPrefs.getLong("position", queue.position).coerceAtLeast(0L)
+        }
+        return queue.position
+    }
+
     suspend fun update(block: (Preferences) -> Preferences) {
         context.preferences.edit { data ->
             val old = read(data)
             val changed = block(old)
             if (old == changed) return@edit
+            if (old.queue != changed.queue) {
+                val entryId = changed.queue.entries.getOrNull(changed.queue.index)?.id.orEmpty()
+                savePosition(entryId, changed.queue.index, changed.queue.position)
+            }
             if (old.queue.entries !== changed.queue.entries && (
                 old.queue.entries.size != changed.queue.entries.size ||
                     old.queue.entries.indices.any { i ->

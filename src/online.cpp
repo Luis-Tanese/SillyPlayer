@@ -16,6 +16,8 @@
 #include <QElapsedTimer>
 #include <QCoreApplication>
 #include <QDateTime>
+#include <QFutureWatcher>
+#include <QtConcurrent>
 #include <QDesktopServices>
 #include <QDir>
 #include <QJsonArray>
@@ -77,10 +79,12 @@ Online::Online(Store *store, QObject *parent)
   progressNotifications.setSingleShot(true);
   progressNotifications.setInterval(100);
   connect(&progressNotifications, &QTimer::timeout, this, &Online::jobsChanged);
+  bool anyChanged = false;
   for (auto v : s->rows("SELECT payload FROM jobs ORDER BY rowid")) {
     auto j = QJsonDocument::fromJson(v.toMap()["payload"].toByteArray())
                  .toVariant()
                  .toMap();
+    const auto original = j;
     savedJobs.insert(j.value("id").toString(), j);
     if (QStringList{"Queued", "Resolving", "Active", "Post-processing"}
             .contains(j["state"].toString()))
@@ -89,14 +93,20 @@ Online::Online(Store *store, QObject *parent)
     source["provider"]=Source::provider(source);
     j["provider"]=source["provider"];
     j["source"]=source;
+    if (j != original) anyChanged = true;
     m_jobs << j;
   }
-  persist();
+  if (anyChanged) persist();
 }
 Online::~Online() { shutdown(); }
 QObject *Online::playlistObject() const { return playlist; }
 QVariantList Online::history() const {
-  return s->rows("SELECT query FROM searches WHERE provider=? ORDER BY used DESC LIMIT 20",{m_provider});
+  if (!historyValid || historyProvider != m_provider) {
+    historyCache = s->rows("SELECT query FROM searches WHERE provider=? ORDER BY used DESC LIMIT 20",{m_provider});
+    historyProvider = m_provider;
+    historyValid = true;
+  }
+  return historyCache;
 }
 QStringList Online::baseArgs() {
   QStringList a{"--ignore-config",
@@ -120,10 +130,12 @@ QStringList Online::baseArgs() {
 }
 void Online::removeHistory(const QString &q) {
   s->exec("DELETE FROM searches WHERE provider=? AND query=?", {m_provider,q});
+  historyValid = false;
   emit searchChanged();
 }
 void Online::clearHistory() {
   s->exec("DELETE FROM searches WHERE provider=?",{m_provider});
+  historyValid = false;
   emit searchChanged();
 }
 QString Online::providerName() const { return Source::name(m_provider); }
@@ -137,6 +149,7 @@ void Online::setActiveProvider(const QString &provider) {
   if (imageReply) { imageReply->abort(); imageReply=nullptr; }
   m_details.clear(); detailError.clear(); playbackUrl.clear();
   m_provider=provider;
+  historyValid = false;
   const auto state=searchStates.value(provider);
   m_results=state.results; lastQuery=state.query; m_status=state.status; limit=state.limit;
   emit providerChanged(); emit searchChanged(); emit detailsChanged();
@@ -185,6 +198,7 @@ void Online::search(const QString &input, bool more) {
   s->exec("INSERT INTO searches VALUES(?,?,?) ON CONFLICT(provider,query) DO UPDATE SET "
           "used=excluded.used",
           {m_provider,query, QDateTime::currentMSecsSinceEpoch()});
+  historyValid = false;
   emit searchChanged();
   auto p = new QProcess(this);
   configureToolProcess(p, true);
@@ -397,30 +411,53 @@ void Online::cacheArtwork(const QVariantMap &details, int attempt) {
     if (reply->bytesAvailable() > 8 * 1024 * 1024) reply->abort();
   });
   connect(reply, &QNetworkReply::finished, this, [this, reply, path, dir, generation, details, attempt] {
-    bool saved = false;
     if (imageReply == reply) imageReply = nullptr;
-    const auto bytes = reply->readAll();
-    if (generation == imageGeneration && reply->error() == QNetworkReply::NoError && bytes.size() <= 8 * 1024 * 1024) {
-      QBuffer buffer; buffer.setData(bytes); buffer.open(QIODevice::ReadOnly);
-      QImageReader reader(&buffer); const auto size=reader.size();
-      if(size.isValid() && size.width()<=8192 && size.height()<=8192) {
-        if (size.width() > 1200 || size.height() > 1200)
-          reader.setScaledSize(size.scaled(1200,1200,Qt::KeepAspectRatio));
-        const auto image=reader.read();
-        if(!image.isNull()) {
-          QSaveFile file(path);
-          if (file.open(QIODevice::WriteOnly) && image.save(&file,"JPG") && file.commit()) {
-            saved = true;
-            m_details["artwork"] = QUrl::fromLocalFile(path).toString(); emit detailsChanged();
-            auto files = QDir(dir).entryInfoList(QDir::Files, QDir::Time);
-            qint64 size = 0;
-            for (const auto &item : files) { size += item.size(); if (size > 100*1024*1024 && item.filePath() != path) QFile::remove(item.filePath()); }
-          }
+    const bool okReply = (generation == imageGeneration && reply->error() == QNetworkReply::NoError);
+    const auto bytes = okReply ? reply->readAll() : QByteArray();
+    reply->deleteLater();
+    if (!okReply || bytes.isEmpty() || bytes.size() > 8 * 1024 * 1024) {
+      if (generation == imageGeneration) cacheArtwork(details, attempt + 1);
+      return;
+    }
+    const bool shouldPrune = (++artworkSavesSincePrune >= 10);
+    if (shouldPrune) artworkSavesSincePrune = 0;
+    // decode, scale, save, and periodically prune cache off the UI thread
+    auto *watcher = new QFutureWatcher<bool>(this);
+    connect(watcher, &QFutureWatcher<bool>::finished, this, [this, watcher, path, generation, details, attempt] {
+      const bool saved = watcher->result();
+      watcher->deleteLater();
+      if (closing || generation != imageGeneration) return;
+      if (saved) {
+        m_details["artwork"] = QUrl::fromLocalFile(path).toString();
+        emit detailsChanged();
+      } else {
+        cacheArtwork(details, attempt + 1);
+      }
+    });
+    watcher->setFuture(QtConcurrent::run([bytes, path, dir, shouldPrune]() -> bool {
+      QBuffer buffer;
+      buffer.setData(bytes);
+      buffer.open(QIODevice::ReadOnly);
+      QImageReader reader(&buffer);
+      const auto size = reader.size();
+      if (!size.isValid() || size.width() > 8192 || size.height() > 8192) return false;
+      if (size.width() > 1200 || size.height() > 1200)
+        reader.setScaledSize(size.scaled(1200, 1200, Qt::KeepAspectRatio));
+      const auto image = reader.read();
+      if (image.isNull()) return false;
+      QSaveFile file(path);
+      if (!file.open(QIODevice::WriteOnly) || !image.save(&file, "JPG") || !file.commit())
+        return false;
+      if (shouldPrune) {
+        auto files = QDir(dir).entryInfoList(QDir::Files, QDir::Time);
+        qint64 total = 0;
+        for (const auto &item : files) {
+          total += item.size();
+          if (total > 100 * 1024 * 1024 && item.filePath() != path) QFile::remove(item.filePath());
         }
       }
-    }
-    reply->deleteLater();
-    if (!saved && generation == imageGeneration) cacheArtwork(details, attempt + 1);
+      return true;
+    }));
   });
 }
 QString Online::enqueue(const QVariantMap &d, const QString &kind,
@@ -957,6 +994,7 @@ void Online::resetJobs() {
   searchStates.clear();
   m_jobs.clear();
   savedJobs.clear();
+  historyValid = false;
   emit searchChanged();
   emit detailsChanged();
   emit jobsChanged();

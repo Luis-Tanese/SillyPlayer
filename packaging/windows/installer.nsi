@@ -8,11 +8,11 @@ InstallDir "$LOCALAPPDATA\Programs\SillyPlayer"
 InstallDirRegKey HKCU "Software\SillyPlayer" "InstallDir"
 RequestExecutionLevel user
 SetCompressor /SOLID lzma
-SetCompressorDictSize 32
-VIProductVersion "1.3.0.0"
+SetCompressorDictSize 64
+VIProductVersion "${VERSION}.0"
 VIAddVersionKey "ProductName" "SillyPlayer"
 VIAddVersionKey "FileDescription" "SillyPlayer installer"
-VIAddVersionKey "FileVersion" "1.3.0"
+VIAddVersionKey "FileVersion" "${VERSION}"
 !define MUI_ICON "${PROJECT}\assets\sillyplayer.ico"
 !define MUI_UNICON "${PROJECT}\assets\sillyplayer.ico"
 !define MUI_ABORTWARNING
@@ -57,13 +57,15 @@ Section "SillyPlayer (required)"
  IfFileExists "$INSTDIR\Uninstall.exe" 0 fresh
   ExecWait '"$INSTDIR\Uninstall.exe" /S _?=$INSTDIR'
  fresh:
+ ; wipe any leftover binaries/libs from older releases (e.g. deno.exe or old DLLs) before extracting; user data lives outside $INSTDIR\app
+ RMDir /r "$INSTDIR\app"
  SetOutPath "$INSTDIR\app"
  File /r "${PAYLOAD}\*"
  SetOutPath "$INSTDIR"
  WriteUninstaller "$INSTDIR\Uninstall.exe"
  WriteRegStr HKCU "Software\SillyPlayer" "InstallDir" "$INSTDIR"
  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SillyPlayer" "DisplayName" "SillyPlayer"
- WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SillyPlayer" "DisplayVersion" "1.1.0"
+ WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SillyPlayer" "DisplayVersion" "${VERSION}"
  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SillyPlayer" "Publisher" "SillyPlayer"
  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SillyPlayer" "InstallLocation" "$INSTDIR"
  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SillyPlayer" "DisplayIcon" "$INSTDIR\app\SillyPlayer.exe"

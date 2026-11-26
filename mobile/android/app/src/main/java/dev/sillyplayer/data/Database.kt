@@ -1,7 +1,11 @@
 package dev.sillyplayer.data
 
 import androidx.room.*
+import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
 import kotlinx.coroutines.flow.Flow
+
+data class TrackLastPlayed(val track: String, val lastPlayed: Long)
 
 @Dao
 interface LibraryDao {
@@ -29,6 +33,21 @@ interface LibraryDao {
     @Query("SELECT * FROM tracks WHERE mergedInto=''") suspend fun allTracks(): List<Track>
 
     @Query("SELECT * FROM tracks") suspend fun recoveryTracks(): List<Track>
+
+    @Query("SELECT EXISTS(SELECT 1 FROM tracks)") suspend fun hasAnyTracks(): Boolean
+
+    @Query("SELECT EXISTS(SELECT 1 FROM collections)") suspend fun hasAnyCollections(): Boolean
+
+    @Query("SELECT COUNT(*) FROM tracks WHERE deleted=0 AND mergedInto='' AND available=1")
+    suspend fun countAvailableTracks(): Int
+
+    @Query(
+        "SELECT * FROM tracks WHERE deleted=0 AND mergedInto='' AND available=1 ORDER BY added DESC,title COLLATE NOCASE LIMIT :limit OFFSET :offset"
+    )
+    suspend fun availableTracksPage(limit: Int, offset: Int): List<Track>
+
+    @Query("SELECT track, MAX(lastPlayed) AS lastPlayed FROM counters WHERE track<>'' GROUP BY track")
+    suspend fun trackLastPlayed(): List<TrackLastPlayed>
 
     @Query("SELECT * FROM tracks WHERE id IN (:ids) AND mergedInto=''")
     suspend fun tracksByIds(ids: List<String>): List<Track>
@@ -62,6 +81,9 @@ interface LibraryDao {
 
     @Query("SELECT * FROM members WHERE collection=:id ORDER BY position,id")
     suspend fun members(id: String): List<Member>
+
+    @Query("SELECT * FROM members WHERE track=:trackId")
+    suspend fun membersForTrack(trackId: String): List<Member>
 
     @Upsert suspend fun putMember(value: Member)
 
@@ -144,9 +166,13 @@ interface LibraryDao {
 
     @Query("SELECT * FROM plays WHERE qualified=1") suspend fun plays(): List<Play>
 
+    @Query("SELECT * FROM plays WHERE track=:trackId") suspend fun playsForTrack(trackId: String): List<Play>
+
     @Query("SELECT * FROM counters") fun observeCounters(): Flow<List<Counter>>
 
     @Query("SELECT * FROM counters") suspend fun counters(): List<Counter>
+
+    @Query("SELECT * FROM counters WHERE track=:trackId") suspend fun countersForTrack(trackId: String): List<Counter>
 
     @Query("SELECT * FROM counters WHERE device=:device AND component=:track")
     suspend fun counter(device: String, track: String): Counter?
@@ -261,9 +287,34 @@ interface LibraryDao {
             SyncConflict::class,
             RestoreId::class,
         ],
-    version = 1,
+    version = 2,
     exportSchema = true,
 )
 abstract class LibraryDatabase : RoomDatabase() {
     abstract fun dao(): LibraryDao
+
+    companion object {
+        // add secondary indexes for hot library, history, and sync queries
+        val MIGRATION_1_2 =
+            object : Migration(1, 2) {
+                override fun migrate(db: SupportSQLiteDatabase) {
+                    for (sql in MIGRATION_1_2_STATEMENTS) db.execSQL(sql)
+                }
+            }
+
+        internal val MIGRATION_1_2_STATEMENTS =
+            listOf(
+                "CREATE INDEX IF NOT EXISTS `index_tracks_deleted_mergedInto_added` ON `tracks` (`deleted`, `mergedInto`, `added`)",
+                "CREATE INDEX IF NOT EXISTS `index_tracks_uri` ON `tracks` (`uri`)",
+                "CREATE INDEX IF NOT EXISTS `index_tracks_hash` ON `tracks` (`hash`)",
+                "CREATE INDEX IF NOT EXISTS `index_plays_qualified_playedAt` ON `plays` (`qualified`, `playedAt`)",
+                "CREATE INDEX IF NOT EXISTS `index_plays_qualified_track_playedAt` ON `plays` (`qualified`, `track`, `playedAt`)",
+                "CREATE INDEX IF NOT EXISTS `index_outbox_peer_entity_key` ON `outbox` (`peer`, `entity`, `key`)",
+                "CREATE INDEX IF NOT EXISTS `index_outbox_peer_created` ON `outbox` (`peer`, `created`)",
+                "CREATE INDEX IF NOT EXISTS `index_outbox_key` ON `outbox` (`key`)",
+                "CREATE INDEX IF NOT EXISTS `index_replicas_key` ON `replicas` (`key`)",
+                "CREATE INDEX IF NOT EXISTS `index_conflicts_peer_entity_key` ON `conflicts` (`peer`, `entity`, `key`)",
+                "CREATE INDEX IF NOT EXISTS `index_conflicts_key` ON `conflicts` (`key`)",
+            )
+    }
 }

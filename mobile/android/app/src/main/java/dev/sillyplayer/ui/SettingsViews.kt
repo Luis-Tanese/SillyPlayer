@@ -222,6 +222,11 @@ fun SettingsScreen(g: Graph, pickers: Pickers) {
                         g.task { g.prefs.update { it.copy(light = mode == "Light") } }
                     }
                 }
+                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                Choice("Fill artwork squares", prefs.cropArtwork) { on ->
+                    g.task { g.prefs.update { it.copy(cropArtwork = on) } }
+                }
+                Hint("Center-crop rectangular thumbnails to fill square covers cleanly without side bars.")
             }
         }
         if (category == "Playback") {
@@ -591,15 +596,17 @@ fun SettingsScreen(g: Graph, pickers: Pickers) {
             icon = "folder",
             actions = { ModalPrimaryButton("Close") { missing = null } },
         ) {
-            Column(Modifier.heightIn(max = 400.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                if (rows.isEmpty()) Hint("No missing files found")
-                for (track in rows) ModalOptionRow(
-                    title = track.title,
-                    subtitle = "Tap to locate audio file",
-                    icon = "folder",
-                    trailingIcon = "chevron-right",
-                ) {
-                    pickers.locate(track.id)
+            LazyColumn(Modifier.heightIn(max = 400.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (rows.isEmpty()) item { Hint("No missing files found") }
+                items(rows, key = { it.id }) { track ->
+                    ModalOptionRow(
+                        title = track.title,
+                        subtitle = "Tap to locate audio file",
+                        icon = "folder",
+                        trailingIcon = "chevron-right",
+                    ) {
+                        pickers.locate(track.id)
+                    }
                 }
             }
         }
@@ -790,6 +797,12 @@ private fun SyncSettings(g: Graph, pickers: Pickers) {
                 }
             }
         }
+        val tracks by g.library.tracks.collectAsStateWithLifecycle()
+        val members by g.library.members.collectAsStateWithLifecycle()
+        val collections by g.library.collections.collectAsStateWithLifecycle()
+        val trackById = remember(tracks) { tracks.associateBy { it.id } }
+        val memberById = remember(members) { members.associateBy { it.id } }
+        val collectionById = remember(collections) { collections.associateBy { it.id } }
         val first = visibleConflictPage * 20
         val end = minOf(first + 20, conflicts.size)
         Column(Modifier.fillMaxWidth().bringIntoViewRequester(conflictAnchor)) {
@@ -800,7 +813,15 @@ private fun SyncSettings(g: Graph, pickers: Pickers) {
             }
         }
         for (conflict in conflicts.subList(first, end)) key(conflict.id) {
-            ConflictView(g, conflict, songGroups[conflict.peer].orEmpty())
+            ConflictView(
+                g,
+                conflict,
+                songGroups[conflict.peer].orEmpty(),
+                syncBusy = sync.busy,
+                trackById = trackById,
+                memberById = memberById,
+                collectionById = collectionById,
+            )
         }
         if (lastConflictPage > 0) Row {
             Action("Previous", enabled = visibleConflictPage > 0) { turnConflictPage(visibleConflictPage - 1) }
@@ -862,11 +883,21 @@ private fun SyncScopeDialog(g: Graph, peer: Peer, pickers: Pickers, onDismiss: (
             Hint("Library information and edits sync both ways. Audio is copied for the selection below.")
         }
         if (!all) {
+            val filteredCollections =
+                remember(collections, query) {
+                    if (query.isBlank()) collections else collections.filter { it.name.contains(query, true) }
+                }
+            val filteredTracks =
+                remember(tracks, query) {
+                    if (query.isBlank()) tracks
+                    else tracks.filter { it.title.contains(query, true) || it.artist.contains(query, true) }
+                }
             SearchBarField(query, { query = it }, "Find songs or playlists")
             LazyColumn(Modifier.heightIn(max = 320.dp)) {
                 items(
-                    collections.filter { query.isBlank() || it.name.contains(query, true) },
+                    filteredCollections,
                     key = { "collection:" + it.id },
+                    contentType = { "collection" },
                 ) { c ->
                     val key = "collection:" + c.id
                     Choice(c.name, key in selected) {
@@ -874,12 +905,9 @@ private fun SyncScopeDialog(g: Graph, peer: Peer, pickers: Pickers, onDismiss: (
                     }
                 }
                 items(
-                    tracks.filter {
-                        query.isBlank() ||
-                            it.title.contains(query, true) ||
-                            it.artist.contains(query, true)
-                    },
+                    filteredTracks,
                     key = { "track:" + it.id },
+                    contentType = { "track" },
                 ) { t ->
                     val key = "track:" + t.id
                     Choice(t.title + " · " + t.artist, key in selected) {
@@ -916,16 +944,38 @@ fun SyncReviewPrompt(g: Graph) {
         icon = "rotate-ccw",
         actions = { ModalTonalButton("Review later") { deferred.add(conflict.id) } },
     ) {
+        val tracks by g.library.tracks.collectAsStateWithLifecycle()
+        val members by g.library.members.collectAsStateWithLifecycle()
+        val collections by g.library.collections.collectAsStateWithLifecycle()
+        val trackById = remember(tracks) { tracks.associateBy { it.id } }
+        val memberById = remember(members) { members.associateBy { it.id } }
+        val collectionById = remember(collections) { collections.associateBy { it.id } }
         Column(Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Hint("This choice is shared with the connected desktop. Review later keeps the song unchanged until you choose in Settings → Phone sync.")
-            ConflictView(g, conflict, songGroups[conflict.peer].orEmpty())
+            ConflictView(
+                g,
+                conflict,
+                songGroups[conflict.peer].orEmpty(),
+                syncBusy = sync.busy,
+                trackById = trackById,
+                memberById = memberById,
+                collectionById = collectionById,
+            )
         }
     }
 }
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun ConflictView(g: Graph, conflict: SyncConflict, sameDesktopSongs: List<SyncConflict>) {
+private fun ConflictView(
+    g: Graph,
+    conflict: SyncConflict,
+    sameDesktopSongs: List<SyncConflict>,
+    syncBusy: Boolean,
+    trackById: Map<String, Track>,
+    memberById: Map<String, Member>,
+    collectionById: Map<String, dev.sillyplayer.data.Collection>,
+) {
     var bulk by remember(conflict.id, conflict.revision) { mutableStateOf<List<SyncConflict>?>(null) }
     var applying by remember(conflict.id, conflict.revision) { mutableStateOf(false) }
     fun choose(usePhone: Boolean) {
@@ -944,26 +994,31 @@ private fun ConflictView(g: Graph, conflict: SyncConflict, sameDesktopSongs: Lis
             }
         }
     }
-    val sync by g.sync.state.collectAsStateWithLifecycle()
-    val tracks by g.library.tracks.collectAsStateWithLifecycle()
-    val members by g.library.members.collectAsStateWithLifecycle()
-    val collections by g.library.collections.collectAsStateWithLifecycle()
+    // memoize conflict json parsing so sync progress updates dont reparse json on the main thread
+    val parsed =
+        remember(conflict.id, conflict.revision, conflict.local, conflict.remote, conflict.fields) {
+            val desktop = runCatching { conflict.local?.let { JsonCodec.parseToJsonElement(it) } }.getOrNull()
+            val phone = runCatching { conflict.remote?.let { JsonCodec.parseToJsonElement(it) } }.getOrNull()
+            val fields =
+                runCatching {
+                        JsonCodec.parseToJsonElement(conflict.fields).jsonArray.map { it.jsonPrimitive.content }
+                    }
+                    .getOrDefault(emptyList())
+            val fallbackTitle =
+                runCatching {
+                        (phone ?: desktop)?.jsonObject?.get("title")?.jsonPrimitive?.content
+                    }
+                    .getOrNull()
+            Triple(desktop, phone, fields to fallbackTitle)
+        }
+    val desktop = parsed.first
+    val phone = parsed.second
+    val fields = parsed.third.first
     val title =
-        tracks.firstOrNull { it.id == conflict.key }?.title
-            ?: collections.firstOrNull { it.id == conflict.key }?.name
-            ?: runCatching { JsonCodec.parseToJsonElement(conflict.remote ?: conflict.local ?: "null").jsonObject["title"]?.jsonPrimitive?.content }.getOrNull()
+        trackById[conflict.key]?.title
+            ?: collectionById[conflict.key]?.name
+            ?: parsed.third.second
             ?: "Library change"
-    val desktop =
-        runCatching { conflict.local?.let { JsonCodec.parseToJsonElement(it) } }.getOrNull()
-    val phone =
-        runCatching { conflict.remote?.let { JsonCodec.parseToJsonElement(it) } }.getOrNull()
-    val fields =
-        runCatching {
-                JsonCodec.parseToJsonElement(conflict.fields).jsonArray.map {
-                    it.jsonPrimitive.content
-                }
-            }
-            .getOrDefault(emptyList())
     Column(Modifier.fillMaxWidth().padding(vertical = 10.dp)) {
         Text("Review: $title", fontSize = 15.sp)
         for (field in fields) {
@@ -980,14 +1035,8 @@ private fun ConflictView(g: Graph, conflict: SyncConflict, sameDesktopSongs: Lis
                 if (value == null || value == JsonNull) return "Removed"
                 if (field == "entries")
                     return value.jsonObject[field]?.jsonArray?.joinToString(" → ") { id ->
-                        tracks
-                            .firstOrNull {
-                                it.id ==
-                                    members
-                                        .firstOrNull { m -> m.id == id.jsonPrimitive.content }
-                                        ?.track
-                            }
-                            ?.title ?: "Removed song"
+                        memberById[id.jsonPrimitive.content]?.track?.let { trackById[it]?.title }
+                            ?: "Removed song"
                     } ?: "Unchanged"
                 if (field in listOf("audioHash", "artHash")) return "Changed"
                 return value.jsonObject[field]?.toString()?.trim('"') ?: "Unchanged"
@@ -1040,11 +1089,25 @@ private fun ConflictView(g: Graph, conflict: SyncConflict, sameDesktopSongs: Lis
         }
         FlowRow {
             val count = bulk?.size?.let { " ($it songs)" }.orEmpty()
-            Action("Keep desktop$count", enabled = !sync.busy && !applying) { choose(false) }
-            Action("Keep phone$count", enabled = !sync.busy && !applying) { choose(true) }
+            Action("Keep desktop$count", enabled = !syncBusy && !applying) { choose(false) }
+            Action("Keep phone$count", enabled = !syncBusy && !applying) { choose(true) }
         }
     }
 }
+
+private data class ArtistPlayGroup(
+    val key: String,
+    val name: String,
+    val tracks: List<Track>,
+    val totalPlays: Long,
+    val cover: String,
+)
+
+private data class StatisticsSnapshot(
+    val counts: Map<String, Long> = emptyMap(),
+    val ordered: List<Track> = emptyList(),
+    val artistGroups: List<ArtistPlayGroup> = emptyList(),
+)
 
 @Composable
 fun StatisticsScreen(g: Graph, onPlay: (Track, List<Track>) -> Unit) {
@@ -1059,58 +1122,83 @@ fun StatisticsScreen(g: Graph, onPlay: (Track, List<Track>) -> Unit) {
     val minutes = milliseconds / 60000
     val compact =
         if (minutes >= 1440) "${minutes/1440}d${minutes/60%24}h" else "${minutes/60}h${minutes%60}m"
-    val insights =
-        remember(period, plays, counters, tracks) {
-            computeListeningInsights(period, plays, counters, tracks)
-        }
-    val counts =
-        remember(counters, plays, period) {
-            if (period == "all")
-                counters.groupBy { it.track }.mapValues { it.value.sumOf { c -> c.plays } }
-            else {
-                val cal = java.util.Calendar.getInstance().apply {
-                    set(java.util.Calendar.HOUR_OF_DAY, 0)
-                    set(java.util.Calendar.MINUTE, 0)
-                    set(java.util.Calendar.SECOND, 0)
-                    set(java.util.Calendar.MILLISECOND, 0)
+    // compute insights off the main thread and only when the section is expanded
+    val insightsState by
+        produceState<ListeningInsights?>(null, insightsOpen, period, plays, counters, tracks) {
+            if (!insightsOpen) return@produceState
+            value =
+                withContext(kotlinx.coroutines.Dispatchers.Default) {
+                    computeListeningInsights(period, plays, counters, tracks)
                 }
-                // use calendar days instead of raw 86400s math so DST switches match insights buckets
-                val cutoff =
-                    when (period) {
-                        "day" -> cal.timeInMillis
-                        "week" -> (cal.clone() as java.util.Calendar).apply { add(java.util.Calendar.DAY_OF_YEAR, -6) }.timeInMillis
-                        else -> (cal.clone() as java.util.Calendar).apply { add(java.util.Calendar.DAY_OF_YEAR, -29) }.timeInMillis
+        }
+    val stats by
+        produceState(StatisticsSnapshot(), tracks, counters, plays, period) {
+            value =
+                withContext(kotlinx.coroutines.Dispatchers.Default) {
+                    val counts =
+                        if (period == "all")
+                            counters.groupBy { it.track }.mapValues { it.value.sumOf { c -> c.plays } }
+                        else {
+                            val cal = java.util.Calendar.getInstance().apply {
+                                set(java.util.Calendar.HOUR_OF_DAY, 0)
+                                set(java.util.Calendar.MINUTE, 0)
+                                set(java.util.Calendar.SECOND, 0)
+                                set(java.util.Calendar.MILLISECOND, 0)
+                            }
+                            // use calendar days instead of raw 86400s math so DST switches match insights buckets
+                            val cutoff =
+                                when (period) {
+                                    "day" -> cal.timeInMillis
+                                    "week" -> {
+                                        cal.add(java.util.Calendar.DAY_OF_YEAR, -6)
+                                        cal.timeInMillis
+                                    }
+                                    else -> {
+                                        cal.add(java.util.Calendar.DAY_OF_YEAR, -29)
+                                        cal.timeInMillis
+                                    }
+                                }
+                            plays
+                                .filter { it.playedAt >= cutoff }
+                                .groupingBy { it.track }
+                                .eachCount()
+                                .mapValues { it.value.toLong() }
+                        }
+                    val ordered =
+                        tracks.filter { (counts[it.id] ?: 0L) > 0L }.sortedByDescending { counts[it.id] ?: 0L }
+                    val buckets = LinkedHashMap<String, Pair<String, MutableList<Track>>>()
+                    for (track in ordered) {
+                        for (artistName in splitArtists(track.artist)) {
+                            val key = artistName.lowercase(Locale.ROOT)
+                            val entry = buckets.getOrPut(key) { artistName to mutableListOf() }
+                            entry.second += track
+                        }
                     }
-                plays
-                    .filter { it.playedAt >= cutoff }
-                    .groupingBy { it.track }
-                    .eachCount()
-                    .mapValues { it.value.toLong() }
-            }
-        }
-    val ordered =
-        remember(tracks, counts) {
-            tracks.filter { (counts[it.id] ?: 0) > 0 }.sortedByDescending { counts[it.id] ?: 0 }
-        }
-    val artistGroups =
-        remember(ordered, counts) {
-            val buckets = LinkedHashMap<String, Pair<String, MutableList<Track>>>()
-            for (track in ordered) {
-                for (artistName in splitArtists(track.artist)) {
-                    val key = artistName.lowercase(Locale.ROOT)
-                    val entry = buckets.getOrPut(key) { artistName to mutableListOf() }
-                    entry.second += track
+                    val artistGroups =
+                        buckets.entries
+                            .map { (key, entry) ->
+                                val list = entry.second.toList()
+                                ArtistPlayGroup(
+                                    key = key,
+                                    name = entry.first,
+                                    tracks = list,
+                                    totalPlays = list.sumOf { counts[it.id] ?: 0L },
+                                    cover = list.firstOrNull { it.art.isNotBlank() }?.art ?: "",
+                                )
+                            }
+                            .sortedByDescending { it.totalPlays }
+                    StatisticsSnapshot(counts, ordered, artistGroups)
                 }
-            }
-            buckets.entries
-                .map { (key, entry) -> Triple(key, entry.first, entry.second.toList()) }
-                .sortedByDescending { (_, _, group) -> group.sumOf { counts[it.id] ?: 0 } }
         }
+    val counts = stats.counts
+    val ordered = stats.ordered
+    val artistGroups = stats.artistGroups
+    val insights = insightsState
     LazyColumn(
         Modifier.fillMaxSize().padding(horizontal = 16.dp),
         contentPadding = PaddingValues(bottom = 16.dp),
     ) {
-        item {
+        item(contentType = "header") {
             Section("Me!")
             Text(
                 compact + " listened",
@@ -1143,7 +1231,7 @@ fun StatisticsScreen(g: Graph, onPlay: (Track, List<Track>) -> Unit) {
                     insightsOpen = !insightsOpen
                 }
             }
-            if (insightsOpen) {
+            if (insightsOpen && insights != null) {
             Spacer(Modifier.height(8.dp))
             Row(
                 Modifier.fillMaxWidth(),
@@ -1269,22 +1357,22 @@ fun StatisticsScreen(g: Graph, onPlay: (Track, List<Track>) -> Unit) {
             Spacer(Modifier.height(12.dp))
         }
         if (artists) {
-            items(artistGroups, key = { it.first }) { (_, artistName, group) ->
-                val count = group.sumOf { counts[it.id] ?: 0 }
+            items(artistGroups, key = { it.key }, contentType = { "artist" }) { group ->
+                val count = group.totalPlays
                 Row(
                     Modifier.fillMaxWidth()
-                        .clickable { onPlay(group.first(), group) }
+                        .clickable { onPlay(group.tracks.first(), group.tracks) }
                         .padding(vertical = 12.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Artwork(group.firstOrNull { it.art.isNotBlank() }?.art ?: "")
+                    Artwork(group.cover)
                     Spacer(Modifier.width(12.dp))
-                    Text(artistName, Modifier.weight(1f))
+                    Text(group.name, Modifier.weight(1f))
                     Hint(if (count == 1L) "1 play" else "$count plays")
                 }
             }
         } else {
-            items(ordered, key = { it.id }) { track ->
+            items(ordered, key = { it.id }, contentType = { "track" }) { track ->
                 val count = counts[track.id] ?: 0L
                 Row(
                     Modifier.fillMaxWidth()
@@ -1308,7 +1396,7 @@ fun StatisticsScreen(g: Graph, onPlay: (Track, List<Track>) -> Unit) {
             }
         }
         if (ordered.isEmpty())
-            item { Hint("Play counts and listening time appear as you listen.") }
+            item(contentType = "empty") { Hint("Play counts and listening time appear as you listen.") }
     }
     if (exact)
         AppModalDialog(

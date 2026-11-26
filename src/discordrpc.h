@@ -59,6 +59,8 @@ private:
   QNetworkAccessManager net;
   QPointer<QNetworkReply> activeReply;
   QTimer reconnectTimer;
+  QTimer connectTimeout;
+  QStringList pendingPipes;
   QByteArray readBuffer;
   bool m_enabled = false;
   bool m_lookupCovers = true;
@@ -78,6 +80,7 @@ private:
   quint64 lookupGen = 0;
 
   void tryConnect();
+  void connectNextPipe();
   void disconnectSocket();
   void sendHandshake();
   void sendCurrentActivity();

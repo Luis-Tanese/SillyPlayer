@@ -96,6 +96,7 @@ fun AppScreen(g: Graph, pickers: Pickers) {
     val trackById = remember(tracks) { tracks.associateBy { it.id } }
     val current = trackById[playback.music?.id] ?: playback.music
     SillyTheme(prefs) {
+        CompositionLocalProvider(LocalCropArtwork provides prefs.cropArtwork) {
         Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
             BoxWithConstraints(Modifier.fillMaxSize()) {
                 val wide = maxWidth >= 840.dp
@@ -303,6 +304,7 @@ fun AppScreen(g: Graph, pickers: Pickers) {
                     }
                 }
             }
+        }
         }
     }
 }

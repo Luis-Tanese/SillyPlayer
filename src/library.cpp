@@ -192,13 +192,16 @@ static QVariantMap readTrack(const QString &path, const QString &cache) {
     }
   }
   if (!cover.isEmpty()) {
-    auto img = QImage::fromData(cover);
-    if (!img.isNull()) {
-      QString out =
-          cache + "/" +
-          QCryptographicHash::hash(cover, QCryptographicHash::Sha256).toHex() +
-          ".jpg";
-      if (QFile::exists(out) ||
+    // hash embedded artwork first so already-cached album covers skip full image decompression
+    const QString out =
+        cache + "/" +
+        QCryptographicHash::hash(cover, QCryptographicHash::Sha256).toHex() +
+        ".jpg";
+    if (QFile::exists(out)) {
+      m["art"] = QUrl::fromLocalFile(out).toString();
+    } else {
+      auto img = QImage::fromData(cover);
+      if (!img.isNull() &&
           img.scaled(640, 640, Qt::KeepAspectRatio, Qt::SmoothTransformation)
               .save(out, "JPG", 85))
         m["art"] = QUrl::fromLocalFile(out).toString();
@@ -209,7 +212,7 @@ static QVariantMap readTrack(const QString &path, const QString &cache) {
 Library::Library(Store *store, const QString &dir, QObject *parent)
     : QObject(parent), s(store), cache(dir) {
   connect(this,&Library::changed,this,[this]{
-    tracksValid=foldersValid=false;cachedLikedCount=-1;trackPositions.clear();emit likesChanged();
+    tracksValid=foldersValid=false;cachedLikedCount=-1;cachedTrackCount=-1;trackPositions.clear();emit likesChanged();
   });
   QDir().mkpath(cache);
   // older managed-file reconciliation could clear deleted while leaving the durable sync tombstone
@@ -230,6 +233,11 @@ Library::Library(Store *store, const QString &dir, QObject *parent)
     if(!scan.future().isValid()) return;
     auto result = scan.result();
     scan.setFuture({}); // release the completed snapshot and retain a finished empty future for shutdown
+    if (result.isEmpty() || result.value("_cancelled").toBool()) {
+      m_busy = false;
+      return;
+    }
+    const quint64 beforeWriteSerial = s->writeSerial();
     if(!s->db().transaction()) {
       m_busy=false; m_status="Scan not saved: cannot begin database transaction";
       emit error(m_status); emit statusChanged(); return;
@@ -243,35 +251,70 @@ Library::Library(Store *store, const QString &dir, QObject *parent)
       auto r = rv.toMap();
       QString id = r["id"].toString();
       bool rootOk = r["ok"].toBool();
-      sql("UPDATE roots SET available=? WHERE id=?", {rootOk, id});
-      if(rootOk && !r["device"].toString().isEmpty()) sql("UPDATE roots SET device=? WHERE id=?",{r["device"],id});
+      sql("UPDATE roots SET available=? WHERE id=? AND available<>?", {rootOk, id, rootOk});
+      if(rootOk && !r["device"].toString().isEmpty())
+        sql("UPDATE roots SET device=? WHERE id=? AND COALESCE(device,'')<>?",{r["device"],id,r["device"]});
       if (!rootOk) {
-        sql("UPDATE tracks SET available=0 WHERE managed=0 AND id IN "
+        sql("UPDATE tracks SET available=0 WHERE managed=0 AND available<>0 AND id IN "
                 "(SELECT track FROM track_roots WHERE root=?)",
                 {id});
         continue;
       }
-      // keep provenance for absent files so diagnostics can verify their storage
-      sql("UPDATE tracks SET available=0 WHERE id IN (SELECT track FROM track_roots WHERE root=?)", {id});
-      for (auto tv : r["tracks"].toList())
-        ok=applyTrack(tv.toMap(), id) && ok;
+      // diff against current root rows instead of blanket-flipping available=0 and rewriting every unchanged track
+      QHash<QString, QVariantMap> rootRowsById;
+      for (const auto &er : s->rows("SELECT t.id,t.path,t.available,t.deleted,t.mergedInto FROM track_roots tr JOIN tracks t ON t.id=tr.track WHERE tr.root=?", {id})) {
+        const auto m = er.toMap();
+        rootRowsById.insert(m["id"].toString(), m);
+      }
+      QSet<QString> seenTrackIds, seenPaths;
+      for (auto tv : r["tracks"].toList()) {
+        const auto tmap = tv.toMap();
+        const QString tpath = tmap["path"].toString();
+        seenPaths.insert(tpath);
+        if (tmap.value("_reused").toBool()) {
+          const QString tid = tmap["id"].toString();
+          if (!tid.isEmpty()) {
+            seenTrackIds.insert(tid);
+            const auto it = rootRowsById.constFind(tid);
+            if (it == rootRowsById.cend())
+              sql("INSERT OR IGNORE INTO track_roots VALUES(?,?)", {tid, id});
+            if (!tmap["available"].toBool() && !tmap["deleted"].toBool() && tmap["mergedInto"].toString().isEmpty())
+              sql("UPDATE tracks SET available=1 WHERE id=? AND available<>1", {tid});
+            continue;
+          }
+        }
+        ok = applyTrack(tmap, id) && ok;
+      }
+      for (auto it = rootRowsById.cbegin(); it != rootRowsById.cend(); ++it) {
+        const auto row = it.value();
+        if (!row["available"].toBool()) continue;
+        if (seenTrackIds.contains(it.key()) || seenPaths.contains(row["path"].toString())) continue;
+        // verify whether the track was renamed/updated in place during this scan before marking unavailable
+        const auto cur = s->rows("SELECT path FROM tracks WHERE id=?", {it.key()}).value(0).toMap();
+        if (!cur.isEmpty() && seenPaths.contains(cur["path"].toString())) continue;
+        sql("UPDATE tracks SET available=0 WHERE id=? AND available<>0", {it.key()});
+      }
       for (auto bad : r["failed"].toList()) {
         sql("INSERT OR IGNORE INTO track_roots SELECT id,? FROM tracks "
                 "WHERE path=?",
                 {id, bad});
-        sql("UPDATE tracks SET available=0 WHERE path=?", {bad});
+        sql("UPDATE tracks SET available=0 WHERE path=? AND available<>0", {bad});
       }
     }
     for (auto v : result["managed"].toList()) {
       auto m = v.toMap();
-      if (m["data"].toMap().isEmpty()) {
+      const auto data = m["data"].toMap();
+      if (data.isEmpty()) {
         if(track(m["id"].toString())["path"]!=m["path"]) continue;
-        sql("UPDATE tracks SET available=0 WHERE id=? AND deleted=0 AND mergedInto=''",
+        sql("UPDATE tracks SET available=0 WHERE id=? AND deleted=0 AND mergedInto='' AND available<>0",
                 {m["id"]});
+      } else if (data.value("_reused").toBool()) {
+        if (!data["available"].toBool() && !data["deleted"].toBool() && data["mergedInto"].toString().isEmpty())
+          sql("UPDATE tracks SET available=1 WHERE id=? AND available<>1", {data["id"]});
       } else
-        ok=applyTrack(m["data"].toMap(), {}, true) && ok;
+        ok=applyTrack(data, {}, true) && ok;
     }
-    sql("UPDATE tracks SET available=0 WHERE managed=0 AND id "
+    sql("UPDATE tracks SET available=0 WHERE managed=0 AND available<>0 AND id "
             "NOT IN (SELECT track FROM track_roots) AND path NOT LIKE 'sync://%'");
     if(!ok || !s->db().commit()) {
       const auto reason=s->error(); s->db().rollback();
@@ -279,32 +322,27 @@ Library::Library(Store *store, const QString &dir, QObject *parent)
       m_status="Scan not saved; previous library retained: "+reason;
       emit changed(); emit error(m_status); emit statusChanged(); return;
     }
-    QStringList dirs;
+    // watch directories only and diff against current watches instead of thrashing thousands of per-file inotify handles
+    QSet<QString> desiredDirs;
     for (auto d : result["dirs"].toList())
-      dirs << d.toString();
-    if (!watches.directories().isEmpty())
-      watches.removePaths(watches.directories());
-    if (!watches.files().isEmpty())
-      watches.removePaths(watches.files());
-    if (!dirs.isEmpty())
-      watches.addPaths(dirs);
-    QStringList files;
-    for (auto v : result["roots"].toList())
-      for (auto t : v.toMap()["tracks"].toList())
-        files << t.toMap()["path"].toString();
-    for (auto v : result["managed"].toList())
-      if (!v.toMap()["data"].toMap().isEmpty())
-        files << v.toMap()["data"].toMap()["path"].toString();
-    files.removeDuplicates();
-    if (!files.isEmpty())
-      watches.addPaths(files);
+      desiredDirs.insert(d.toString());
+    const auto currentDirsList = watches.directories();
+    const QSet<QString> currentDirs(currentDirsList.begin(), currentDirsList.end());
+    QStringList toRemove, toAdd;
+    for (const auto &d : currentDirs) if (!desiredDirs.contains(d)) toRemove << d;
+    for (const auto &d : desiredDirs) if (!currentDirs.contains(d)) toAdd << d;
+    if (!toRemove.isEmpty()) watches.removePaths(toRemove);
+    if (!watches.files().isEmpty()) watches.removePaths(watches.files());
+    if (!toAdd.isEmpty()) watches.addPaths(toAdd);
     m_busy = false;
     m_status = QString("Library scan · %1 refreshed, %2 unchanged · %3 unique files · %4 new, %5 updated · %6 missing, %7 storage unavailable, %8 unresolved · %9 errors")
       .arg(result["read"].toInt()).arg(result["reused"].toInt()).arg(result["unique"].toInt())
       .arg(result["imported"].toInt()).arg(result["updated"].toInt()).arg(result["missing"].toInt())
       .arg(result["unavailable"].toInt()).arg(result["unresolved"].toInt()).arg(result["processingErrors"].toInt());
     if(!result["errors"].toStringList().isEmpty()) m_status+=" · "+result["errors"].toStringList().join("; ");
-    emit changed();
+    // skip emitting Library::changed on no-op periodic scans so sync, recovery, and UI dont churn every 5 min
+    if (s->writeSerial() != beforeWriteSerial)
+      emit changed();
     emit statusChanged();
     if (pending) {
       pending = false;
@@ -315,28 +353,45 @@ Library::Library(Store *store, const QString &dir, QObject *parent)
   });
   QTimer::singleShot(0, this, [this] { startScan(false); });
 }
+void Library::requestStop() {
+  stopFlag->store(true);
+  debounce.stop();
+  periodic.stop();
+}
 Library::~Library() {
+  requestStop();
   finishTrash();
   scan.waitForFinished();
   for (auto w : edits)
     w->waitForFinished();
 }
+int Library::trackCount() const {
+  if (tracksValid && tracksSerial == s->tracksSerial()) return cachedTracks.size();
+  if (cachedTrackCount >= 0 && trackCountSerial == s->tracksSerial()) return cachedTrackCount;
+  cachedTrackCount = s->rows("SELECT COUNT(*) AS n FROM tracks WHERE deleted=0 AND mergedInto=''").value(0).toMap().value("n").toInt();
+  trackCountSerial = s->tracksSerial();
+  return cachedTrackCount;
+}
 QVariantList Library::tracks() const {
-  if(tracksValid && tracksSerial==s->writeSerial())return cachedTracks;
+  if(tracksValid && tracksSerial==s->tracksSerial())return cachedTracks;
   cachedTracks=s->rows(
       "SELECT t.*, EXISTS(SELECT 1 FROM likes WHERE track=t.id) AS liked FROM "
       "tracks t WHERE deleted=0 AND mergedInto='' ORDER BY added DESC,title COLLATE NOCASE");
   trackPositions.clear();trackPositions.reserve(cachedTracks.size());
   for(int i=0;i<cachedTracks.size();++i)trackPositions.insert(cachedTracks[i].toMap().value("id").toString(),i);
-  tracksValid=true;tracksSerial=s->writeSerial();tracksCatalogueSerial=s->catalogueSerial();return cachedTracks;
+  tracksValid=true;tracksSerial=s->tracksSerial();tracksCatalogueSerial=s->catalogueSerial();return cachedTracks;
 }
 QVariantList Library::folders() const {
-  if(!foldersValid || foldersSerial!=s->writeSerial()){cachedFolders=s->rows("SELECT * FROM roots ORDER BY path");foldersValid=true;foldersSerial=s->writeSerial();}
+  if(!foldersValid || foldersSerial!=s->rootsSerial()){cachedFolders=s->rows("SELECT * FROM roots ORDER BY path");foldersValid=true;foldersSerial=s->rootsSerial();}
   return cachedFolders;
 }
 int Library::likedCount() const {
   if(cachedLikedCount<0)cachedLikedCount=s->rows("SELECT COUNT(*) AS n FROM likes l JOIN tracks t ON t.id=l.track WHERE t.deleted=0").value(0).toMap().value("n").toInt();
   return cachedLikedCount;
+}
+QString Library::likedCover() const {
+  return s->rows("SELECT t.art FROM likes l JOIN tracks t ON t.id=l.track WHERE t.deleted=0 AND t.art<>'' ORDER BY l.rowid DESC LIMIT 1")
+      .value(0).toMap().value("art").toString();
 }
 void Library::patchTracks(const QVariantMap &patches) {
   // a field patch cannot reconcile intervening metadata or membership writes
@@ -350,7 +405,7 @@ void Library::patchTracks(const QVariantMap &patches) {
       cachedTracks[*at]=row;
     }
   }
-  tracksSerial=s->writeSerial();
+  tracksSerial=s->tracksSerial();
   if(likes){cachedLikedCount=-1;emit likesChanged();}
   emit tracksUpdated(patches);
 }
@@ -407,7 +462,9 @@ void Library::startScan(bool force) {
   for(const auto &v:s->rows("SELECT path,art FROM tracks UNION ALL SELECT '',art FROM collections")) {
     const auto row=v.toMap();restoreReferences.insert(row["path"].toString());restoreReferences.insert(filePath(row["art"].toString()));
   }
-  scan.setFuture(QtConcurrent::run([roots, cacheDir, managed, indexed, force,restoreDirectory,restoreReferences] {
+  const auto stop = stopFlag;
+  scan.setFuture(QtConcurrent::run([roots, cacheDir, managed, indexed, force,restoreDirectory,restoreReferences,stop] {
+    if (stop->load()) return QVariantMap{{"_cancelled", true}};
     // a killed restore can leave published files before its SQL transaction
     // only remove recorded destinations inside this restore directory, and preserve every path already referenced by a committed library row
     const QDir restore(restoreDirectory);
@@ -450,8 +507,10 @@ void Library::startScan(bool force) {
           (art.isEmpty() || QFileInfo::exists(filePath(art)))) {
         ++reused;
         observedIdentities.insert(old["identity"].toString());
-        processed.insert(key,old);
-        return old;
+        auto reusedTrack = old;
+        reusedTrack["_reused"] = true;
+        processed.insert(key, reusedTrack);
+        return reusedTrack;
       }
       auto data=readTrack(path, cacheDir);
       if(!data.isEmpty()) { ++read; observedIdentities.insert(data["identity"].toString()); if(old.isEmpty() && !(knownIdentities.contains(data["identity"].toString()) && !QFileInfo::exists(knownIdentities.value(data["identity"].toString())))) ++imported; }
@@ -462,6 +521,7 @@ void Library::startScan(bool force) {
     QVariantList output, dirs, managedOutput;
     QStringList errors;
     for (auto rv : roots) {
+      if (stop->load()) return QVariantMap{{"_cancelled", true}};
       auto r = rv.toMap();
       QString root = r["path"].toString();
       QStorageInfo storage(root);
@@ -472,6 +532,7 @@ void Library::startScan(bool force) {
         QDirIterator it(root, QDir::Files | QDir::Dirs | QDir::NoDotAndDotDot,
                         QDirIterator::Subdirectories);
         while (it.hasNext()) {
+          if (stop->load()) return QVariantMap{{"_cancelled", true}};
           QString p = it.next();
           if(p.contains("/.sillyplayer-restore-"))continue;
           auto fi = it.fileInfo();
@@ -503,6 +564,7 @@ void Library::startScan(bool force) {
           {"id", r["id"]}, {"ok", ok}, {"device",ok?storageIdentity(root):QString()}, {"tracks", tracks}, {"failed", failed}};
     }
     for (auto v : managed) {
+      if (stop->load()) return QVariantMap{{"_cancelled", true}};
       auto m = v.toMap();
       QString path = m["path"].toString();
       auto data = readOrReuse(path);

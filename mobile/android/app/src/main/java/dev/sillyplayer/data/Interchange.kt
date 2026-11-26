@@ -235,15 +235,15 @@ fun computeListeningInsights(
     }
     val topArtist = artistTotals.values.maxByOrNull { it.second }
 
+    // reuse one calendar across the loop instead of allocating thousands of GregorianCalendars
+    val workCal = java.util.Calendar.getInstance(timeZone)
     fun dayKey(ms: Long): Long {
-        val c = java.util.Calendar.getInstance(timeZone).apply {
-            timeInMillis = ms
-            set(java.util.Calendar.HOUR_OF_DAY, 0)
-            set(java.util.Calendar.MINUTE, 0)
-            set(java.util.Calendar.SECOND, 0)
-            set(java.util.Calendar.MILLISECOND, 0)
-        }
-        return c.timeInMillis
+        workCal.timeInMillis = ms
+        workCal.set(java.util.Calendar.HOUR_OF_DAY, 0)
+        workCal.set(java.util.Calendar.MINUTE, 0)
+        workCal.set(java.util.Calendar.SECOND, 0)
+        workCal.set(java.util.Calendar.MILLISECOND, 0)
+        return workCal.timeInMillis
     }
 
     val allPlayDays = HashSet<Long>()
@@ -254,15 +254,21 @@ fun computeListeningInsights(
 
     for (p in plays) {
         if (p.track !in trackMap) continue
-        val dk = dayKey(p.playedAt)
+        workCal.timeInMillis = p.playedAt
+        val inPeriod = p.playedAt >= cutoff
+        val hour = if (inPeriod) workCal.get(java.util.Calendar.HOUR_OF_DAY) else 0
+        val rawDow = if (inPeriod) workCal.get(java.util.Calendar.DAY_OF_WEEK) else 0
+        workCal.set(java.util.Calendar.HOUR_OF_DAY, 0)
+        workCal.set(java.util.Calendar.MINUTE, 0)
+        workCal.set(java.util.Calendar.SECOND, 0)
+        workCal.set(java.util.Calendar.MILLISECOND, 0)
+        val dk = workCal.timeInMillis
         allPlayDays += dk
-        if (p.playedAt >= cutoff) {
+        if (inPeriod) {
             periodActiveDays += dk
             dailyCounts[dk] = (dailyCounts[dk] ?: 0) + 1
-            val c = java.util.Calendar.getInstance(timeZone).apply { timeInMillis = p.playedAt }
-            val hour = c.get(java.util.Calendar.HOUR_OF_DAY)
             timeBlocks[(hour / 4).coerceIn(0, 5)]++
-            val dow = when (c.get(java.util.Calendar.DAY_OF_WEEK)) {
+            val dow = when (rawDow) {
                 java.util.Calendar.MONDAY -> 0
                 java.util.Calendar.TUESDAY -> 1
                 java.util.Calendar.WEDNESDAY -> 2
@@ -276,13 +282,13 @@ fun computeListeningInsights(
     }
 
     var streakDays = 0
-    val streakCal = java.util.Calendar.getInstance(timeZone).apply { timeInMillis = todayStart }
-    if (streakCal.timeInMillis !in allPlayDays) {
-        streakCal.add(java.util.Calendar.DAY_OF_YEAR, -1)
+    workCal.timeInMillis = todayStart
+    if (workCal.timeInMillis !in allPlayDays) {
+        workCal.add(java.util.Calendar.DAY_OF_YEAR, -1)
     }
-    while (streakCal.timeInMillis in allPlayDays) {
+    while (workCal.timeInMillis in allPlayDays) {
         streakDays++
-        streakCal.add(java.util.Calendar.DAY_OF_YEAR, -1)
+        workCal.add(java.util.Calendar.DAY_OF_YEAR, -1)
     }
 
     val blockLabels = listOf("12a", "4a", "8a", "12p", "4p", "8p")
@@ -306,11 +312,9 @@ fun computeListeningInsights(
             "day" -> blockLabels.mapIndexed { idx, lbl -> ListeningBucket(lbl, timeBlocks[idx]) }
             "week" -> {
                 (6 downTo 0).map { offset ->
-                    val dCal = java.util.Calendar.getInstance(timeZone).apply {
-                        timeInMillis = todayStart
-                        add(java.util.Calendar.DAY_OF_YEAR, -offset)
-                    }
-                    val dow = when (dCal.get(java.util.Calendar.DAY_OF_WEEK)) {
+                    workCal.timeInMillis = todayStart
+                    workCal.add(java.util.Calendar.DAY_OF_YEAR, -offset)
+                    val dow = when (workCal.get(java.util.Calendar.DAY_OF_WEEK)) {
                         java.util.Calendar.MONDAY -> 0
                         java.util.Calendar.TUESDAY -> 1
                         java.util.Calendar.WEDNESDAY -> 2
@@ -320,7 +324,7 @@ fun computeListeningInsights(
                         else -> 6
                     }
                     val label = if (offset == 0) "Today" else weekShort[dow]
-                    ListeningBucket(label, dailyCounts[dCal.timeInMillis] ?: 0)
+                    ListeningBucket(label, dailyCounts[workCal.timeInMillis] ?: 0)
                 }
             }
             "month" -> {
@@ -328,13 +332,11 @@ fun computeListeningInsights(
                     this.timeZone = timeZone
                 }
                 (29 downTo 0).map { offset ->
-                    val dCal = java.util.Calendar.getInstance(timeZone).apply {
-                        timeInMillis = todayStart
-                        add(java.util.Calendar.DAY_OF_YEAR, -offset)
-                    }
+                    workCal.timeInMillis = todayStart
+                    workCal.add(java.util.Calendar.DAY_OF_YEAR, -offset)
                     val label =
-                        if (offset == 29 || offset == 15 || offset == 0) fmt.format(dCal.time) else ""
-                    ListeningBucket(label, dailyCounts[dCal.timeInMillis] ?: 0)
+                        if (offset == 29 || offset == 15 || offset == 0) fmt.format(workCal.time) else ""
+                    ListeningBucket(label, dailyCounts[workCal.timeInMillis] ?: 0)
                 }
             }
             else -> weekShort.mapIndexed { idx, lbl -> ListeningBucket(lbl, weekdayCounts[idx]) }

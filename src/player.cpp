@@ -3,6 +3,7 @@
 #include <QRegularExpression>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <stdexcept>
 
 Player::Player(bool video, QObject *parent) : QObject(parent) {
@@ -45,10 +46,10 @@ Player::Player(bool video, QObject *parent) : QObject(parent) {
   speedTimer.setInterval(64);
   connect(&speedTimer, &QTimer::timeout, this, &Player::flushSpeed);
   writeVolume();
-  // mpv wakes the Qt thread for events. The timer is only a seek-timeout fallback
+  // mpv wakes the Qt thread for events. The timer is only a seek-timeout fallback, started only while pendingSeek is active
   timer.setInterval(1000);
   connect(&timer, &QTimer::timeout, this, &Player::poll);
-  timer.start();
+  positionClock.start();
   fadeTimer.setInterval(16);
   connect(&fadeTimer, &QTimer::timeout, this, [this] {
     if (fadeClock.elapsed() >= fadeMilliseconds) { pausePlayback(); return; }
@@ -136,11 +137,14 @@ void Player::load(const QString &path, const QString &audio,
   heldPosition = paused ? resume : -1;
   resumeFloor = -1;
   pos = dur = 0;
+  lastEmittedPos = -1.0;
   canSeek = false;
   hasFile = false;
   stalled = false;
   pause = true;
+  timer.stop();
   emit changed();
+  emit positionChanged();
   command({"set", "pause", "yes"});
   // a new file must never overtake debounced speed or volume writes; flush both before loadfile so the first frames match the new track
   speedTimer.stop();
@@ -302,8 +306,10 @@ void Player::seek(double seconds) {
   const char *args[] = {"seek", target.constData(), "absolute+exact", nullptr};
   const int rc = mpv_command_async(m, ++seekSerial, args);
   if (rc < 0) err = mpv_error_string(rc);
-  else { pendingSeek = true; seekStarted = false; if (resumePaused) heldPosition = seekTarget; seekClock.restart(); }
+  else { pendingSeek = true; seekStarted = false; if (resumePaused) heldPosition = seekTarget; seekClock.restart(); timer.start(); }
+  lastEmittedPos = position();
   emit changed();
+  emit positionChanged();
 }
 void Player::setVolume(double volume) {
   if (!std::isfinite(volume)) return;
@@ -391,9 +397,11 @@ void Player::stop() {
   startAfterSpeed=false;
   ++mediaGeneration;
   pendingSeek = false;
+  timer.stop();
   command({"stop"});
   hasFile = false;
   pos = dur = resumeAt = 0;
+  lastEmittedPos = -1.0;
   heldPosition = resumeFloor = -1;
   canSeek = stalled = false;
   pause = true;
@@ -401,11 +409,13 @@ void Player::stop() {
   err.clear();
   backendError.clear();
   emit changed();
+  emit positionChanged();
 }
 void Player::poll() {
   if (!m)
     return;
   bool dirty = false;
+  bool posMoved = false;
   while (auto e = mpv_wait_event(m, 0)) {
     if (e->event_id == MPV_EVENT_NONE)
       break;
@@ -430,7 +440,7 @@ void Player::poll() {
         dirty = true;
       }
     } else if (e->event_id == MPV_EVENT_COMMAND_REPLY && e->reply_userdata == seekSerial && e->error < 0) {
-      pendingSeek = false; heldPosition = -1; err = mpv_error_string(e->error); dirty = true;
+      pendingSeek = false; timer.stop(); heldPosition = -1; err = mpv_error_string(e->error); dirty = true; posMoved = true;
     } else if (e->event_id == MPV_EVENT_SEEK) {
       if (pendingSeek) seekStarted = true;
     } else if (e->event_id == MPV_EVENT_PLAYBACK_RESTART) {
@@ -438,9 +448,11 @@ void Player::poll() {
         mpv_get_property(m, "time-pos", MPV_FORMAT_DOUBLE, &pos);
         if (std::abs(pos - seekTarget) < 0.75) {
           pendingSeek = false;
+          timer.stop();
           if (!resumePaused && pos < seekTarget) resumeFloor = seekTarget;
         }
         dirty = true;
+        posMoved = true;
       }
     } else if (e->event_id == MPV_EVENT_LOG_MESSAGE) {
       const auto message = static_cast<mpv_event_log_message *>(e->data);
@@ -450,28 +462,32 @@ void Player::poll() {
       if (!text.isEmpty()) backendError = (backendError + " " + text).trimmed().right(800);
     } else if (e->event_id == MPV_EVENT_PROPERTY_CHANGE) {
       auto p = static_cast<mpv_event_property *>(e->data);
-      if (!p->data)
+      if (!p->data || !p->name)
         continue;
-      QString n = p->name;
       if (p->format == MPV_FORMAT_DOUBLE) {
         double v = *static_cast<double *>(p->data);
-        if (n == "time-pos" && hasFile) {
+        if (std::strcmp(p->name, "time-pos") == 0 && hasFile) {
           pos = v;
           if (!pause && pos >= resumeFloor) resumeFloor = -1;
           updateTransitionFadeOut();
-        } else if (n == "duration" && hasFile)
+          posMoved = true;
+        } else if (std::strcmp(p->name, "duration") == 0 && hasFile) {
           dur = v;
-      }
-      if (p->format == MPV_FORMAT_FLAG) {
+          dirty = true;
+        }
+      } else if (p->format == MPV_FORMAT_FLAG) {
         bool v = *static_cast<int *>(p->data);
-        if (n == "pause")
+        if (std::strcmp(p->name, "pause") == 0) {
           pause = v;
-        else if (n == "seekable")
+          dirty = true;
+        } else if (std::strcmp(p->name, "seekable") == 0) {
           canSeek = v;
-        else if (n == "paused-for-cache")
+          dirty = true;
+        } else if (std::strcmp(p->name, "paused-for-cache") == 0) {
           stalled = v;
+          dirty = true;
+        }
       }
-      dirty = true;
     } else if (e->event_id == MPV_EVENT_FILE_LOADED) {
       hasFile = true;
       mpv_get_property(m, "duration", MPV_FORMAT_DOUBLE, &dur);
@@ -492,16 +508,19 @@ void Player::poll() {
       }
       emit loadedFile();
       dirty = true;
+      posMoved = true;
     } else if (e->event_id == MPV_EVENT_END_FILE) {
       resetFade();
       resetTransitionFade();
       auto end = static_cast<mpv_event_end_file *>(e->data);
       const bool hadStarted = hasFile && pos > 0.05;
       pendingSeek = false;
+      timer.stop();
       resumeFloor = -1;
       hasFile = false;
       pause = true;
       dirty = true;
+      posMoved = true;
       if (end->reason == MPV_END_FILE_REASON_ERROR) {
         err = mpv_error_string(end->error);
         if (!backendError.isEmpty()) err += ": " + backendError;
@@ -516,8 +535,17 @@ void Player::poll() {
     if (!resumePaused && pendingFadeIn) startTransitionFadeIn();
   }
   if (pendingSeek && seekClock.elapsed() > 5000) {
-    pendingSeek = false; heldPosition = -1; err = "Seek timed out"; dirty = true;
+    pendingSeek = false; timer.stop(); heldPosition = -1; err = "Seek timed out"; dirty = true; posMoved = true;
   }
   if (dirty)
     emit changed();
+  // throttle positionChanged to ~30Hz so the seekbar glides smoothly while keeping changed() quiet
+  if (posMoved) {
+    const double cur = position();
+    if (dirty || lastEmittedPos < 0.0 || std::abs(cur - lastEmittedPos) >= 0.033 || positionClock.elapsed() >= 33) {
+      lastEmittedPos = cur;
+      positionClock.restart();
+      emit positionChanged();
+    }
+  }
 }

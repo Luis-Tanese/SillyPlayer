@@ -7,7 +7,14 @@ import kotlinx.serialization.Serializable
 fun uuid(): String = UUID.randomUUID().toString()
 
 @Serializable
-@Entity(tableName = "tracks")
+@Entity(
+    tableName = "tracks",
+    indices = [
+        Index(value = ["deleted", "mergedInto", "added"], name = "index_tracks_deleted_mergedInto_added"),
+        Index(value = ["uri"], name = "index_tracks_uri"),
+        Index(value = ["hash"], name = "index_tracks_hash"),
+    ],
+)
 data class Track(
     @PrimaryKey val id: String = uuid(),
     val uri: String = "",
@@ -116,7 +123,14 @@ data class Search(
 )
 
 @Serializable
-@Entity(tableName = "plays", indices = [Index("track")])
+@Entity(
+    tableName = "plays",
+    indices = [
+        Index("track"),
+        Index(value = ["qualified", "playedAt"], name = "index_plays_qualified_playedAt"),
+        Index(value = ["qualified", "track", "playedAt"], name = "index_plays_qualified_track_playedAt"),
+    ],
+)
 data class Play(
     @PrimaryKey val session: String = uuid(),
     val track: String,
@@ -148,7 +162,14 @@ data class TrashEntry(
 )
 
 @Serializable
-@Entity(tableName = "outbox")
+@Entity(
+    tableName = "outbox",
+    indices = [
+        Index(value = ["peer", "entity", "key"], name = "index_outbox_peer_entity_key"),
+        Index(value = ["peer", "created"], name = "index_outbox_peer_created"),
+        Index(value = ["key"], name = "index_outbox_key"),
+    ],
+)
 data class Outbox(
     @PrimaryKey val opId: String = uuid(),
     val peer: String = "",
@@ -160,7 +181,11 @@ data class Outbox(
 )
 
 @Serializable
-@Entity(tableName = "replicas", primaryKeys = ["peer", "entity", "key"])
+@Entity(
+    tableName = "replicas",
+    primaryKeys = ["peer", "entity", "key"],
+    indices = [Index(value = ["key"], name = "index_replicas_key")],
+)
 data class Replica(
     val peer: String,
     val entity: String,
@@ -183,7 +208,13 @@ data class Peer(
 )
 
 @Serializable
-@Entity(tableName = "conflicts")
+@Entity(
+    tableName = "conflicts",
+    indices = [
+        Index(value = ["peer", "entity", "key"], name = "index_conflicts_peer_entity_key"),
+        Index(value = ["key"], name = "index_conflicts_key"),
+    ],
+)
 data class SyncConflict(
     @PrimaryKey val id: String,
     val entity: String,
@@ -225,6 +256,7 @@ data class Preferences(
     val developerMode: Boolean = false,
     val palette: String = "Catppuccin",
     val light: Boolean = false,
+    val cropArtwork: Boolean = true,
     val master: Float = 100f,
     val onlineVolume: Float = 100f,
     val mode: Int = 0,

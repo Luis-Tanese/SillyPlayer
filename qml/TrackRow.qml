@@ -15,10 +15,12 @@ Rectangle {
     property string sourceName: "Songs"
     height: 72
     radius: 9
-    color: selected ? Qt.alpha(Theme.accent, 0.12) : hover.hovered ? Qt.alpha(Theme.hover, 0.5) : track.id === app.current.id ? Qt.alpha(Theme.accent, 0.055) : "transparent"
+    color: selected ? Qt.alpha(Theme.accent, 0.12) : hover.hovered ? Qt.alpha(Theme.hover, 0.5) : track.id === app.currentTrackId ? Qt.alpha(Theme.accent, 0.055) : "transparent"
     function activate(modifiers, artwork) {
         if (selectionController && selectionController.rowClick(track, modifiers)) return;
-        app.playTrack(track.id, sourceTracks, sourceName, sourceId, track.memberId || "");
+        // send lightweight ids/memberIds instead of marshaling full track maps across JS->C++
+        const refs = sourceTracks.map(t => typeof t === "string" ? t : (t.memberId ? { id: t.id, memberId: t.memberId } : t.id));
+        app.playTrack(track.id, refs, sourceName, sourceId, track.memberId || "");
         if (artwork) shell.expand();
     }
     HoverHandler {
@@ -57,7 +59,7 @@ Rectangle {
             spacing: 3
             Label {
                 text: track.title || "Unknown title"
-                color: track.id === app.current.id ? Theme.accent : Theme.text
+                color: track.id === app.currentTrackId ? Theme.accent : Theme.text
                 font.pixelSize: 14
                 elide: Text.ElideRight
                 Layout.fillWidth: true

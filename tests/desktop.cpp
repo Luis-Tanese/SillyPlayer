@@ -12,6 +12,7 @@
 #include "stablemodel.h"
 #include "directtransfer.h"
 #include "youtubeplaylist.h"
+#include "roundedart.h"
 #include <QBuffer>
 #include <QDateTime>
 #include <QJsonDocument>
@@ -37,6 +38,7 @@
 #include <cstdio>
 #define CHECK(x) do { if (!(x)) { qFatal("Check failed at line %d: %s", __LINE__, #x); } } while (0)
 int main(int argc, char **argv) {
+  qputenv("SILLYPLAYER_NO_AUTO_RECOVERY", "1");
   QApplication gui(argc, argv);
   std::setlocale(LC_NUMERIC, "C");
   CHECK(splitArtists("ANGUISH, EXILED, Elfass") == (QStringList{"ANGUISH", "EXILED", "Elfass"}));
@@ -194,10 +196,20 @@ int main(int argc, char **argv) {
     CHECK(store.exec("UPDATE tracks SET managed=1 WHERE id=?",{id}));
     library.rescan();scanDone(); CHECK(library.tracks().size()==1);CHECK(library.status().contains("1 refreshed, 0 unchanged"));
     CHECK(store.exec("CREATE TRIGGER fail_scan BEFORE UPDATE ON tracks BEGIN SELECT RAISE(ABORT,'scan failure'); END"));
+    // unchanged rescan must not execute any UPDATE tracks or bump writeSerial
+    const quint64 serialBeforeNoop = store.writeSerial();
+    library.rescan();scanDone();
+    CHECK(!library.status().startsWith("Scan not saved"));
+    CHECK(store.writeSerial() == serialBeforeNoop);
+    CHECK(store.exec("DROP TRIGGER fail_scan"));
+    // when a real track change is required, a trigger abort must roll back cleanly and report Scan not saved
+    CHECK(store.exec("UPDATE tracks SET available=0 WHERE id=?",{id}));
+    CHECK(store.exec("CREATE TRIGGER fail_scan BEFORE UPDATE ON tracks BEGIN SELECT RAISE(ABORT,'scan failure'); END"));
     const auto before=store.rows("SELECT * FROM tracks");
     library.rescan();scanDone();
     CHECK(library.status().startsWith("Scan not saved")); CHECK(store.rows("SELECT * FROM tracks")==before);
     CHECK(store.exec("DROP TRIGGER fail_scan"));
+    CHECK(store.exec("UPDATE tracks SET available=1 WHERE id=?",{id}));
     CHECK(QFile::rename(nested+"/tone.wav",nested+"/renamed.wav"));
     library.rescan();scanDone(); CHECK(library.track(id)["available"].toBool());
     CHECK(library.track(id)["path"].toString()==nested+"/renamed.wav");
@@ -764,6 +776,133 @@ int main(int argc, char **argv) {
       CHECK(r2["linksRestored"].toInt() == 1);
       CHECK(store.rows("SELECT deleted,videoId FROM tracks WHERE id=?", {t1["id"]}).first().toMap()["deleted"].toInt() == 0);
       CHECK(store.rows("SELECT videoId FROM tracks WHERE id=?", {t1["id"]}).first().toMap()["videoId"].toString() == "dQw4w9WgXcQ");
+    }
+
+    // Pass 1 performance invariants: SQLite pragmas/indexes, table-scoped serials, 1-query allSettings, split Player positionChanged signal
+    {
+      CHECK(store.rows("PRAGMA synchronous").first().toMap().values().first().toInt() == 1);
+      CHECK(store.rows("PRAGMA journal_mode").first().toMap().values().first().toString().toLower() == "wal");
+      QSet<QString> indexNames;
+      for (const auto &row : store.rows("SELECT name FROM sqlite_master WHERE type='index'"))
+        indexNames.insert(row.toMap()["name"].toString());
+      for (const QString &expected : {QStringLiteral("idx_members_col_track"), QStringLiteral("idx_members_track"),
+                                      QStringLiteral("idx_track_roots_root"), QStringLiteral("idx_tracks_identity"),
+                                      QStringLiteral("idx_tracks_videoId"), QStringLiteral("idx_track_listens_recent"),
+                                      QStringLiteral("idx_sync_conflicts_ek"), QStringLiteral("idx_playlist_dl_path"),
+                                      QStringLiteral("idx_playlist_dl_job")})
+        CHECK(indexNames.contains(expected));
+
+      const quint64 t0 = store.tracksSerial(), r0 = store.rootsSerial(), s0 = store.settingsSerial();
+      store.setSetting("position", 42.5);
+      store.setSetting("queueIndex", 1);
+      store.setSetting("listeningSession", QVariantMap{{"track", "x"}});
+      CHECK(store.tracksSerial() == t0);
+      CHECK(store.rootsSerial() == r0);
+      CHECK(store.settingsSerial() == s0);
+
+      store.setSetting("palette", "Nord");
+      CHECK(store.settingsSerial() > s0);
+      CHECK(store.tracksSerial() == t0);
+      CHECK(store.rootsSerial() == r0);
+      const auto all = store.allSettings();
+      CHECK(all.value("palette").toString() == "Nord");
+      CHECK(all.value("position").toDouble() == 42.5);
+
+      const QMetaObject *pmo = &Player::staticMetaObject;
+      const int posPropIdx = pmo->indexOfProperty("position");
+      CHECK(posPropIdx >= 0);
+      CHECK(QByteArray(pmo->property(posPropIdx).notifySignal().name()) == "positionChanged");
+
+      // Pass 2 checks: O(N log N) smartShuffleOrder, batched setSettings, trackCount, and cached Online::history
+      {
+        QVector<SmartShuffleItem> bigPool;
+        bigPool.reserve(1500);
+        const qint64 now = 1'700'000'000'000LL;
+        for (int i = 0; i < 1500; ++i)
+          bigPool.append({i, QString("Artist %1").arg(i % 30), now - qint64(i % 10) * 86400000LL});
+        std::mt19937 rng(42);
+        const auto order = smartShuffleOrder(bigPool, "Artist 0", rng, now);
+        CHECK(order.size() == 1500);
+        QSet<int> uniq(order.begin(), order.end());
+        CHECK(uniq.size() == 1500);
+        CHECK(bigPool[order.first()].artist != "Artist 0");
+        for (int i = 1; i < order.size(); ++i)
+          CHECK(bigPool[order[i]].artist != bigPool[order[i - 1]].artist);
+
+        // single-artist edge case completes cleanly and returns exact permutation
+        QVector<SmartShuffleItem> mono;
+        for (int i = 0; i < 200; ++i) mono.append({i, "Same Artist", now});
+        const auto monoOrder = smartShuffleOrder(mono, "Same Artist", rng, now);
+        CHECK(monoOrder.size() == 200);
+        CHECK(QSet<int>(monoOrder.begin(), monoOrder.end()).size() == 200);
+      }
+
+      int settingsSignals = 0;
+      auto sconn = QObject::connect(&app, &App::settingsChanged, [&] { ++settingsSignals; });
+      app.setSettings({{"windowWidth", 1280}, {"windowHeight", 720}, {"lastPage", "Music"}});
+      QObject::disconnect(sconn);
+      CHECK(settingsSignals == 1);
+      CHECK(app.settings()["windowWidth"].toInt() == 1280);
+      CHECK(app.settings()["windowHeight"].toInt() == 720);
+      CHECK(app.library.trackCount() == app.library.tracks().size());
+
+      store.exec("INSERT OR REPLACE INTO searches VALUES('youtube','synthwave',100)");
+      app.online.removeHistory("nonexistent");
+      CHECK(app.online.history().size() == 1);
+      app.online.clearHistory();
+      CHECK(app.online.history().isEmpty());
+
+      // Pass 3 checks: Store::lastAffected, single-pass Listening::insights, and FolderTree root dedupe
+      {
+        CHECK(store.exec("INSERT OR REPLACE INTO tracks(id,path,title,artist,deleted) VALUES('p3a','/tmp/p3/a.mp3','P3A','Artist P3',0)"));
+        const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+        CHECK(store.exec("INSERT OR REPLACE INTO listening_plays(session,track,playedAt) VALUES('s3-1','p3a',?),('s3-2','p3a',?)",
+                         {nowMs, nowMs - 86400000LL}));
+        CHECK(store.lastAffected() == 2);
+        const auto ins = app.listening.insights("week");
+        CHECK(ins["activeDays"].toInt() >= 2);
+        CHECK(ins["streakDays"].toInt() >= 2);
+        CHECK(store.exec("DELETE FROM listening_plays WHERE session IN ('s3-1','s3-2')"));
+        CHECK(store.lastAffected() == 2);
+        CHECK(store.exec("DELETE FROM tracks WHERE id='p3a'"));
+      }
+      {
+        // cropArtwork default, rounded 16:9 square crop without upscaling, liked/recent cover inheritance, and playlist sort metadata
+        CHECK(app.settings()["cropArtwork"].toBool() == true);
+        const QString widePath = dir.path() + "/wide-cover.png";
+        QImage wide(320, 180, QImage::Format_ARGB32);
+        wide.fill(QColor(220, 40, 80));
+        CHECK(wide.save(widePath));
+        RoundedArtProvider provider;
+        QSize outSz;
+        const QImage cropped = provider.requestImage("1/0.25/" + QUrl::toPercentEncoding(QUrl::fromLocalFile(widePath).toString()), &outSz, QSize(128, 128));
+        CHECK(!cropped.isNull() && cropped.width() == 128 && cropped.height() == 128);
+        CHECK(qAlpha(cropped.pixel(0, 0)) == 0);
+        CHECK(qAlpha(cropped.pixel(64, 64)) == 255);
+        const QImage uncropped = provider.requestImage("0/0.25/" + QUrl::toPercentEncoding(QUrl::fromLocalFile(widePath).toString()), &outSz, QSize(128, 128));
+        CHECK(!uncropped.isNull() && uncropped.width() == 128 && uncropped.height() == 72);
+
+        const QString wideUrl = QUrl::fromLocalFile(widePath).toString();
+        CHECK(store.exec("INSERT INTO tracks(id,path,title,artist,art,duration,available,deleted,added) VALUES('cov1','/tmp/cov1.mp3','Cover Song','Art',?,180,1,0,5000)", {wideUrl}));
+        CHECK(store.exec("INSERT OR REPLACE INTO likes(track) VALUES('cov1')"));
+        CHECK(store.exec("INSERT OR REPLACE INTO track_listens(track,plays,lastPlayed) VALUES('cov1',1,9999999999)"));
+        CHECK(app.library.likedCover() == wideUrl);
+        CHECK(app.recentCover() == wideUrl);
+        const auto plSortId = app.createCollection("Sort Meta Pl", "playlist");
+        CHECK(app.addTracksToCollection(plSortId, {"cov1"}, "skip")["added"].toInt() == 1);
+        bool foundMeta = false;
+        for (const auto &v : app.collections()) {
+          const auto m = v.toMap();
+          if (m["id"].toString() == plSortId) {
+            foundMeta = (m["totalDuration"].toDouble() >= 180.0 && m["latestAdded"].toLongLong() == 5000 && m["sortOrder"].toLongLong() > 0);
+          }
+        }
+        CHECK(foundMeta);
+        app.deleteCollection(plSortId);
+        CHECK(store.exec("DELETE FROM likes WHERE track='cov1'"));
+        CHECK(store.exec("DELETE FROM track_listens WHERE track='cov1'"));
+        CHECK(store.exec("DELETE FROM tracks WHERE id='cov1'"));
+      }
     }
 
     const auto resetRes = app.resetDesktopLibrary(false);

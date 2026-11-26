@@ -37,6 +37,15 @@ import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.distinctUntilChanged
 
 private data class SongRow(val key: String, val track: Track, val member: Member? = null)
+private data class GroupRow(
+    val id: String,
+    val title: String,
+    val count: Int,
+    val cover: String,
+    val totalDuration: Double = 0.0,
+    val latestAdded: Long = 0L,
+    val sortOrder: Int = 0,
+)
 
 @OptIn(ExperimentalLayoutApi::class, ExperimentalFoundationApi::class)
 @Composable
@@ -84,6 +93,8 @@ fun MusicScreen(
     var playlistSortAsc by rememberSaveable { mutableStateOf(true) }
     var artistSort by rememberSaveable { mutableStateOf("Name") }
     var artistSortAsc by rememberSaveable { mutableStateOf(true) }
+    var playlistsTabSort by rememberSaveable { mutableStateOf("Default order") }
+    var playlistsTabSortAsc by rememberSaveable { mutableStateOf(true) }
     var albumType by rememberSaveable { mutableStateOf("Generated") }
     var selecting by rememberSaveable { mutableStateOf(false) }
     var selected by rememberSaveable { mutableStateOf(listOf<String>()) }
@@ -133,9 +144,13 @@ fun MusicScreen(
             }
         }
     }
+    val showingSongs = tab == "Songs" || collectionId.isNotBlank()
     val orderedState by produceState<Pair<String, List<SongRow>>>(
-        "" to emptyList(), tracks, members, likes, recent, collectionId, sort, sortAsc, playlistSort, playlistSortAsc,
+        "" to emptyList(), showingSongs, tracks, members, likes, recent, collectionId, sort, sortAsc, playlistSort, playlistSortAsc,
     ) {
+        if (!showingSongs) {
+            return@produceState
+        }
         value = withContext(Dispatchers.Default) {
             val values: List<SongRow> =
                 when {
@@ -201,7 +216,10 @@ fun MusicScreen(
         }
     }
     val orderedRows = orderedState.second
-    val rowsState by produceState(orderedState, orderedState, query) {
+    val rowsState by produceState(orderedState, showingSongs, orderedState, query) {
+        if (!showingSongs) {
+            return@produceState
+        }
         if (query.isNotBlank()) delay(120)
         value = withContext(Dispatchers.Default) {
             val filtered =
@@ -224,11 +242,17 @@ fun MusicScreen(
                 "Custom album: $collectionName"
             else -> "Playlist: $collectionName"
         }
-    val showingSongs = tab == "Songs" || collectionId.isNotBlank()
     val selectedKeys = remember(selected) { selected.toHashSet() }
     val chosen = remember(orderedRows, selectedKeys) { if(selectedKeys.isEmpty()) emptyList() else orderedRows.filter { it.key in selectedKeys } }
-    val actualIds = chosen.map { it.track.id }
-    val all = rows.isNotEmpty() && selectedKeys.size >= rows.size && rows.all { it.key in selectedKeys }
+    val actualIds = remember(chosen) { chosen.map { it.track.id } }
+    val all = remember(rows, selectedKeys) { rows.isNotEmpty() && selectedKeys.size >= rows.size && rows.all { it.key in selectedKeys } }
+    val latestSelectedKeys by rememberUpdatedState(selectedKeys)
+    val toggleRowSelection =
+        remember {
+            { key: String ->
+                selected = if (key in latestSelectedKeys) selected - key else selected + key
+            }
+        }
     Column(
         Modifier.fillMaxSize().onPreviewKeyEvent {
             if (it.type == KeyEventType.KeyUp && it.key == Key.Escape && selecting) {
@@ -624,7 +648,11 @@ fun MusicScreen(
                                 selecting = true
                                 val base = latestSelectedList.toHashSet()
                                 val fillMode = startRow.key !in base
+                                var lastEndIdx = -1
                                 fun applyRange(endIdx: Int) {
+                                    // skip redundant allocations at 60-120Hz when pointer stays on the same row
+                                    if (endIdx == lastEndIdx) return
+                                    lastEndIdx = endIdx
                                     val lo = minOf(startIdx, endIdx).coerceAtLeast(0)
                                     val hi = maxOf(startIdx, endIdx).coerceAtMost(latestDisplayedRows.lastIndex)
                                     val next = LinkedHashSet(base)
@@ -723,10 +751,7 @@ fun MusicScreen(
                                 { DragReorderHandle(reorderState, row.key, index) }
                             } else null,
                         enableLongClick = false,
-                        onSelect = {
-                            selected =
-                                if (row.key in selectedKeys) selected - row.key else selected + row.key
-                        },
+                        onSelect = { toggleRowSelection(row.key) },
                         onLong = {},
                         onPlay = {
                             g.engine.value?.playTrack(
@@ -831,7 +856,7 @@ fun MusicScreen(
                 state = folderListState,
                 contentPadding = PaddingValues(bottom = 12.dp),
             ) {
-                items(visibleSubfolders, key = { "folder:${it.path}" }) { sub ->
+                items(visibleSubfolders, key = { "folder:${it.path}" }, contentType = { "folder" }) { sub ->
                     Row(
                         Modifier.fillMaxWidth()
                             .clickable {
@@ -875,7 +900,7 @@ fun MusicScreen(
                         Glyph("chevron-right", modifier = Modifier.size(18.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 }
-                itemsIndexed(visibleFolderTracks, key = { _, t -> "ftrack:${t.id}" }) { index, track ->
+                itemsIndexed(visibleFolderTracks, key = { _, t -> "ftrack:${t.id}" }, contentType = { _, _ -> "track" }) { index, track ->
                     TrackListRow(
                         track = track,
                         onPlay = {
@@ -899,7 +924,7 @@ fun MusicScreen(
                     )
                 }
                 if (visibleSubfolders.isEmpty() && visibleFolderTracks.isEmpty()) {
-                    item {
+                    item(contentType = "empty") {
                         Hint(
                             if (query.isNotBlank()) "No matching folders or songs"
                             else "Add a music folder in Settings to browse by directory."
@@ -908,35 +933,36 @@ fun MusicScreen(
                 }
             }
         } else {
-            val groupsState by produceState<Pair<String, List<Triple<String, String, List<Track>>>>>(
-                "" to emptyList(), tab, albumType, tracks, membersByCollection, collections, likes, recent, artistSort, artistSortAsc, pinnedPlaylists, pinnedArtists,
+            val groupsState by produceState<Pair<String, List<GroupRow>>>(
+                "" to emptyList(), tab, albumType, tracks, membersByCollection, collections, likes, recent, artistSort, artistSortAsc, playlistsTabSort, playlistsTabSortAsc, pinnedPlaylists, pinnedArtists,
             ) {
                 value = withContext(Dispatchers.Default) {
-                val computed = when (tab) {
+                val computed: List<GroupRow> = when (tab) {
                     "Artists" -> {
-                        val buckets = LinkedHashMap<String, Pair<String, MutableList<Track>>>()
+                        val buckets = LinkedHashMap<String, Triple<String, Int, String>>()
                         for (track in tracks) {
                             for (artistName in splitArtists(track.artist)) {
                                 val key = artistName.lowercase(Locale.ROOT)
-                                val entry = buckets.getOrPut(key) { artistName to mutableListOf() }
-                                entry.second += track
+                                val prev = buckets[key]
+                                val cover = prev?.third?.ifBlank { track.art } ?: track.art
+                                buckets[key] = Triple(prev?.first ?: artistName, (prev?.second ?: 0) + 1, cover)
                             }
                         }
                         val listItems =
                             buckets.map { (key, entry) ->
-                                Triple("artist:$key", entry.first, entry.second.toList())
+                                GroupRow("artist:$key", entry.first, entry.second, entry.third)
                             }
-                        val baseComp: Comparator<Triple<String, String, List<Track>>> =
+                        val baseComp: Comparator<GroupRow> =
                             when (artistSort) {
                                 "Songs" ->
-                                    if (artistSortAsc) compareBy<Triple<String, String, List<Track>>> { it.third.size }.thenBy { it.second.lowercase(Locale.ROOT) }
-                                    else compareByDescending<Triple<String, String, List<Track>>> { it.third.size }.thenBy { it.second.lowercase(Locale.ROOT) }
+                                    if (artistSortAsc) compareBy<GroupRow> { it.count }.thenBy { it.title.lowercase(Locale.ROOT) }
+                                    else compareByDescending<GroupRow> { it.count }.thenBy { it.title.lowercase(Locale.ROOT) }
                                 else ->
-                                    if (artistSortAsc) compareBy { it.second.lowercase(Locale.ROOT) }
-                                    else compareByDescending { it.second.lowercase(Locale.ROOT) }
+                                    if (artistSortAsc) compareBy { it.title.lowercase(Locale.ROOT) }
+                                    else compareByDescending { it.title.lowercase(Locale.ROOT) }
                             }
                         listItems.sortedWith(
-                            compareByDescending<Triple<String, String, List<Track>>> { it.first in pinnedArtists }
+                            compareByDescending<GroupRow> { it.id in pinnedArtists }
                                 .then(baseComp)
                         )
                     }
@@ -945,12 +971,9 @@ fun MusicScreen(
                             collections
                                 .filter { it.kind == "custom" }
                                 .map { c ->
-                                    Triple(
-                                        c.id,
-                                        c.name,
-                                        (membersByCollection[c.id] ?: emptyList())
-                                            .mapNotNull { trackById[it.track] },
-                                    )
+                                    val memberTracks = (membersByCollection[c.id] ?: emptyList()).mapNotNull { trackById[it.track] }
+                                    val cover = c.art.ifBlank { memberTracks.firstOrNull { it.art.isNotBlank() }?.art ?: "" }
+                                    GroupRow(c.id, c.name, memberTracks.size, cover)
                                 }
                         else
                             // group generated albums by album title so featuring artists dont create duplicate albums
@@ -958,29 +981,108 @@ fun MusicScreen(
                                 .filter { it.album.isNotBlank() }
                                 .groupBy { it.album.trim().lowercase(Locale.ROOT) }
                                 .map { (key, values) ->
-                                    Triple("album:$key", values.first().album.trim(), values)
+                                    GroupRow(
+                                        "album:$key",
+                                        values.first().album.trim(),
+                                        values.size,
+                                        values.firstOrNull { it.art.isNotBlank() }?.art ?: "",
+                                    )
                                 }
-                                .sortedBy { it.second.lowercase(Locale.ROOT) }
+                                .sortedBy { it.title.lowercase(Locale.ROOT) }
                     else -> {
                         // pinned playlists sit above utility actions and unpinned playlists below them
-                        collections
-                            .filter { it.kind == "playlist" }
-                            .sortedByDescending { it.id in pinnedPlaylists }
-                            .map { c ->
-                                Triple(
-                                    c.id,
-                                    c.name,
-                                    (membersByCollection[c.id] ?: emptyList())
-                                        .mapNotNull { trackById[it.track] },
-                                )
+                        val playlistRows =
+                            collections
+                                .filter { it.kind == "playlist" }
+                                .mapIndexed { idx, c ->
+                                    val memberTracks = (membersByCollection[c.id] ?: emptyList()).mapNotNull { trackById[it.track] }
+                                    val cover = c.art.ifBlank { memberTracks.firstOrNull { it.art.isNotBlank() }?.art ?: "" }
+                                    val totalDur = memberTracks.sumOf { it.duration }
+                                    val latest = memberTracks.maxOfOrNull { it.added } ?: 0L
+                                    GroupRow(c.id, c.name, memberTracks.size, cover, totalDur, latest, idx)
+                                }
+                        val baseComp: Comparator<GroupRow> =
+                            when (playlistsTabSort) {
+                                "Name" ->
+                                    if (playlistsTabSortAsc) compareBy { it.title.lowercase(Locale.ROOT) }
+                                    else compareByDescending { it.title.lowercase(Locale.ROOT) }
+                                "Songs" ->
+                                    if (playlistsTabSortAsc) compareBy<GroupRow> { it.count }.thenBy { it.title.lowercase(Locale.ROOT) }
+                                    else compareByDescending<GroupRow> { it.count }.thenBy { it.title.lowercase(Locale.ROOT) }
+                                "Duration" ->
+                                    if (playlistsTabSortAsc) compareBy<GroupRow> { it.totalDuration }.thenBy { it.title.lowercase(Locale.ROOT) }
+                                    else compareByDescending<GroupRow> { it.totalDuration }.thenBy { it.title.lowercase(Locale.ROOT) }
+                                "Recently updated" ->
+                                    if (playlistsTabSortAsc) compareBy<GroupRow> { it.latestAdded }.thenBy { it.title.lowercase(Locale.ROOT) }
+                                    else compareByDescending<GroupRow> { it.latestAdded }.thenBy { it.title.lowercase(Locale.ROOT) }
+                                else ->
+                                    if (playlistsTabSortAsc) compareBy { it.sortOrder }
+                                    else compareByDescending { it.sortOrder }
                             }
+                        playlistRows.sortedWith(
+                            compareByDescending<GroupRow> { it.id in pinnedPlaylists }
+                                .then(baseComp)
+                        )
                     }
                 }
-                "$tab|$albumType|$artistSort|$artistSortAsc" to computed
+                "$tab|$albumType|$artistSort|$artistSortAsc|$playlistsTabSort|$playlistsTabSortAsc" to computed
                 }
             }
             val groups = groupsState.second
+            val systemGroups by produceState<List<GroupRow>>(emptyList(), tab, tracks, likes, recent, trackById, query) {
+                if (tab != "Playlists") {
+                    value = emptyList()
+                    return@produceState
+                }
+                value = withContext(Dispatchers.Default) {
+                    val likedTracks = tracks.filter { it.id in likes }
+                    val recentTracks = recent.mapNotNull { trackById[it] }
+                    listOf(
+                        GroupRow("liked", "Liked Songs", likedTracks.size, likedTracks.firstOrNull { it.art.isNotBlank() }?.art ?: ""),
+                        GroupRow("recent", "Recently Played", recentTracks.size, recentTracks.firstOrNull { it.art.isNotBlank() }?.art ?: ""),
+                    ).filter { query.isBlank() || it.title.contains(query, true) }
+                }
+            }
+            val pinnedItems =
+                remember(tab, groups, pinnedPlaylists, query) {
+                    if (tab != "Playlists") emptyList()
+                    else groups.filter { it.id in pinnedPlaylists && (query.isBlank() || it.title.contains(query, true)) }
+                }
+            val visibleGroups =
+                remember(tab, groups, pinnedPlaylists, query) {
+                    groups.filter {
+                        (tab != "Playlists" || it.id !in pinnedPlaylists) &&
+                            (query.isBlank() || it.title.contains(query, true))
+                    }
+                }
+            val hasPlaylistMatches =
+                tab == "Playlists" && (pinnedItems.isNotEmpty() || systemGroups.isNotEmpty() || visibleGroups.isNotEmpty())
             val collectionListState = rememberSaveable(tab, albumType, groupsState.first, saver = LazyListState.Saver) { LazyListState() }
+            if (tab == "Playlists") {
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        if (groups.size == 1) "1 playlist" else "${groups.size} playlists",
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.weight(1f))
+                    SortControl(
+                        value = playlistsTabSort,
+                        ascending = playlistsTabSortAsc,
+                        options = listOf("Default order", "Name", "Songs", "Duration", "Recently updated"),
+                        onPick = { picked ->
+                            if (picked != playlistsTabSort) {
+                                playlistsTabSort = picked
+                                playlistsTabSortAsc = picked == "Default order" || picked == "Name"
+                            }
+                        },
+                        onToggleDirection = { playlistsTabSortAsc = !playlistsTabSortAsc },
+                    )
+                }
+            }
             if (tab == "Artists") {
                 Row(
                     Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
@@ -1008,25 +1110,20 @@ fun MusicScreen(
             }
             LazyColumn(Modifier.weight(1f), state = collectionListState) {
                 if (tab == "Playlists") {
-                    val pinnedItems = groups.filter { it.first in pinnedPlaylists && (query.isBlank() || it.second.contains(query, true)) }
-                    items(pinnedItems, key = { "pinned:${it.first}" }) { (id, title, values) ->
-                        val collection = collectionById[id]
+                    items(pinnedItems, key = { "pinned:${it.id}" }, contentType = { "group" }) { group ->
+                        val collection = collectionById[group.id]
                         Row(
                             Modifier.fillMaxWidth()
-                                .clickable { open(id, title) }
+                                .clickable { open(group.id, group.title) }
                                 .padding(horizontal = 12.dp, vertical = 10.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
-                            Artwork(
-                                collection?.art?.takeIf { it.isNotBlank() }
-                                    ?: values.firstOrNull { it.art.isNotBlank() }?.art
-                                    ?: ""
-                            )
+                            Artwork(group.cover)
                             Spacer(Modifier.width(12.dp))
                             Column(Modifier.weight(1f)) {
                                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
                                     Text(
-                                        title,
+                                        group.title,
                                         Modifier.weight(1f, fill = false),
                                         maxLines = 1,
                                         overflow = TextOverflow.Ellipsis,
@@ -1035,7 +1132,7 @@ fun MusicScreen(
                                     Glyph("pin", "Pinned", Modifier.size(13.dp), tint = MaterialTheme.colorScheme.primary)
                                 }
                                 Text(
-                                    if (values.size == 1) "1 song" else "${values.size} songs",
+                                    if (group.count == 1) "1 song" else "${group.count} songs",
                                     fontSize = 12.sp,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
@@ -1049,7 +1146,7 @@ fun MusicScreen(
                     }
                 }
                 if ((tab == "Playlists" || tab == "Albums" && albumType == "Custom") && query.isBlank())
-                    item {
+                    item(contentType = "action") {
                         Row(
                             Modifier.fillMaxWidth()
                                 .clickable {
@@ -1077,7 +1174,7 @@ fun MusicScreen(
                         }
                     }
                 if (tab == "Playlists" && query.isBlank())
-                    item {
+                    item(contentType = "action") {
                         Row(
                             Modifier.fillMaxWidth()
                                 .clickable { pickers.importPlaylist() }
@@ -1105,24 +1202,22 @@ fun MusicScreen(
                         }
                     }
                 if (tab == "Playlists") {
-                    val systemGroups =
-                        listOf(
-                            Triple("liked", "Liked Songs", tracks.filter { it.id in likes }),
-                            Triple("recent", "Recently Played", recent.mapNotNull { trackById[it] }),
-                        ).filter { query.isBlank() || it.second.contains(query, true) }
-                    items(systemGroups, key = { "sys:${it.first}" }) { (id, title, values) ->
+                    items(systemGroups, key = { "sys:${it.id}" }, contentType = { "system" }) { group ->
                         Row(
                             Modifier.fillMaxWidth()
-                                .clickable { open(id, title) }
+                                .clickable { open(group.id, group.title) }
                                 .padding(horizontal = 12.dp, vertical = 10.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
-                            Artwork(values.firstOrNull { it.art.isNotBlank() }?.art ?: "")
+                            Artwork(
+                                group.cover,
+                                fallbackGlyph = if (group.id == "liked") "heart" else "rotate-ccw",
+                            )
                             Spacer(Modifier.width(12.dp))
                             Column(Modifier.weight(1f)) {
-                                Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 14.sp)
+                                Text(group.title, maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 14.sp)
                                 Text(
-                                    if (values.size == 1) "1 song" else "${values.size} songs",
+                                    if (group.count == 1) "1 song" else "${group.count} songs",
                                     fontSize = 12.sp,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
@@ -1130,40 +1225,27 @@ fun MusicScreen(
                         }
                     }
                 }
-                val visibleGroups =
-                    groups.filter {
-                        (tab != "Playlists" || it.first !in pinnedPlaylists) &&
-                            (query.isBlank() || it.second.contains(query, true))
-                    }
-                val hasPlaylistMatches =
-                    tab == "Playlists" &&
-                        (groups.any { it.first in pinnedPlaylists && (query.isBlank() || it.second.contains(query, true)) } ||
-                            listOf("Liked Songs", "Recently Played").any { query.isBlank() || it.contains(query, true) } ||
-                            visibleGroups.isNotEmpty())
                 items(
                     visibleGroups,
-                    key = { it.first },
-                ) { (id, title, values) ->
-                    val collection = collectionById[id]
+                    key = { it.id },
+                    contentType = { "group" },
+                ) { group ->
+                    val collection = collectionById[group.id]
                     val isPinned =
-                        (collection?.kind == "playlist" && id in pinnedPlaylists) ||
-                            (id.startsWith("artist:") && id in pinnedArtists)
+                        (collection?.kind == "playlist" && group.id in pinnedPlaylists) ||
+                            (group.id.startsWith("artist:") && group.id in pinnedArtists)
                     Row(
                         Modifier.fillMaxWidth()
-                            .clickable { open(id, title) }
+                            .clickable { open(group.id, group.title) }
                             .padding(horizontal = 12.dp, vertical = 10.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        Artwork(
-                            collection?.art?.takeIf { it.isNotBlank() }
-                                ?: values.firstOrNull { it.art.isNotBlank() }?.art
-                                ?: ""
-                        )
+                        Artwork(group.cover)
                         Spacer(Modifier.width(12.dp))
                         Column(Modifier.weight(1f)) {
                             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
                                 Text(
-                                    title,
+                                    group.title,
                                     Modifier.weight(1f, fill = false),
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis,
@@ -1174,7 +1256,7 @@ fun MusicScreen(
                                 }
                             }
                             Text(
-                                if (values.size == 1) "1 song" else "${values.size} songs",
+                                if (group.count == 1) "1 song" else "${group.count} songs",
                                 fontSize = 12.sp,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
@@ -1183,14 +1265,14 @@ fun MusicScreen(
                             IconAction("ellipsis", "Collection actions") {
                                 collectionMenu = collection
                             }
-                        else if (id.startsWith("artist:"))
+                        else if (group.id.startsWith("artist:"))
                             IconAction("ellipsis", "Artist actions") {
-                                artistMenu = id to title
+                                artistMenu = group.id to group.title
                             }
                     }
                 }
                 if (query.isNotBlank() && ((tab == "Playlists" && !hasPlaylistMatches) || (tab != "Playlists" && visibleGroups.isEmpty()))) {
-                    item {
+                    item(contentType = "empty") {
                         Box(Modifier.fillMaxWidth().padding(20.dp), contentAlignment = Alignment.Center) {
                             Hint(
                                 when (tab) {
@@ -1700,12 +1782,12 @@ fun PlaylistChooser(
                 }
             }
         }
-        Column(
-            Modifier.heightIn(max = 300.dp).verticalScroll(rememberScrollState()),
+        LazyColumn(
+            Modifier.heightIn(max = 300.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
             @Composable
-            fun playlistRow(c: dev.sillyplayer.data.Collection, pinned: Boolean) {
+            fun PlaylistRow(c: dev.sillyplayer.data.Collection, pinned: Boolean) {
                 val entries = membersByCollection[c.id].orEmpty()
                 val already = singleTrackId != null && entries.any { it.track == singleTrackId }
                 val cover = c.art.ifBlank { entries.firstNotNullOfOrNull { covers[it.track]?.takeIf(String::isNotBlank) }.orEmpty() }
@@ -1736,21 +1818,27 @@ fun PlaylistChooser(
                     }
                 }
             }
-            for (c in pinnedEditable) playlistRow(c, true)
+            items(pinnedEditable, key = { "pin:${it.id}" }, contentType = { "playlist" }) { c ->
+                PlaylistRow(c, true)
+            }
             if (showLiked) {
-                val alreadyLiked = singleTrackId != null && singleTrackId in likes
-                ModalOptionRow(
-                    title = "Liked Songs",
-                    subtitle = (if (likes.size == 1) "1 song" else "${likes.size} songs") + if (alreadyLiked) " · Already added" else "",
-                    icon = "heart",
-                    trailingIcon = "chevron-right",
-                ) {
-                    onPick("liked")
+                item(key = "liked", contentType = "liked") {
+                    val alreadyLiked = singleTrackId != null && singleTrackId in likes
+                    ModalOptionRow(
+                        title = "Liked Songs",
+                        subtitle = (if (likes.size == 1) "1 song" else "${likes.size} songs") + if (alreadyLiked) " · Already added" else "",
+                        icon = "heart",
+                        trailingIcon = "chevron-right",
+                    ) {
+                        onPick("liked")
+                    }
                 }
             }
-            for (c in unpinnedEditable) playlistRow(c, false)
+            items(unpinnedEditable, key = { it.id }, contentType = { "playlist" }) { c ->
+                PlaylistRow(c, false)
+            }
             if (pinnedEditable.isEmpty() && unpinnedEditable.isEmpty() && !showLiked) {
-                Hint("No matching playlists")
+                item(contentType = "empty") { Hint("No matching playlists") }
             }
         }
     }

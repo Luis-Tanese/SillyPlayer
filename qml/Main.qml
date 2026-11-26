@@ -39,23 +39,23 @@ ApplicationWindow {
         interval: 450
         onTriggered: {
             if (!root.geometryReady) return;
+            const current = app.settings;
+            const updates = {};
             if (root.visibility === Window.Windowed || root.visibility === Window.Maximized) {
                 const maximized = root.visibility === Window.Maximized;
-                if (Boolean(app.settings.windowMaximized) !== maximized)
-                    app.setSetting("windowMaximized", maximized);
+                if (Boolean(current.windowMaximized) !== maximized)
+                    updates.windowMaximized = maximized;
             }
             if (root.visibility === Window.Windowed) {
-                if (Number(app.settings.windowWidth) !== root.width)
-                    app.setSetting("windowWidth", root.width);
-                if (Number(app.settings.windowHeight) !== root.height)
-                    app.setSetting("windowHeight", root.height);
-                if (Number(app.settings.windowX) !== root.x)
-                    app.setSetting("windowX", root.x);
-                if (Number(app.settings.windowY) !== root.y)
-                    app.setSetting("windowY", root.y);
+                if (Number(current.windowWidth) !== root.width) updates.windowWidth = root.width;
+                if (Number(current.windowHeight) !== root.height) updates.windowHeight = root.height;
+                if (Number(current.windowX) !== root.x) updates.windowX = root.x;
+                if (Number(current.windowY) !== root.y) updates.windowY = root.y;
             }
-            if (app.settings.lastPage !== root.page)
-                app.setSetting("lastPage", root.page);
+            if (current.lastPage !== root.page)
+                updates.lastPage = root.page;
+            if (Object.keys(updates).length > 0)
+                app.setSettings(updates);
         }
     }
     onWidthChanged: {
@@ -87,7 +87,7 @@ ApplicationWindow {
     property bool playerKeyboard: expanded || compactPlayer.activeFocus || videoKeyboard
     // track settingsPane modals too so global shortcuts stay paused when clear/reset dialogs are open
     property bool modalActive: libraryToolsDialog.opened || playlistDownloadDialog.opened || sleepDialog.opened || musicPane.bulkModalActive || settingsPane.modalActive || errorDialog.opened || nameDialog.opened || deleteDialog.opened || removeDuplicatesDialog.opened || addDialog.opened || metadataDialog.opened || catalogueDialog.opened || infoDialog.opened || speedDialog.opened || songVolumeDialog.opened || eqDialog.opened || downloadDialog.opened || duplicateDialog.opened || addSongsDialog.opened || detailsDialog.opened || trashDialog.opened || linkDialog.opened || songMenu.opened || expandedMenu.opened || collectionActions.opened
-    property var orderedJobs: online.jobs.slice().sort((a, b) => {
+    property var orderedJobs: root.page !== "Downloads" ? [] : online.jobs.slice().sort((a, b) => {
             const states = ["Active", "Resolving", "Post-processing", "Queued", "Paused", "Interrupted", "Failed", "Completed", "Cancelled"];
             return states.indexOf(a.state) - states.indexOf(b.state);
         })
@@ -717,7 +717,7 @@ ApplicationWindow {
             }
             FlatButton {
                 text: "Clear upcoming"
-                enabled: queueDrawer.visible && app.queue.some(q => !q.passed && !q.isCurrent)
+                enabled: app.hasUpcoming
                 onClicked: app.clearUpcoming()
             }
             ListView {
@@ -1241,7 +1241,15 @@ ApplicationWindow {
         property var selectedIds: ({})
         property int anchorIndex: -1
         property string feedback: ""
-        readonly property var filteredTracks: visible ? library.tracks.filter(t => ((t.title || "") + " " + (t.artist || "")).toLowerCase().includes(addSongSearch.text.toLowerCase())) : []
+        property string appliedSearch: ""
+        Timer { id: addSongsSearchDelay; interval: 120; onTriggered: addSongsDialog.appliedSearch = addSongSearch.text.toLowerCase() }
+        onOpened: { appliedSearch = addSongSearch.text.toLowerCase(); }
+        readonly property var filteredTracks: {
+            if (!visible) return [];
+            const all = library.tracks;
+            if (!appliedSearch) return all;
+            return all.filter(t => ((t.title || "") + " " + (t.artist || "")).toLowerCase().includes(appliedSearch));
+        }
         function toggle(index, modifiers) {
             if (index < 0 || index >= filteredTracks.length) return;
             let ids = Object.assign({}, selectedIds);
@@ -1256,11 +1264,12 @@ ApplicationWindow {
         }
         ColumnLayout {
             width: parent.width; spacing: 10
-            AppField { id: addSongSearch; objectName: "addSongSearch"; search: true; placeholderText: "Search your library"; Layout.fillWidth: true; onTextChanged: addSongsDialog.anchorIndex = -1 }
+            AppField { id: addSongSearch; objectName: "addSongSearch"; search: true; placeholderText: "Search your library"; Layout.fillWidth: true; onTextChanged: { addSongsDialog.anchorIndex = -1; addSongsSearchDelay.restart(); } }
             ListView {
                 id: songChoices
                 Layout.fillWidth: true; Layout.preferredHeight: Math.max(80, Math.min(360, root.height - 330)); clip: true
-                model: addSongsDialog.filteredTracks
+                cacheBuffer: 480
+                model: StableListModel { rows: addSongsDialog.filteredTracks }
                 ScrollBar.vertical: ScrollBar {}
                 Keys.onPressed: event => {
                     if (event.key === Qt.Key_Space && currentIndex >= 0) {
@@ -1273,18 +1282,18 @@ ApplicationWindow {
                     }
                 }
                 delegate: CollectionRow {
-                    required property var modelData
+                    required property var record
                     required property int index
-                    width: ListView.view.width; title: modelData.title; cover: modelData.art || ""
-                    selectable: true; selected: !!addSongsDialog.selectedIds[modelData.id]
-                    subtitle: modelData.artist || "Unknown artist"
+                    width: ListView.view.width; title: record.title; cover: record.art || ""
+                    selectable: true; selected: !!addSongsDialog.selectedIds[record.id]
+                    subtitle: record.artist || "Unknown artist"
                     onClicked: { songChoices.forceActiveFocus(); addSongsDialog.toggle(index, 0); }
                     MouseArea {
                         anchors.fill: parent
                         onClicked: mouse => { songChoices.forceActiveFocus(); addSongsDialog.toggle(index, mouse.modifiers); }
                     }
                 }
-                Label { anchors.centerIn: parent; text: library.tracks.length ? "No matching songs" : "Your library is empty"; visible: parent.count === 0; color: Theme.muted }
+                Label { anchors.centerIn: parent; text: library.trackCount ? "No matching songs" : "Your library is empty"; visible: parent.count === 0; color: Theme.muted }
             }
             Label { text: Object.keys(addSongsDialog.selectedIds).length + " songs selected"; color: Theme.muted }
             Label { text: addSongsDialog.feedback; visible: !!text; color: Theme.muted; Layout.fillWidth: true; wrapMode: Text.Wrap }
@@ -1645,10 +1654,32 @@ ApplicationWindow {
                 }
             }
         }
+        property bool eqCommitPending: false
+        Timer {
+            id: eqCommitTimer
+            interval: 180
+            onTriggered: eqDialog.flushPendingEq()
+        }
+        function flushPendingEq() {
+            if (!eqCommitPending) return;
+            eqCommitPending = false;
+            eqCommitTimer.stop();
+            app.applyEq(eqEnabled.checked, gains, "Custom");
+            syncCombo();
+        }
+        onClosed: flushPendingEq()
         function apply(values, presetName) {
+            eqCommitPending = false;
+            eqCommitTimer.stop();
             gains = values;
             app.applyEq(eqEnabled.checked, values, presetName || "Custom");
             syncCombo();
+        }
+        function preview(values) {
+            gains = values;
+            app.previewEq(eqEnabled.checked, values);
+            eqCommitPending = true;
+            eqCommitTimer.restart();
         }
         ColumnLayout {
             width: parent.width
@@ -1770,7 +1801,7 @@ ApplicationWindow {
                                 let g = eqDialog.gains.slice();
                                 g[index] = value;
                                 eqPreset.currentIndex = eqDialog.presetNames.length - 1;
-                                eqDialog.apply(g);
+                                eqDialog.preview(g);
                             }
                             Accessible.name: modelData + " Hz gain"
                         }

@@ -20,7 +20,8 @@ Listening::Listening(Store *store,Player *backend,QObject *parent):QObject(paren
     });
     poller.setInterval(1000);connect(&poller,&QTimer::timeout,this,&Listening::poll);
   }
-  checkpoint.setInterval(5000); connect(&checkpoint,&QTimer::timeout,this,&Listening::flush); checkpoint.start();
+  // run checkpoint timer only when listening state is dirty instead of waking every 5s while idle
+  checkpoint.setInterval(5000); connect(&checkpoint,&QTimer::timeout,this,&Listening::flush);
   // todo: maybe bump this to 90 days if we ever add a yearly/quarterly view
   s->exec("DELETE FROM listening_plays WHERE playedAt<?",{QDateTime::currentMSecsSinceEpoch()-30LL*86400000});
   lastPrune=QDateTime::currentMSecsSinceEpoch();
@@ -77,6 +78,7 @@ void Listening::observe(const ListeningSample &sample,qint64 monotonicMs,qint64 
     const double heard=qMin(wallBudget,audioBudget);
     wallBudget-=heard; audioBudget-=heard;
     totalMs+=heard; realMs+=heard; mediaMs+=media; dirty=true;
+    if(!checkpoint.isActive()) checkpoint.start();
     if(!qualified && (realMs>=30000 || (sample.duration>0 && mediaMs>=sample.duration*500))) {
       qualified=true; qualifiedAt=utcMs;
       pendingPlays.append({session,track,qualifiedAt});
@@ -96,14 +98,14 @@ void Listening::remapTracks(const QVariantMap &ids) {
   dirty=true; flush(); emit rankingsChanged();
 }
 void Listening::flush() {
-  if(!dirty || closed) return;
+  if(!dirty || closed) { if(checkpoint.isActive()) checkpoint.stop(); return; }
   bool ok=s->db().transaction();
   const bool newPlay=!pendingPlays.isEmpty();
   decltype(pendingPlays) newlyCounted;
   for(const auto &play:pendingPlays) {
     if(!ok) break;
     ok=s->exec("INSERT OR IGNORE INTO listening_plays(session,track,playedAt) VALUES(?,?,?)",{play.session,play.track,play.at});
-    if(ok && s->rows("SELECT changes() AS n").value(0).toMap().value("n").toInt()>0) {
+    if(ok && s->lastAffected()>0) {
       newlyCounted.append(play);
       ok=s->exec("INSERT INTO track_listens(track,plays,lastPlayed) VALUES(?,1,?) ON CONFLICT(track) DO UPDATE SET plays=plays+1,lastPlayed=excluded.lastPlayed",{play.track,play.at});
     }
@@ -126,6 +128,7 @@ void Listening::flush() {
   }
   if(now-lastPrune>=3600000) lastPrune=now;
   dirty=false; pendingPlays.clear(); reportedError=false;
+  if(checkpoint.isActive()) checkpoint.stop();
   if(newPlay) emit rankingsChanged();
 }
 QVariantList Listening::recentTracks() const {
@@ -190,32 +193,32 @@ QVariantMap Listening::insights(const QString &period) const {
   qint64 totalPlays=0;
   for(const auto &v : topSongs) totalPlays+=v.toMap()["playCount"].toLongLong();
 
-  const auto recentPlays=s->rows("SELECT p.playedAt FROM listening_plays p JOIN tracks t ON t.id=p.track WHERE t.deleted=0 AND p.playedAt>=?",{cutoff});
+  // scan listening_plays once to derive both streak dates and period buckets
   const auto allRecentDays=s->rows("SELECT p.playedAt FROM listening_plays p JOIN tracks t ON t.id=p.track WHERE t.deleted=0");
   QSet<QDate> streakDates;
+  QSet<QDate> activeDaySet;
+  int timeBlocks[6]={0,0,0,0,0,0}; // 0-3, 4-7, 8-11, 12-15, 16-19, 20-23
+  int weekdayCounts[7]={0,0,0,0,0,0,0}; // Mon(0)..Sun(6)
+  QHash<QDate,int> dailyCounts;
   for(const auto &v : allRecentDays) {
-    streakDates.insert(QDateTime::fromMSecsSinceEpoch(v.toMap()["playedAt"].toLongLong()).date());
+    const qint64 ts = v.toMap()["playedAt"].toLongLong();
+    const auto dt = QDateTime::fromMSecsSinceEpoch(ts);
+    const auto d = dt.date();
+    streakDates.insert(d);
+    if (ts >= cutoff) {
+      activeDaySet.insert(d);
+      dailyCounts[d]+=1;
+      const int hour=dt.time().hour();
+      timeBlocks[qBound(0,hour/4,5)]+=1;
+      const int dow=d.dayOfWeek()-1; // 1=Mon..7=Sun -> 0..6
+      if(dow>=0 && dow<7) weekdayCounts[dow]+=1;
+    }
   }
   int streakDays=0;
   QDate cursorDate=streakDates.contains(today) ? today : today.addDays(-1);
   while(streakDates.contains(cursorDate)) {
     streakDays++;
     cursorDate=cursorDate.addDays(-1);
-  }
-
-  QSet<QDate> activeDaySet;
-  int timeBlocks[6]={0,0,0,0,0,0}; // 0-3, 4-7, 8-11, 12-15, 16-19, 20-23
-  int weekdayCounts[7]={0,0,0,0,0,0,0}; // Mon(0)..Sun(6)
-  QHash<QDate,int> dailyCounts;
-  for(const auto &v : recentPlays) {
-    const auto dt=QDateTime::fromMSecsSinceEpoch(v.toMap()["playedAt"].toLongLong());
-    const auto d=dt.date();
-    activeDaySet.insert(d);
-    dailyCounts[d]+=1;
-    const int hour=dt.time().hour();
-    timeBlocks[qBound(0,hour/4,5)]+=1;
-    const int dow=d.dayOfWeek()-1; // 1=Mon..7=Sun -> 0..6
-    if(dow>=0 && dow<7) weekdayCounts[dow]+=1;
   }
 
   static const char *kBlockLabels[6]={"12a","4a","8a","12p","4p","8p"};

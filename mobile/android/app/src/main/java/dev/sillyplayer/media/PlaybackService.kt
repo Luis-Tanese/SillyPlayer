@@ -100,35 +100,67 @@ class PlaybackService : MediaLibraryService() {
             )
             .build()
 
-    private suspend fun resolveChildren(parentId: String): List<MediaItem> {
-        val tracks = withContext(Dispatchers.IO) { graph.dao.tracks().filter { it.available } }
+    private suspend fun resolveChildren(parentId: String, page: Int, pageSize: Int): List<MediaItem> {
+        fun slice(items: List<MediaItem>): List<MediaItem> {
+            if (pageSize <= 0) return items
+            val from = (page * pageSize).coerceAtMost(items.size)
+            val to = ((page + 1) * pageSize).coerceAtMost(items.size)
+            return if (from < to) items.subList(from, to) else emptyList()
+        }
         return when {
-            parentId == ROOT_ID ->
-                // todo: add a Recently Played category here for android auto too
-                listOf(
-                    browsableItem(SONGS_ID, "Songs", "${tracks.size} songs", MediaMetadata.MEDIA_TYPE_FOLDER_MIXED),
-                    browsableItem(LIKED_ID, "Liked Songs", "", MediaMetadata.MEDIA_TYPE_FOLDER_PLAYLISTS),
-                    browsableItem(PLAYLISTS_ID, "Playlists", "", MediaMetadata.MEDIA_TYPE_FOLDER_PLAYLISTS),
-                    browsableItem(ARTISTS_ID, "Artists", "", MediaMetadata.MEDIA_TYPE_FOLDER_ARTISTS),
+            parentId == ROOT_ID -> {
+                // only count available tracks instead of loading the full track table for root items
+                val trackCount = withContext(Dispatchers.IO) { graph.dao.countAvailableTracks() }
+                slice(
+                    listOf(
+                        browsableItem(SONGS_ID, "Songs", "$trackCount songs", MediaMetadata.MEDIA_TYPE_FOLDER_MIXED),
+                        browsableItem(LIKED_ID, "Liked Songs", "", MediaMetadata.MEDIA_TYPE_FOLDER_PLAYLISTS),
+                        browsableItem(PLAYLISTS_ID, "Playlists", "", MediaMetadata.MEDIA_TYPE_FOLDER_PLAYLISTS),
+                        browsableItem(ARTISTS_ID, "Artists", "", MediaMetadata.MEDIA_TYPE_FOLDER_ARTISTS),
+                    )
                 )
-            parentId == SONGS_ID -> tracks.map { playableItem("songs", it) }
-            parentId == LIKED_ID -> {
-                val likes = withContext(Dispatchers.IO) { graph.dao.likes().mapTo(HashSet()) { it.track } }
-                tracks.filter { it.id in likes }.map { playableItem("liked", it) }
+            }
+            parentId == SONGS_ID -> {
+                val rows =
+                    withContext(Dispatchers.IO) {
+                        if (pageSize > 0) graph.dao.availableTracksPage(pageSize, page * pageSize)
+                        else graph.dao.tracks().filter { it.available }
+                    }
+                rows.map { playableItem("songs", it) }
             }
             parentId == PLAYLISTS_ID -> {
                 val collections = withContext(Dispatchers.IO) { graph.dao.collections() }
-                collections
-                    .filter { it.kind == "playlist" || it.kind == "custom" }
-                    .map { c -> browsableItem("playlist:${c.id}", c.name, "", MediaMetadata.MEDIA_TYPE_PLAYLIST) }
+                slice(
+                    collections
+                        .filter { it.kind == "playlist" || it.kind == "custom" }
+                        .map { c -> browsableItem("playlist:${c.id}", c.name, "", MediaMetadata.MEDIA_TYPE_PLAYLIST) }
+                )
+            }
+            parentId == LIKED_ID -> {
+                val (tracks, likes) =
+                    withContext(Dispatchers.IO) {
+                        graph.dao.tracks().filter { it.available } to
+                            graph.dao.likes().mapTo(HashSet()) { it.track }
+                    }
+                slice(tracks.filter { it.id in likes }.map { playableItem("liked", it) })
             }
             parentId.startsWith("playlist:") -> {
                 val cid = parentId.removePrefix("playlist:")
-                val byId = tracks.associateBy { it.id }
-                val members = withContext(Dispatchers.IO) { graph.dao.members(cid) }
-                members.mapNotNull { byId[it.track]?.let { t -> playableItem(parentId, t) } }
+                val items =
+                    withContext(Dispatchers.IO) {
+                        val members = graph.dao.members(cid)
+                        val ids = members.map { it.track }.distinct()
+                        val byId =
+                            ids.chunked(400)
+                                .flatMap { graph.dao.tracksByIds(it) }
+                                .filter { it.available && !it.deleted }
+                                .associateBy { it.id }
+                        members.mapNotNull { byId[it.track]?.let { t -> playableItem(parentId, t) } }
+                    }
+                slice(items)
             }
             parentId == ARTISTS_ID -> {
+                val tracks = withContext(Dispatchers.IO) { graph.dao.tracks().filter { it.available } }
                 val seen = LinkedHashMap<String, Pair<String, Int>>()
                 for (t in tracks) {
                     for (artist in splitArtists(t.artist)) {
@@ -137,18 +169,23 @@ class PlaybackService : MediaLibraryService() {
                         seen[key] = (prev?.first ?: artist) to ((prev?.second ?: 0) + 1)
                     }
                 }
-                seen.entries
-                    .sortedBy { it.value.first.lowercase(Locale.ROOT) }
-                    .map { (key, info) ->
-                        val countLabel = if (info.second == 1) "1 song" else "${info.second} songs"
-                        browsableItem("artist:$key", info.first, countLabel, MediaMetadata.MEDIA_TYPE_ARTIST)
-                    }
+                slice(
+                    seen.entries
+                        .sortedBy { it.value.first.lowercase(Locale.ROOT) }
+                        .map { (key, info) ->
+                            val countLabel = if (info.second == 1) "1 song" else "${info.second} songs"
+                            browsableItem("artist:$key", info.first, countLabel, MediaMetadata.MEDIA_TYPE_ARTIST)
+                        }
+                )
             }
             parentId.startsWith("artist:") -> {
                 val key = parentId.removePrefix("artist:")
-                tracks
-                    .filter { t -> splitArtists(t.artist).any { it.lowercase(Locale.ROOT) == key } }
-                    .map { playableItem(parentId, it) }
+                val tracks = withContext(Dispatchers.IO) { graph.dao.tracks().filter { it.available } }
+                slice(
+                    tracks
+                        .filter { t -> splitArtists(t.artist).any { it.lowercase(Locale.ROOT) == key } }
+                        .map { playableItem(parentId, it) }
+                )
             }
             else -> emptyList()
         }
@@ -278,10 +315,7 @@ class PlaybackService : MediaLibraryService() {
                     val future = SettableFuture.create<LibraryResult<ImmutableList<MediaItem>>>()
                     serviceScope.launch {
                         try {
-                            val items = resolveChildren(parentId)
-                            val from = (page * pageSize).coerceAtMost(items.size)
-                            val to = ((page + 1) * pageSize).coerceAtMost(items.size)
-                            val slice = if (pageSize > 0 && from < to) items.subList(from, to) else items
+                            val slice = resolveChildren(parentId, page, pageSize)
                             future.set(LibraryResult.ofItemList(ImmutableList.copyOf(slice), params))
                         } catch (e: Exception) {
                             future.set(LibraryResult.ofError(SessionError.ERROR_IO))

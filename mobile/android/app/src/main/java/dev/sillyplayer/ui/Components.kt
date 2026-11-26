@@ -30,7 +30,11 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.zIndex
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import coil3.compose.AsyncImage
+import coil3.request.ImageRequest
+import coil3.size.Scale
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -56,10 +60,34 @@ fun modifierLabel(track: Track): String =
         }
         .joinToString(" · ")
 
+val LocalCropArtwork = staticCompositionLocalOf { true }
+
 @Composable
-fun Artwork(source: String, size: Int = 44, modifier: Modifier = Modifier, youtubeId: String = "") {
+fun Artwork(
+    source: String,
+    size: Int = 44,
+    modifier: Modifier = Modifier,
+    youtubeId: String = "",
+    fallbackGlyph: String = "music-2",
+) {
+    val cropArtwork = LocalCropArtwork.current
     val candidates = remember(source, youtubeId) { thumbnailCandidates(source, youtubeId) }
     var attempt by remember(candidates) { mutableIntStateOf(0) }
+    val url = candidates.getOrNull(attempt)
+    var loaded by remember(url) { mutableStateOf(false) }
+    val context = LocalContext.current
+    val sizePx = with(LocalDensity.current) { size.dp.roundToPx() }.coerceAtLeast(32)
+    val request =
+        remember(url, sizePx, cropArtwork) {
+            url?.let {
+                // use Scale.FILL when cropping so rectangular 16:9 covers decode their short side to sizePx with no upscaling blur
+                ImageRequest.Builder(context)
+                    .data(it)
+                    .size(sizePx, sizePx)
+                    .scale(if (cropArtwork) Scale.FILL else Scale.FIT)
+                    .build()
+            }
+        }
     Box(
         modifier
             .size(size.dp)
@@ -67,11 +95,22 @@ fun Artwork(source: String, size: Int = 44, modifier: Modifier = Modifier, youtu
             .background(MaterialTheme.colorScheme.surfaceVariant),
         contentAlignment = Alignment.Center,
     ) {
-        Glyph("music-2", modifier = Modifier.size((size * .45).dp))
-        candidates.getOrNull(attempt)?.let { url ->
-            key(source, attempt) {
-                AsyncImage(url, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop,
-                    onError = { if (candidates.getOrNull(attempt) == url) attempt++ })
+        if (!loaded) {
+            Glyph(fallbackGlyph, modifier = Modifier.size((size * .45).dp))
+        }
+        if (request != null && url != null) {
+            key(source, attempt, cropArtwork) {
+                AsyncImage(
+                    model = request,
+                    contentDescription = null,
+                    modifier = Modifier.fillMaxSize(),
+                    contentScale = if (cropArtwork) ContentScale.Crop else ContentScale.Fit,
+                    onSuccess = { loaded = true },
+                    onError = {
+                        loaded = false
+                        if (candidates.getOrNull(attempt) == url) attempt++
+                    },
+                )
             }
         }
     }
@@ -148,7 +187,6 @@ fun Progress(stage: String, progress: Float = -1f) {
     var startFraction by remember { mutableFloatStateOf(0f) }
     var lastFraction by remember { mutableFloatStateOf(-1f) }
     var smoothedEtaMs by remember { mutableDoubleStateOf(-1.0) }
-    var tick by remember { mutableLongStateOf(0L) }
 
     LaunchedEffect(determinate, clamped) {
         if (!determinate) {
@@ -177,16 +215,7 @@ fun Progress(stage: String, progress: Float = -1f) {
         }
     }
 
-    LaunchedEffect(determinate, clamped >= 1f) {
-        if (determinate && clamped < 1f) {
-            while (isActive) {
-                delay(1000)
-                tick = android.os.SystemClock.elapsedRealtime()
-            }
-        }
-    }
-
-    val etaLabel = remember(determinate, clamped, startMs, startFraction, smoothedEtaMs, tick) {
+    val etaLabel = remember(determinate, clamped, smoothedEtaMs) {
         if (!determinate || clamped >= 1f) ""
         else if (smoothedEtaMs >= 0.0) "Estimated time left: ${formatEta(smoothedEtaMs.toLong())}"
         else "Estimating time left…"

@@ -19,9 +19,12 @@ class App : public QObject {
   Q_PROPERTY(
       QVariantList collections READ collections NOTIFY collectionsChanged)
   Q_PROPERTY(QVariantList queue READ queue NOTIFY queueChanged)
+  Q_PROPERTY(bool hasUpcoming READ hasUpcoming NOTIFY queueChanged)
   Q_PROPERTY(QVariantMap current READ current NOTIFY currentChanged)
+  Q_PROPERTY(QString currentTrackId READ currentTrackId NOTIFY currentChanged)
   Q_PROPERTY(bool currentLiked READ currentLiked NOTIFY currentLikeChanged)
   Q_PROPERTY(int recentCount READ recentCount NOTIFY recentChanged)
+  Q_PROPERTY(QString recentCover READ recentCover NOTIFY recentChanged)
   Q_PROPERTY(QObject *statistics READ statistics CONSTANT)
   Q_PROPERTY(QObject *sleepTimer READ timerObject CONSTANT)
   Q_PROPERTY(QObject *backup READ backupObject CONSTANT)
@@ -57,10 +60,13 @@ public:
   QVariantMap settings() const;
   QVariantList collections() const;
   QVariantList queue() const;
+  bool hasUpcoming() const { return index >= 0 && index + 1 < entries.size(); }
   QVariantMap current() const;
+  QString currentTrackId() const { return index >= 0 && index < entries.size() ? entries[index].toMap().value("trackId").toString() : QString(); }
   bool currentLiked() const { return current().value("liked").toBool(); }
   bool hasQueue() const { return !entries.isEmpty(); }
   int recentCount() const;
+  QString recentCover() const;
   int mode() const { return m_mode; }
   QString context() const { return m_context; }
   QVariantMap sourceContext() const { return m_source; }
@@ -68,6 +74,7 @@ public:
   Q_INVOKABLE void checkForUpdates(bool manual = false);
   Q_INVOKABLE void openReleasePage();
   Q_INVOKABLE void setSetting(const QString &key, const QVariant &value);
+  Q_INVOKABLE void setSettings(const QVariantMap &values);
   Q_INVOKABLE QVariantList collectionTracks(const QString &id) const;
   Q_INVOKABLE QVariantMap folderView(const QString &path = {}) const;
   Q_INVOKABLE bool isPinned(const QString &kind, const QString &id) const;
@@ -130,6 +137,7 @@ public:
   Q_INVOKABLE void openTrash();
   Q_INVOKABLE QString speedLabel(const QVariantMap &track) const;
   Q_INVOKABLE void applySpeed(double value, bool nightcore);
+  Q_INVOKABLE void previewEq(bool enabled, const QVariantList &gains);
   Q_INVOKABLE void applyEq(bool enabled, const QVariantList &gains, const QString &preset = {});
   Q_INVOKABLE QVariantMap saveEqPreset(const QString &name, const QVariantList &gains);
   Q_INVOKABLE QVariantMap deleteEqPreset(const QString &id);
@@ -162,11 +170,15 @@ private:
   mutable QVariantMap currentSnapshot;
   mutable QVariantMap settingsSnapshot;
   mutable quint64 settingsSerial=quint64(-1);
+  mutable quint64 settingsTracksSerial=quint64(-1);
   mutable QString settingsTrack;
   mutable QString currentSnapshotId;
-  mutable QVariantList collectionSnapshot,queueSnapshot,queueSnapshotEntries;
-  mutable quint64 currentSerial=quint64(-1),collectionSerial=quint64(-1),queueSerial=quint64(-1);
+  mutable QVariantList collectionSnapshot,queueSnapshot;
+  mutable quint64 currentSerial=quint64(-1),collectionSerial=quint64(-1),collectionSettingsSerial=quint64(-1),queueSerial=quint64(-1);
+  mutable quint64 queueSnapshotVersion=quint64(-1);
   mutable int queueSnapshotIndex=-2;
+  quint64 queueVersion=0,savedQueueVersion=quint64(-1);
+  void markQueueDirty() { ++queueVersion; }
   double onlineResume = 0;
   bool onlinePaused = false;
   bool closing = false, batchTrashing = false;

@@ -117,7 +117,8 @@ class PlaybackEngine(private val g: Graph) {
     private var fadeOutScheduledFor: String? = null
     private var crossfadeMs = 0
     private var smartShuffle = false
-    private var lastPlayedByTrack: Map<String, Long> = emptyMap()
+    @Volatile private var lastPlayedByTrack: Map<String, Long> = emptyMap()
+    private var lastPlayedLoaded = false
     private var duckAudio = true
     private var previewGain: Pair<String, Float>? = null
     private var sleepFired = 0L
@@ -125,8 +126,26 @@ class PlaybackEngine(private val g: Graph) {
     private var repairedAttemptTrackId = ""
     private var sessionOccurrence: String? = null
     private var counted = 0L
+    private data class PlaybackPrefsSnapshot(
+        val master: Float,
+        val onlineVolume: Float,
+        val sleepEnd: Long,
+        val mode: Int,
+        val smartShuffle: Boolean,
+        val crossfadeMs: Int,
+        val duckAudio: Boolean,
+        val eqEnabled: Boolean,
+        val eq: List<Float>,
+    )
+
+    private var lastPlaybackPrefs: PlaybackPrefsSnapshot? = null
+    private var persistedEntries: List<QueueEntry>? = null
+    private var persistedShuffle: List<String>? = null
+    private var persistedIndex = -1
+    private var persistedContext = ""
     private var lastTick = SystemClock.elapsedRealtime()
-    private var lastSave = 0L
+    private var lastPositionSave = SystemClock.elapsedRealtime()
+    private var lastListeningFlush = SystemClock.elapsedRealtime()
     private var listeningRunning = false
     private val advancing = MutableStateFlow(false)
     private var sleepJob: Job? = null
@@ -250,6 +269,21 @@ class PlaybackEngine(private val g: Graph) {
         )
         scope.launch {
             g.prefs.state.collect { p ->
+                val playbackPrefs =
+                    PlaybackPrefsSnapshot(
+                        master = p.master,
+                        onlineVolume = p.onlineVolume,
+                        sleepEnd = p.sleepEnd,
+                        mode = p.mode,
+                        smartShuffle = p.smartShuffle,
+                        crossfadeMs = p.crossfadeMs,
+                        duckAudio = p.duckAudio,
+                        eqEnabled = p.eqEnabled,
+                        eq = p.eq,
+                    )
+                // skip prefs updates that only touched queue or visual settings so playback state doesn't churn
+                if (playbackPrefs == lastPlaybackPrefs) return@collect
+                lastPlaybackPrefs = playbackPrefs
                 if (p.master != prefsMaster) {
                     master = p.master
                     prefsMaster = p.master
@@ -273,6 +307,13 @@ class PlaybackEngine(private val g: Graph) {
                 if (requestedMode == p.mode) requestedMode = null
                 val smartChanged = smartShuffle != p.smartShuffle
                 smartShuffle = p.smartShuffle
+                if (smartShuffle && !lastPlayedLoaded) {
+                    lastPlayedLoaded = true
+                    lastPlayedByTrack =
+                        withContext(Dispatchers.IO) {
+                            g.dao.trackLastPlayed().associate { it.track to it.lastPlayed }
+                        }
+                }
                 applyPlaybackMode(requestedMode ?: p.mode)
                 if (smartChanged && mode == 2 && local.entries.size > 1) {
                     val previous = upcomingPlaybackQueue(local.entries, local.index, mode, local.shuffleOrder).map { it.id }
@@ -309,17 +350,6 @@ class PlaybackEngine(private val g: Graph) {
             }
         }
         scope.launch {
-            g.dao.observeCounters().collect { counters ->
-                val latest = HashMap<String, Long>()
-                for (c in counters) {
-                    if (c.track.isBlank()) continue
-                    val prev = latest[c.track] ?: 0L
-                    if (c.lastPlayed > prev) latest[c.track] = c.lastPlayed
-                }
-                lastPlayedByTrack = latest
-            }
-        }
-        scope.launch {
             try {
                 val p = g.prefs.loaded.await()
                 val indexed =
@@ -329,7 +359,12 @@ class PlaybackEngine(private val g: Graph) {
                     }
                 // a user selection made during disk loading takes precedence over saved playback
                 if (local.entries.isEmpty()) {
-                    local = restoreQueue(p.queue, indexed)
+                    val restored = restoreQueue(p.queue, indexed)
+                    local = restored.copy(position = g.prefs.loadPosition(restored))
+                    persistedEntries = local.entries
+                    persistedShuffle = local.shuffleOrder
+                    persistedIndex = local.index
+                    persistedContext = local.context
                     restoreLocal(false)
                 }
                 ready.complete(Unit)
@@ -1052,13 +1087,37 @@ class PlaybackEngine(private val g: Graph) {
     }
 
     fun removeTracks(ids: Set<String>) {
+        if (ids.isEmpty()) return
         saveLocal()
         val current = local.entries.getOrNull(local.index)
         if (current?.track?.id !in ids) {
-            for (index in local.entries.indices.reversed()) if (
-                local.entries[index].track.id in ids
-            )
-                removeQueue(index)
+            // batch-remove all matching entries in one pass instead of calling removeQueue() per item
+            val kept = ArrayList<QueueEntry>(local.entries.size)
+            val removedIndices = ArrayList<Int>()
+            var newIndex = local.index
+            for ((i, entry) in local.entries.withIndex()) {
+                if (entry.track.id in ids) {
+                    removedIndices += i
+                    if (i < local.index) newIndex--
+                } else {
+                    kept += entry
+                }
+            }
+            if (removedIndices.isEmpty()) return
+            local = local.copy(entries = kept, index = newIndex.coerceAtLeast(0))
+            changingQueue = true
+            try {
+                if (owner == "music") {
+                    for (i in removedIndices.asReversed()) {
+                        if (i < player.mediaItemCount) player.removeMediaItem(i)
+                    }
+                }
+            } finally {
+                changingQueue = false
+            }
+            refreshQueueOrder()
+            publish()
+            save()
             return
         }
         flushListening()
@@ -1107,9 +1166,28 @@ class PlaybackEngine(private val g: Graph) {
         }
     }
 
+    private fun hasStructuralQueueChange(): Boolean =
+        local.entries !== persistedEntries ||
+            local.shuffleOrder !== persistedShuffle ||
+            local.index != persistedIndex ||
+            local.context != persistedContext
+
+    private fun savePositionOnly() {
+        saveLocal()
+        val entryId = local.entries.getOrNull(local.index)?.id.orEmpty()
+        g.prefs.savePosition(entryId, local.index, local.position)
+    }
+
     private fun save() {
         saveLocal()
         val snapshot = local
+        val entryId = snapshot.entries.getOrNull(snapshot.index)?.id.orEmpty()
+        g.prefs.savePosition(entryId, snapshot.index, snapshot.position)
+        if (!hasStructuralQueueChange()) return
+        persistedEntries = snapshot.entries
+        persistedShuffle = snapshot.shuffleOrder
+        persistedIndex = snapshot.index
+        persistedContext = snapshot.context
         pendingSave?.cancel()
         pendingSave = g.scope.launch {
             delay(250)
@@ -1153,10 +1231,13 @@ class PlaybackEngine(private val g: Graph) {
         accountListening()
         updateTransitionFadeOut()
         val now = SystemClock.elapsedRealtime()
-        if (now - lastSave >= 15000) {
-            lastSave = now
+        if (now - lastPositionSave >= 30000L) {
+            lastPositionSave = now
+            if (hasStructuralQueueChange()) save() else savePositionOnly()
+        }
+        if (now - lastListeningFlush >= 120000L) {
+            lastListeningFlush = now
             flushListening(false)
-            save()
         }
         // only seek/time controls observe position ticks, no whole-screen invalidation
         if (g.foreground.value) publishProgress()
@@ -1166,9 +1247,16 @@ class PlaybackEngine(private val g: Graph) {
         accountListening()
         val session = playSession
         if (session != null && session.heardMs > counted) {
+            lastListeningFlush = SystemClock.elapsedRealtime()
             val added = session.heardMs - counted
             val first = session.qualified && !countedQualified
             if (first) countedQualified = true
+            if (session.qualified && lastPlayedLoaded) {
+                val prev = lastPlayedByTrack[session.track] ?: 0L
+                if (session.playedAt > prev) {
+                    lastPlayedByTrack = lastPlayedByTrack + (session.track to session.playedAt)
+                }
+            }
             counted = session.heardMs
             g.task {
                 g.db.withTransaction {
@@ -1212,6 +1300,11 @@ class PlaybackEngine(private val g: Graph) {
         counted = 0
         sessionOccurrence = null
         local = QueueState()
+        persistedEntries = null
+        persistedShuffle = null
+        persistedIndex = -1
+        persistedContext = ""
+        g.prefs.savePosition("", 0, 0L)
         online = null
         onlinePosition = 0
         owner = "music"

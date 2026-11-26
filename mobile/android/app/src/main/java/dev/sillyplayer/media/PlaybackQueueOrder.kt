@@ -34,13 +34,18 @@ internal fun shuffledQueueOrder(entries: List<QueueEntry>, index: Int,
     return listOf(current) + tail
 }
 
-private fun normalizedArtists(raw: String): Set<String> =
-    splitArtists(raw)
-        .map { it.trim().lowercase(Locale.ROOT) }
-        .filter { it.isNotEmpty() && it != "unknown artist" }
-        .toSet()
+private fun overlaps(a: IntArray, b: IntArray): Boolean {
+    if (a.isEmpty() || b.isEmpty()) return false
+    for (x in a) {
+        for (y in b) {
+            if (x == y) return true
+        }
+    }
+    return false
+}
 
 // spreads out same artist tracks and favors songs that havent played recently
+// uses interned artist ids + fenwick weighted rejection sampling for O(N log N) runtime
 internal fun smartShuffledQueueOrder(
     entries: List<QueueEntry>,
     index: Int,
@@ -51,54 +56,177 @@ internal fun smartShuffledQueueOrder(
 ): List<String> {
     if (entries.isEmpty()) return emptyList()
     val currentEntry = entries[index.coerceIn(entries.indices)]
-    val remaining =
-        entries
-            .filter { it.id != currentEntry.id }
-            .map { entry ->
-                val last = lastPlayedByTrack[entry.trackId] ?: 0L
-                val weight =
-                    if (last <= 0L) 3.0
-                    else {
-                        val ageDays = ((nowMs - last).coerceAtLeast(0L)).toDouble() / 86_400_000.0
-                        1.0 + 1.8 * minOf(1.0, ageDays / 7.0)
-                    }
-                Triple(entry.id, normalizedArtists(entry.track.artist), weight)
-            }
-            .toMutableList()
-    val tail = ArrayList<String>(remaining.size)
-    var prev1 = normalizedArtists(currentEntry.track.artist)
-    var prev2 = emptySet<String>()
-    while (remaining.isNotEmpty()) {
-        val eligible =
-            if (prev1.isEmpty()) remaining.indices.toList()
-            else remaining.indices.filter { idx -> remaining[idx].second.none { it in prev1 } }
-                .ifEmpty { remaining.indices.toList() }
-        val weights = DoubleArray(eligible.size)
-        var total = 0.0
-        for (k in eligible.indices) {
-            val item = remaining[eligible[k]]
-            val penalty = if (prev2.isNotEmpty() && item.second.any { it in prev2 }) 0.35 else 1.0
-            val w = item.third * penalty
-            weights[k] = w
-            total += w
-        }
-        var chosenSlot = eligible.last()
-        if (total > 0.0) {
-            val pick = random.nextDouble() * total
-            var acc = 0.0
-            for (k in eligible.indices) {
-                acc += weights[k]
-                if (pick <= acc) {
-                    chosenSlot = eligible[k]
+    val poolEntries = entries.filter { it.id != currentEntry.id }
+    val n = poolEntries.size
+    if (n == 0) return listOf(currentEntry.id)
+
+    val artistToId = HashMap<String, Int>(n)
+    fun internArtists(raw: String): IntArray {
+        val parts = splitArtists(raw)
+        if (parts.isEmpty()) return IntArray(0)
+        var tmp = IntArray(parts.size)
+        var count = 0
+        for (part in parts) {
+            val key = part.trim().lowercase(Locale.ROOT)
+            if (key.isEmpty() || key == "unknown artist") continue
+            val id = artistToId.getOrPut(key) { artistToId.size }
+            var dup = false
+            for (k in 0 until count) {
+                if (tmp[k] == id) {
+                    dup = true
                     break
                 }
             }
+            if (!dup) tmp[count++] = id
         }
-        val picked = remaining.removeAt(chosenSlot)
-        tail += picked.first
-        prev2 = prev1
-        prev1 = picked.second
+        return if (count == tmp.size) tmp else tmp.copyOf(count)
     }
+
+    val entryIds = Array(n) { poolEntries[it].id }
+    val entryArtists = Array(n) { internArtists(poolEntries[it].track.artist) }
+    val weights = DoubleArray(n)
+    val activePos = IntArray(n) { it }
+    val activeList = IntArray(n) { it }
+    var activeCount = n
+    val bit = DoubleArray(n + 1)
+    var bitTotal = 0.0
+
+    for (i in 0 until n) {
+        val last = lastPlayedByTrack[poolEntries[i].trackId] ?: 0L
+        val w =
+            if (last <= 0L) 3.0
+            else {
+                val ageDays = ((nowMs - last).coerceAtLeast(0L)).toDouble() / 86_400_000.0
+                1.0 + 1.8 * minOf(1.0, ageDays / 7.0)
+            }
+        weights[i] = w
+        bitTotal += w
+    }
+
+    // O(N) fenwick tree build
+    for (i in 1..n) {
+        bit[i] += weights[i - 1]
+        val parent = i + (i and -i)
+        if (parent <= n) bit[parent] += bit[i]
+    }
+
+    var prev1 = internArtists(currentEntry.track.artist)
+    var prev2 = IntArray(0)
+
+    val artistRemaining = IntArray(artistToId.size + 4)
+    for (i in 0 until n) {
+        for (a in entryArtists[i]) artistRemaining[a]++
+    }
+
+    var highestBit = 1
+    while ((highestBit shl 1) <= n) highestBit = highestBit shl 1
+
+    fun bitSample(): Int {
+        if (bitTotal <= 0.0) return activeList[activeCount - 1]
+        var target = random.nextDouble() * bitTotal
+        var idx = 0
+        var step = highestBit
+        while (step > 0) {
+            val next = idx + step
+            if (next <= n && bit[next] < target) {
+                idx = next
+                target -= bit[next]
+            }
+            step = step shr 1
+        }
+        return if (idx < n && activePos[idx] >= 0) idx else activeList[activeCount - 1]
+    }
+
+    fun removeItem(slot: Int) {
+        val w = weights[slot]
+        bitTotal = (bitTotal - w).coerceAtLeast(0.0)
+        var i = slot + 1
+        while (i <= n) {
+            bit[i] -= w
+            i += i and -i
+        }
+        for (a in entryArtists[slot]) artistRemaining[a]--
+        val pos = activePos[slot]
+        val lastSlot = activeList[activeCount - 1]
+        activeList[pos] = lastSlot
+        activePos[lastSlot] = pos
+        activeCount--
+        activePos[slot] = -1
+    }
+
+    val tail = ArrayList<String>(n)
+    while (activeCount > 0) {
+        var chosen = -1
+        var allBlocked = false
+        for (a in prev1) {
+            if (a < artistRemaining.size && artistRemaining[a] >= activeCount) {
+                allBlocked = true
+                break
+            }
+        }
+
+        if (allBlocked) {
+            for (attempt in 0 until 12) {
+                val cand = bitSample()
+                if (!overlaps(entryArtists[cand], prev2) || random.nextDouble() < 0.35) {
+                    chosen = cand
+                    break
+                }
+            }
+        } else {
+            for (attempt in 0 until 16) {
+                val cand = bitSample()
+                if (overlaps(entryArtists[cand], prev1)) continue
+                if (overlaps(entryArtists[cand], prev2) && random.nextDouble() >= 0.35) continue
+                chosen = cand
+                break
+            }
+        }
+
+        if (chosen < 0) {
+            var eligibleTotal = 0.0
+            var anyNonPrev1 = false
+            for (k in 0 until activeCount) {
+                val slot = activeList[k]
+                if (!overlaps(entryArtists[slot], prev1)) {
+                    anyNonPrev1 = true
+                    var w = weights[slot]
+                    if (overlaps(entryArtists[slot], prev2)) w *= 0.35
+                    eligibleTotal += w
+                }
+            }
+            if (!anyNonPrev1) {
+                for (k in 0 until activeCount) {
+                    val slot = activeList[k]
+                    var w = weights[slot]
+                    if (overlaps(entryArtists[slot], prev2)) w *= 0.35
+                    eligibleTotal += w
+                }
+            }
+            chosen = activeList[activeCount - 1]
+            if (eligibleTotal > 0.0) {
+                val pick = random.nextDouble() * eligibleTotal
+                var acc = 0.0
+                for (k in 0 until activeCount) {
+                    val slot = activeList[k]
+                    if (anyNonPrev1 && overlaps(entryArtists[slot], prev1)) continue
+                    var w = weights[slot]
+                    if (overlaps(entryArtists[slot], prev2)) w *= 0.35
+                    acc += w
+                    if (pick <= acc) {
+                        chosen = slot
+                        break
+                    }
+                }
+            }
+        }
+
+        tail += entryIds[chosen]
+        prev2 = prev1
+        prev1 = entryArtists[chosen]
+        removeItem(chosen)
+    }
+
     val old = upcomingPlaybackQueue(entries, index, 2, previous).map { it.id }
     if (tail.size > 1 && listOf(currentEntry.id) + tail == old) tail.add(tail.removeAt(0))
     return listOf(currentEntry.id) + tail

@@ -5,9 +5,9 @@ from pathlib import Path
 from extractor_bundle import install_extractor
 root=Path(__file__).resolve().parents[1];sdk=root/'.deps/windows';qt=sdk/'qt/6.4.2/mingw_64'
 version=re.search(r'project\(SillyPlayer VERSION ([\d.]+)',(root/'CMakeLists.txt').read_text()).group(1)
-stage=root/'build/release/windows/app';release=root/'dist/windows'/version
+stage=root/'build/release/windows/app';release=root/'dist'/f'v{version}'/'windows';sha_dir=root/'dist'/f'v{version}'/'SHAs'
 if stage.exists():shutil.rmtree(stage)
-stage.mkdir(parents=True);release.mkdir(parents=True,exist_ok=True)
+stage.mkdir(parents=True);release.mkdir(parents=True,exist_ok=True);sha_dir.mkdir(parents=True,exist_ok=True)
 search=[sdk/'native/bin',qt/'bin',sdk/'msys/mingw64/bin',sdk/'mpv',Path('/usr/lib/gcc/x86_64-w64-mingw32/13-posix'),Path('/usr/x86_64-w64-mingw32/lib')]
 available={p.name.lower():p for directory in reversed(search) for p in directory.glob('*.dll')}
 system=set('ADVAPI32 AUTHZ AVICAP32 AVRT BCRYPT BCRYPTPRIMITIVES CFGMGR32 COMCTL32 COMDLG32 CRYPT32 CRYPTBASE CREDUI D2D1 D3D9 D3D11 DBGHELP DNSAPI DWRITE DWMAPI DXGI GDI32 GLU32 IMM32 IPHLPAPI KERNEL32 MPR MSIMG32 MSVCRT MSVCP_WIN MSWSOCK NCRYPT NETAPI32 NORMALIZ NTDLL OLE32 OLEACC OLEAUT32 OPENGL32 PATHCCH POWRPROF PROPSYS PSAPI SECUR32 SETUPAPI SHCORE SHELL32 SHLWAPI UCRTBASE URLMON USER32 USERENV UXTHEME VERSION WIN32U WINHTTP WININET WINMM WINSPOOL WINTRUST XMLLITE WLDAP32 CRYPTUI D3DCOMPILER_47 MF MFPLAT MFREADWRITE RTWORKQ WS2_32 WTSAPI32'.lower().split())
@@ -43,8 +43,8 @@ for group,names in {'platforms':['qwindows.dll'],'imageformats':['qjpeg.dll','qs
   copy(source,stage/'plugins'/group/name)
 (stage/'qt.conf').write_text('[Paths]\nPrefix=.\nPlugins=plugins\nQml2Imports=qml\n')
 (stage/'README.txt').write_text('SillyPlayer '+version+'\n\nWindows 10/11 x64. Use the Start menu or desktop shortcut.\nUpdates preserve your library and settings; music stays in its chosen folders.\nExit through the tray menu before updating. The uninstaller does not remove your library or music.\nThis build is not code-signed. Third-party notices: NOTICE.txt.\n')
-notice=['SillyPlayer uses Qt 6.4.2, libmpv, FFmpeg, TagLib, libarchive, OpenSSL, zlib, Deno, yt-dlp and Lucide.\nLibraries remain dynamically replaceable.\nQt source: https://download.qt.io/archive/qt/6.4/6.4.2/submodules/\nlibmpv source/build: https://github.com/shinchiro/mpv-winbuild-cmake/releases/tag/20261021\nFFmpeg 6.1.5: https://ffmpeg.org/releases/ffmpeg-6.1.5.tar.xz\nTagLib 1.13.1: https://taglib.org/releases/taglib-1.13.1.tar.gz\nlibarchive 3.8.2: https://www.libarchive.org/downloads/libarchive-3.8.2.tar.xz\nOpenSSL: https://openssl-library.org/source/\n']
-for name,path in [('LGPLv3','/usr/share/common-licenses/LGPL-3'),('GPLv3','/usr/share/common-licenses/GPL-3'),('LGPLv2.1','/usr/share/common-licenses/LGPL-2.1'),('GPLv2','/usr/share/common-licenses/GPL-2'),('Lucide',root/'assets/icons/LICENSE'),('TagLib',sdk/'src/taglib-1.13.1/COPYING.LGPL'),('libarchive',sdk/'src/libarchive-3.8.2/COPYING'),('OpenSSL',sdk/'msys/mingw64/share/licenses/openssl/LICENSE.txt'),('zlib',sdk/'src/zlib-1.3.1/README'),('LAME',sdk/'src/lame-3.100/COPYING'),('WebP',sdk/'src/libwebp-1.6.0/COPYING'),('Deno',root/'packaging/licenses/Deno.txt'),('yt-dlp',root/'packaging/licenses/yt-dlp.txt')]:
+notice=['SillyPlayer uses Qt 6.4.2, libmpv 0.36.0 (audio-only minimal build), FFmpeg 6.1.5, TagLib, libarchive, OpenSSL, zlib, QuickJS-NG, yt-dlp and Lucide.\nLibraries remain dynamically replaceable.\nQt source: https://download.qt.io/archive/qt/6.4/6.4.2/submodules/\nlibmpv source: https://github.com/mpv-player/mpv/archive/refs/tags/v0.36.0.tar.gz\nFFmpeg 6.1.5: https://ffmpeg.org/releases/ffmpeg-6.1.5.tar.xz\nTagLib 1.13.1: https://taglib.org/releases/taglib-1.13.1.tar.gz\nlibarchive 3.8.2: https://www.libarchive.org/downloads/libarchive-3.8.2.tar.xz\nOpenSSL: https://openssl-library.org/source/\nQuickJS-NG: https://github.com/quickjs-ng/quickjs\n']
+for name,path in [('LGPLv3','/usr/share/common-licenses/LGPL-3'),('GPLv3','/usr/share/common-licenses/GPL-3'),('LGPLv2.1','/usr/share/common-licenses/LGPL-2.1'),('GPLv2','/usr/share/common-licenses/GPL-2'),('Lucide',root/'assets/icons/LICENSE'),('TagLib',sdk/'src/taglib-1.13.1/COPYING.LGPL'),('libarchive',sdk/'src/libarchive-3.8.2/COPYING'),('OpenSSL',sdk/'msys/mingw64/share/licenses/openssl/LICENSE.txt'),('zlib',sdk/'src/zlib-1.3.1/README'),('LAME',sdk/'src/lame-3.100/COPYING'),('WebP',sdk/'src/libwebp-1.6.0/COPYING'),('QuickJS-NG',root/'packaging/licenses/QuickJS.txt'),('yt-dlp',root/'packaging/licenses/yt-dlp.txt')]:
  p=Path(path)
  if p.exists():notice.append('\n===== '+name+' =====\n'+p.read_text(errors='replace'))
 qr=(root/'src/third_party/qrcodegen.hpp').read_text();notice.append(qr[:qr.index('*/')+2])
@@ -62,8 +62,8 @@ lines.append('RMDir "$INSTDIR\\app"');remove.write_text('\n'.join(lines)+'\n')
 installer=release/f'SillyPlayer-{version}-windows-x86_64-setup.exe'
 size=sum(p.stat().st_size for p in files)
 env=dict(os.environ,NSISDIR=str(sdk/'host/usr/share/nsis'))
-subprocess.run([str(sdk/'host/usr/bin/makensis'),'-V2','-DPROJECT='+str(root),'-DPAYLOAD='+str(stage),'-DOUTPUT='+str(installer),'-DREMOVE_FILES='+str(remove),'-DSIZE_KIB='+str((size+1023)//1024),str(root/'packaging/windows/installer.nsi')],env=env,check=True)
-digest=hashlib.sha256(installer.read_bytes()).hexdigest();Path(str(installer)+'.sha256').write_text(digest+'  '+installer.name+'\n')
+subprocess.run([str(sdk/'host/usr/bin/makensis'),'-V2','-DVERSION='+version,'-DPROJECT='+str(root),'-DPAYLOAD='+str(stage),'-DOUTPUT='+str(installer),'-DREMOVE_FILES='+str(remove),'-DSIZE_KIB='+str((size+1023)//1024),str(root/'packaging/windows/installer.nsi')],env=env,check=True)
+digest=hashlib.sha256(installer.read_bytes()).hexdigest();(sha_dir/(installer.name+'.sha256')).write_text(digest+'  '+installer.name+'\n')
 manifest={'version':version,'platform':'Windows 10/11 x64','installer':installer.name,'sha256':digest,'installedBytes':size,'installerBytes':installer.stat().st_size,'files':len(files),'dlls':sorted(copied),'codeSigned':False}
 (root/'build/windows/package-manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
 print(json.dumps(manifest,indent=2))

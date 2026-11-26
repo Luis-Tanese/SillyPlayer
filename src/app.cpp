@@ -144,6 +144,7 @@ App::App(Store *store, const QString &cacheDir, QObject *parent)
   entries = s->setting("queue", QVariantList{}).toList();
   normalQueueOrder = s->setting("queueOrder").toStringList();
   reconcileQueueOrder();
+  savedQueueVersion = queueVersion;
   index = s->setting("queueIndex", -1).toInt();
   m_context = s->setting("queueContext", "Songs").toString();
   m_source = s->setting("queueSource", QVariantMap{}).toMap();
@@ -177,7 +178,13 @@ App::App(Store *store, const QString &cacheDir, QObject *parent)
   youtube.setPauseFade(opts["pauseFadeEnabled"].toBool(), opts["pauseFadeMs"].toInt());
   discord.setLookupCovers(opts["discordRpcLookupCovers"].toBool());
   discord.setUploadCovers(opts["discordRpcUploadCovers"].toBool());
-  discord.setEnabled(opts["discordRpcEnabled"].toBool());
+  if (opts["discordRpcEnabled"].toBool())
+    QTimer::singleShot(1500, this, [this] {
+      if (!closing && settings()["discordRpcEnabled"].toBool()) {
+        discord.setEnabled(true);
+        syncDiscordPresence(true);
+      }
+    });
   // save resolved discord cover urls into the folder mirror too
   connect(&discord, &DiscordRpc::coverResolved, &recovery, &DesktopRecovery::requestSave);
   recovery.inspectFolder(opts["musicDir"].toString());
@@ -201,10 +208,13 @@ App::App(Store *store, const QString &cacheDir, QObject *parent)
 App::~App() { shutdown(); }
 QVariantMap App::settings() const {
   const auto active=index>=0&&index<entries.size()?entries[index].toMap().value("trackId").toString():QString();
-  if(settingsSerial==s->writeSerial() && settingsTrack==active)return settingsSnapshot;
+  if(settingsSerial==s->settingsSerial() && settingsTracksSerial==s->tracksSerial() && settingsTrack==active)return settingsSnapshot;
+  // load all settings in one query instead of 30+ individual selects
+  const auto stored = s->allSettings();
   QVariantMap defaults{
       {"palette", "Catppuccin"},
       {"light", false},
+      {"cropArtwork", true},
       {"pauseFadeEnabled", false},
       {"pauseFadeMs", 300},
       {"crossfadeMs", 0},
@@ -212,7 +222,7 @@ QVariantMap App::settings() const {
       {"speed", 1.0},
       {"nightcore", false},
       {"volume", 70},
-      {"youtubeVolume", s->setting("videoVolume", 70)},
+      {"youtubeVolume", stored.value("videoVolume", 70)},
       {"eqEnabled", false},
       {"eqGains", QVariantList{0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
       {"eqPreset", "Flat"},
@@ -237,7 +247,7 @@ QVariantMap App::settings() const {
        QStandardPaths::writableLocation(QStandardPaths::MusicLocation) +
            "/SillyPlayer"}};
   for (auto it = defaults.begin(); it != defaults.end(); ++it)
-    it.value() = s->setting(it.key(), it.value());
+    if (stored.contains(it.key())) it.value() = stored.value(it.key());
   QVariantList activePresets;
   for (const auto &v : defaults.value("eqCustomPresets").toList()) {
     const auto p = v.toMap();
@@ -251,7 +261,7 @@ QVariantMap App::settings() const {
   const auto track = current();
   defaults["speed"] = track.value("speed", 1.0);
   defaults["nightcore"] = track.value("nightcore", false);
-  settingsSerial=s->writeSerial();settingsTrack=active;settingsSnapshot=defaults;return settingsSnapshot;
+  settingsSerial=s->settingsSerial();settingsTracksSerial=s->tracksSerial();settingsTrack=active;settingsSnapshot=defaults;return settingsSnapshot;
 }
 void App::setSetting(const QString &key, const QVariant &value) {
   if (key == "pauseFadeMs" && (!std::isfinite(value.toDouble()) || value.toDouble()<50 || value.toDouble()>5000)) {
@@ -296,6 +306,63 @@ void App::setSetting(const QString &key, const QVariant &value) {
   }
   if (!QStringList{"windowWidth", "windowHeight", "windowX", "windowY", "windowMaximized", "lastPage", "lastNotifiedUpdate"}.contains(key)) {
     recovery.requestSave();
+  }
+  emit settingsChanged();
+}
+void App::setSettings(const QVariantMap &values) {
+  if (values.isEmpty()) return;
+  if (values.contains("pauseFadeMs")) {
+    const double ms = values.value("pauseFadeMs").toDouble();
+    if (!std::isfinite(ms) || ms < 50 || ms > 5000) {
+      emit error("Pause fade must be between 0.05 and 5.00 seconds");
+      return;
+    }
+  }
+  if (values.contains("crossfadeMs")) {
+    const double ms = values.value("crossfadeMs").toDouble();
+    if (!std::isfinite(ms) || ms < 0 || ms > 8000) {
+      emit error("Transition fade must be between 0 and 8.0 seconds");
+      return;
+    }
+  }
+  // commit multi-key updates in one SQLite transaction and one settingsChanged signal
+  const bool startedTx = s->db().transaction();
+  for (auto it = values.cbegin(); it != values.cend(); ++it)
+    s->setSetting(it.key(), it.value());
+  if (startedTx) s->db().commit();
+
+  if (values.contains("pauseFadeEnabled") || values.contains("pauseFadeMs")) {
+    const auto opts = settings();
+    music.setPauseFade(opts["pauseFadeEnabled"].toBool(), opts["pauseFadeMs"].toInt());
+    youtube.setPauseFade(opts["pauseFadeEnabled"].toBool(), opts["pauseFadeMs"].toInt());
+  }
+  if (values.contains("crossfadeMs"))
+    music.setCrossfadeMs(values.value("crossfadeMs").toInt());
+  if (values.contains("smartShuffle") && m_mode == 2 && !entries.isEmpty()) {
+    rebuildShuffle();
+    emit queueChanged();
+    save();
+  }
+  if (values.contains("pinnedPlaylists") || values.contains("pinnedArtists"))
+    emit collectionsChanged();
+  if (values.contains("discordRpcEnabled")) {
+    discord.setEnabled(values.value("discordRpcEnabled").toBool());
+    syncDiscordPresence(true);
+  }
+  if (values.contains("discordRpcLookupCovers"))
+    discord.setLookupCovers(values.value("discordRpcLookupCovers").toBool());
+  if (values.contains("discordRpcUploadCovers"))
+    discord.setUploadCovers(values.value("discordRpcUploadCovers").toBool());
+  if (values.contains("musicDir"))
+    recovery.recoverFromFolder(values.value("musicDir").toString());
+
+  static const QSet<QString> uiOnlyKeys{"windowWidth", "windowHeight", "windowX", "windowY",
+                                        "windowMaximized", "lastPage", "lastNotifiedUpdate"};
+  for (auto it = values.cbegin(); it != values.cend(); ++it) {
+    if (!uiOnlyKeys.contains(it.key())) {
+      recovery.requestSave();
+      break;
+    }
   }
   emit settingsChanged();
 }
@@ -392,17 +459,21 @@ void App::openReleasePage() {
 }
 QVariantMap App::current() const {
   const auto id=index>=0&&index<entries.size()?entries[index].toMap().value("trackId").toString():QString();
-  if(currentSerial!=s->writeSerial() || currentSnapshotId!=id) {
-    currentSnapshot=id.isEmpty()?QVariantMap{}:library.track(id);currentSnapshotId=id;currentSerial=s->writeSerial();
+  if(currentSerial!=s->tracksSerial() || currentSnapshotId!=id) {
+    currentSnapshot=id.isEmpty()?QVariantMap{}:library.track(id);currentSnapshotId=id;currentSerial=s->tracksSerial();
   }
   return currentSnapshot;
 }
 int App::recentCount() const {
   return std::min(100,s->rows("SELECT COUNT(*) AS n FROM track_listens l JOIN tracks t ON t.id=l.track WHERE t.deleted=0").value(0).toMap().value("n").toInt());
 }
+QString App::recentCover() const {
+  return s->rows("SELECT t.art FROM track_listens l JOIN tracks t ON t.id=l.track WHERE t.deleted=0 AND t.art<>'' ORDER BY l.lastPlayed DESC,t.id LIMIT 1")
+      .value(0).toMap().value("art").toString();
+}
 QVariantList App::queue() const {
   if(entries.isEmpty())return {};
-  if(queueSerial==s->writeSerial() && queueSnapshotIndex==index && queueSnapshotEntries==entries)return queueSnapshot;
+  if(queueSerial==s->tracksSerial() && queueSnapshotIndex==index && queueSnapshotVersion==queueVersion)return queueSnapshot;
   // expand queue occurrences in one indexed join instead of one query per song to avoid unnecessary work
   queueSnapshot=s->rows("SELECT t.*,EXISTS(SELECT 1 FROM likes WHERE track=t.id) AS liked,"
                  "json_extract(e.value,'$.entryId') AS entryId,"
@@ -410,13 +481,14 @@ QVariantList App::queue() const {
                  "FROM json_each(?) e LEFT JOIN tracks t ON t.id=json_extract(e.value,'$.trackId') "
                  "ORDER BY CAST(e.key AS INTEGER)",
                  {index,index,QString::fromUtf8(QJsonDocument::fromVariant(entries).toJson(QJsonDocument::Compact))});
-  queueSerial=s->writeSerial();queueSnapshotIndex=index;queueSnapshotEntries=entries;return queueSnapshot;
+  queueSerial=s->tracksSerial();queueSnapshotIndex=index;queueSnapshotVersion=queueVersion;return queueSnapshot;
 }
 // keep the queue's ordinary occurrence order independently from shuffle
 // song ids are insufficient because a playlist/queue may contain a song twice
 void App::rememberQueueOrder() {
   normalQueueOrder.clear();
   for (const auto &value : entries) normalQueueOrder << value.toMap()["entryId"].toString();
+  markQueueDirty();
 }
 void App::reconcileQueueOrder() {
   QSet<QString> live, seen;
@@ -430,7 +502,10 @@ void App::reconcileQueueOrder() {
     const auto id=value.toMap()["entryId"].toString();
     if (!seen.contains(id)) { retained << id; seen.insert(id); }
   }
-  normalQueueOrder=retained;
+  if (retained != normalQueueOrder) {
+    normalQueueOrder = retained;
+    markQueueDirty();
+  }
 }
 void App::restoreQueueOrder() {
   reconcileQueueOrder();
@@ -442,6 +517,7 @@ void App::restoreQueueOrder() {
   for (const auto &id : normalQueueOrder) ordered << byId.value(id);
   entries=ordered;
   index=playing.isEmpty()?-1:normalQueueOrder.indexOf(playing);
+  markQueueDirty();
 }
 void App::insertedQueueOrder(const QStringList &added,bool next) {
   if (m_mode!=2) { rememberQueueOrder(); return; }
@@ -450,6 +526,7 @@ void App::insertedQueueOrder(const QStringList &added,bool next) {
   int at=next?normalQueueOrder.indexOf(playing)+1:normalQueueOrder.size();
   for (const auto &id : added) normalQueueOrder.insert(at++,id);
   reconcileQueueOrder();
+  markQueueDirty();
 }
 void App::rebuildShuffle() {
   if (m_mode != 2 || entries.isEmpty())
@@ -490,6 +567,7 @@ void App::rebuildShuffle() {
     entries.prepend(playing);
     index = 0;
   }
+  markQueueDirty();
 }
 void App::playTrack(const QString &id, const QVariantList &ids,
                     const QString &context, const QString &collection, const QString &member) {
@@ -644,13 +722,30 @@ QVariantMap App::addTracksToCollection(const QString &collection, const QStringL
     ? (s->setting("allowPlaylistDuplicates", false).toBool() ? QStringLiteral("duplicates") : QStringLiteral("skip"))
     : policy;
   QStringList valid;
-  QSet<QString> seen, videos;
+  QSet<QString> existingTracks, existingVideos, seen, videos;
+  if (liked) {
+    for (const auto &v : s->rows("SELECT track FROM likes"))
+      existingTracks.insert(v.toMap()["track"].toString());
+  } else {
+    for (const auto &v : s->rows("SELECT m.track, t.videoId FROM members m JOIN tracks t ON t.id=m.track WHERE m.collection=?", {collection})) {
+      const auto row = v.toMap();
+      existingTracks.insert(row["track"].toString());
+      const QString vid = row["videoId"].toString();
+      if (!vid.isEmpty()) existingVideos.insert(vid);
+    }
+  }
+  QHash<QString, QString> liveVideoById;
+  for (const auto &v : library.tracks()) {
+    const auto row = v.toMap();
+    liveVideoById.insert(row["id"].toString(), row["videoId"].toString());
+  }
   int duplicates=0, skipped=0;
   for (const auto &id:tracks) {
-    const auto t=library.track(id);
-    if (t.isEmpty() || t.value("deleted").toBool()) {++skipped; continue;}
-    const auto video=t.value("videoId").toString();
-    const bool duplicate=collectionContains(collection,id) || seen.contains(id) || (!liked && !video.isEmpty() && videos.contains(video));
+    auto it = liveVideoById.constFind(id);
+    if (it == liveVideoById.cend()) {++skipped; continue;}
+    const QString &video = it.value();
+    const bool duplicate = existingTracks.contains(id) || seen.contains(id) ||
+        (!liked && !video.isEmpty() && (existingVideos.contains(video) || videos.contains(video)));
     seen.insert(id); if (!video.isEmpty()) videos.insert(video);
     if (duplicate) {
       ++duplicates;
@@ -728,7 +823,7 @@ QVariantMap App::removeMembers(const QString &collection, const QStringList &mem
     if(seen.contains(id)) continue;
     seen.insert(id);
     ok=s->exec("DELETE FROM members WHERE id=? AND collection=?",{id,collection}) && ok;
-    removed+=s->rows("SELECT changes() AS count").first().toMap()["count"].toInt();
+    removed+=s->lastAffected();
   }
   if (!ok || !s->db().commit()) {s->db().rollback(); return {{"status","error"},{"message","Could not remove entries"}};}
   if (removed) emit collectionsChanged();
@@ -739,7 +834,7 @@ QVariantMap App::unlikeTracks(const QStringList &tracks) {
   bool ok=true; int removed=0;
   for(const auto &id:QSet<QString>(tracks.begin(),tracks.end())) {
     ok=s->exec("DELETE FROM likes WHERE track=?",{id}) && ok;
-    removed+=s->rows("SELECT changes() AS count").first().toMap()["count"].toInt();
+    removed+=s->lastAffected();
   }
   if(!ok || !s->db().commit()) {s->db().rollback(); return {{"status","error"},{"message","Could not update Liked Songs"}};}
   if(removed){QVariantMap patches;for(const auto &id:tracks)patches[id]=QVariantMap{{"liked",false}};library.patchTracks(patches);}
@@ -780,6 +875,7 @@ void App::removeTrashedFromQueue(const QStringList &tracks) {
   }
   if(playing) {listening.flush(); music.stop();}
   for(int i=entries.size()-1;i>=0;--i) if(removed.contains(entries[i].toMap().value("trackId").toString())) entries.removeAt(i);
+  markQueueDirty();
   index=-1;
   const auto desired=playing ? following : currentEntry;
   for(int i=0;i<entries.size();++i) if(entries[i].toMap().value("entryId").toString()==desired) index=i;
@@ -807,6 +903,7 @@ void App::removeQueue(const QString &entry) {
       if (i == index)
         return;
       entries.removeAt(i);
+      markQueueDirty();
       if (i < index)
         --index;
       emit queueChanged();
@@ -828,8 +925,10 @@ void App::moveQueue(int from, int to) {
   save();
 }
 void App::clearUpcoming() {
+  if (entries.size() <= index + 1) return;
   while (entries.size() > index + 1)
     entries.removeLast();
+  markQueueDirty();
   emit queueChanged();
   save();
 }
@@ -843,14 +942,17 @@ void App::like(const QString &id) {
   else emit error("Could not save Liked Songs");
 }
 QVariantList App::collections() const {
-  if(collectionSerial==s->catalogueSerial())return collectionSnapshot;
+  if(collectionSerial==s->catalogueSerial() && collectionSettingsSerial==s->settingsSerial())return collectionSnapshot;
   const QStringList pinnedPlaylistsList = s->setting("pinnedPlaylists").toStringList();
   const QStringList pinnedArtistsList = s->setting("pinnedArtists").toStringList();
   const QSet<QString> pinnedPlaylists(pinnedPlaylistsList.begin(), pinnedPlaylistsList.end());
   const QSet<QString> pinnedArtists(pinnedArtistsList.begin(), pinnedArtistsList.end());
 
   QVariantList rawCollections = s->rows(
-      "SELECT c.*,COUNT(CASE WHEN mt.deleted=0 THEN m.id END) AS count,COALESCE(NULLIF(c.art,''),(SELECT t.art "
+      "SELECT c.*,c.rowid AS sortOrder,COUNT(CASE WHEN mt.deleted=0 THEN m.id END) AS count,"
+      "COALESCE(SUM(CASE WHEN mt.deleted=0 THEN mt.duration ELSE 0 END),0) AS totalDuration,"
+      "COALESCE(MAX(CASE WHEN mt.deleted=0 THEN mt.added ELSE 0 END),0) AS latestAdded,"
+      "COALESCE(NULLIF(c.art,''),(SELECT t.art "
       "FROM members mm JOIN tracks t ON t.id=mm.track WHERE mm.collection=c.id "
       "AND t.deleted=0 AND t.art<>'' ORDER BY mm.position LIMIT 1),'') AS cover FROM "
       "collections c LEFT JOIN members m ON m.collection=c.id LEFT JOIN tracks mt ON mt.id=m.track GROUP BY c.id "
@@ -868,7 +970,7 @@ QVariantList App::collections() const {
   out.append(pinnedPlaylistRows);
   out.append(regularCollectionRows);
 
-  // group generated albums by album title so featuring artists dont split one album into duplicates
+  // build generated albums and artists in a single pass over cached tracks so splitArtists runs once per track
   struct AlbumBucket {
     QString title;
     int count = 0;
@@ -878,25 +980,38 @@ QVariantList App::collections() const {
     QHash<QString, int> artistHits;
     QHash<QString, QString> artistDisplay;
   };
+  struct ArtistBucket { QString name; int count = 0; QString cover; };
   QHash<QString, AlbumBucket> albumBuckets;
-  for (const auto &v : s->rows("SELECT album,albumArtist,artist,art FROM tracks WHERE deleted=0 AND TRIM(album)<>''")) {
+  QHash<QString, ArtistBucket> artistBuckets;
+  for (const auto &v : library.tracks()) {
     const auto row = v.toMap();
-    const QString albumName = row["album"].toString().trimmed();
-    const QString key = albumName.toLower();
-    auto &b = albumBuckets[key];
-    if (b.title.isEmpty()) b.title = albumName;
-    b.count++;
     const QString cover = row["art"].toString();
-    if (b.cover.isEmpty() && !cover.isEmpty()) b.cover = cover;
-    const QString aa = row["albumArtist"].toString().trimmed();
-    if (!aa.isEmpty()) {
-      b.albumArtists.insert(aa.toLower());
-      if (b.firstAlbumArtist.isEmpty()) b.firstAlbumArtist = aa;
+    const QString artistRaw = row["artist"].toString();
+    const QStringList artists = artistRaw.trimmed().isEmpty() ? QStringList{} : splitArtists(artistRaw);
+    const QString albumName = row["album"].toString().trimmed();
+    if (!albumName.isEmpty()) {
+      const QString key = albumName.toLower();
+      auto &b = albumBuckets[key];
+      if (b.title.isEmpty()) b.title = albumName;
+      b.count++;
+      if (b.cover.isEmpty() && !cover.isEmpty()) b.cover = cover;
+      const QString aa = row["albumArtist"].toString().trimmed();
+      if (!aa.isEmpty()) {
+        b.albumArtists.insert(aa.toLower());
+        if (b.firstAlbumArtist.isEmpty()) b.firstAlbumArtist = aa;
+      }
+      for (const auto &artistName : artists) {
+        const QString ak = artistName.toLower();
+        b.artistHits[ak]++;
+        if (!b.artistDisplay.contains(ak)) b.artistDisplay.insert(ak, artistName);
+      }
     }
-    for (const auto &artistName : splitArtists(row["artist"].toString())) {
-      const QString ak = artistName.toLower();
-      b.artistHits[ak]++;
-      if (!b.artistDisplay.contains(ak)) b.artistDisplay.insert(ak, artistName);
+    for (const auto &artistName : artists) {
+      const QString key = artistName.toLower();
+      auto &bucket = artistBuckets[key];
+      if (bucket.name.isEmpty()) bucket.name = artistName;
+      bucket.count++;
+      if (bucket.cover.isEmpty() && !cover.isEmpty()) bucket.cover = cover;
     }
   }
   QVariantList albumRows;
@@ -929,19 +1044,6 @@ QVariantList App::collections() const {
   });
   out.append(albumRows);
 
-  struct ArtistBucket { QString name; int count = 0; QString cover; };
-  QHash<QString, ArtistBucket> artistBuckets;
-  for (const auto &v : s->rows("SELECT artist,art FROM tracks WHERE deleted=0 AND TRIM(artist)<>''")) {
-    const auto row = v.toMap();
-    const auto cover = row["art"].toString();
-    for (const auto &artistName : splitArtists(row["artist"].toString())) {
-      const QString key = artistName.toLower();
-      auto &bucket = artistBuckets[key];
-      if (bucket.name.isEmpty()) bucket.name = artistName;
-      bucket.count++;
-      if (bucket.cover.isEmpty() && !cover.isEmpty()) bucket.cover = cover;
-    }
-  }
   QVariantList artistRows;
   artistRows.reserve(artistBuckets.size());
   for (auto it = artistBuckets.cbegin(); it != artistBuckets.cend(); ++it) {
@@ -960,7 +1062,7 @@ QVariantList App::collections() const {
     return ma["name"].toString().compare(mb["name"].toString(), Qt::CaseInsensitive) < 0;
   });
   out.append(artistRows);
-  collectionSnapshot=out;collectionSerial=s->catalogueSerial();return collectionSnapshot;
+  collectionSnapshot=out;collectionSerial=s->catalogueSerial();collectionSettingsSerial=s->settingsSerial();return collectionSnapshot;
 }
 QVariantList App::collectionTracks(const QString &id) const {
   if(id=="recent") return listening.recentTracks();
@@ -971,7 +1073,8 @@ QVariantList App::collectionTracks(const QString &id) const {
   if (id.startsWith("artist:")) {
     const QString target = id.mid(7).trimmed().toLower();
     QVariantList matched;
-    for (const auto &v : s->rows("SELECT t.*,EXISTS(SELECT 1 FROM likes WHERE track=t.id) AS liked FROM tracks t WHERE deleted=0 ORDER BY title COLLATE NOCASE,added")) {
+    // pre-filter in SQL before splitting multi-artist strings
+    for (const auto &v : s->rows("SELECT t.*,EXISTS(SELECT 1 FROM likes WHERE track=t.id) AS liked FROM tracks t WHERE deleted=0 AND INSTR(LOWER(artist),?)>0 ORDER BY title COLLATE NOCASE,added", {target})) {
       const auto row = v.toMap();
       for (const auto &artistName : splitArtists(row["artist"].toString())) {
         if (artistName.toLower() == target) {
@@ -1226,7 +1329,7 @@ QVariantMap App::clearMusicFolder(const QString &folderPath) {
   }
   static const QSet<QString> audioExts{"mp3", "flac", "ogg", "oga", "opus",
                                        "m4a", "aac",  "wav", "webm", "mp4"};
-  QStringList trashedPaths;
+  QSet<QString> trashedPaths;
   QStringList failedFiles;
   QDirIterator it(cleanTarget, QDir::Files, QDirIterator::Subdirectories);
   while (it.hasNext()) {
@@ -1236,7 +1339,7 @@ QVariantMap App::clearMusicFolder(const QString &folderPath) {
       continue;
     QFile file(path);
     if (file.moveToTrash())
-      trashedPaths << QDir::cleanPath(fi.absoluteFilePath());
+      trashedPaths.insert(QDir::cleanPath(fi.absoluteFilePath()));
     else
       failedFiles << fi.fileName() + ": " + file.errorString();
   }
@@ -1312,6 +1415,8 @@ QVariantMap App::resetDesktopLibrary(bool removeCachedMedia) {
   online.resetJobs();
   entries.clear();
   normalQueueOrder.clear();
+  markQueueDirty();
+  savedQueueVersion = quint64(-1);
   index = -1;
   m_context = "Songs";
   m_source = {{"kind", "songs"}, {"id", ""}, {"name", "Songs"}};
@@ -1367,7 +1472,8 @@ QVariantMap App::resetDesktopLibrary(bool removeCachedMedia) {
       QDir(cache + "/" + sub).removeRecursively();
     }
   }
-  currentSerial = collectionSerial = queueSerial = settingsSerial = quint64(-1);
+  currentSerial = collectionSerial = collectionSettingsSerial = queueSerial = settingsSerial = quint64(-1);
+  queueSnapshotVersion = quint64(-1);
   savedPlayback.clear();
   listening.resetState();
   sync.resetLocalState();
@@ -1394,6 +1500,7 @@ void App::forgetRemovedTrack(const QString &id) {
   }
   if (playing) music.stop();
   for (int i=entries.size()-1;i>=0;--i) if (entries[i].toMap().value("trackId").toString()==id) entries.removeAt(i);
+  markQueueDirty();
   index = -1;
   if (!playing) for (int i=0;i<entries.size();++i) if (entries[i].toMap().value("entryId").toString()==currentEntry) index=i;
   if (playing && !entries.isEmpty()) {
@@ -1575,14 +1682,19 @@ void App::openTrash() {
   if (!QDesktopServices::openUrl(QUrl("trash:///"))) emit error("Could not open the system Trash");
 #endif
 }
+void App::previewEq(bool enabled, const QVariantList &gains) {
+  music.setEq(enabled, gains);
+}
 void App::applyEq(bool enabled, const QVariantList &gains, const QString &preset) {
   music.setEq(enabled, gains);
   const qint64 now = QDateTime::currentMSecsSinceEpoch();
   const qint64 stamp = qMax(now, s->setting("eqStateUpdatedAt", 0).toLongLong() + 1);
+  const bool startedTx = s->db().transaction();
   s->setSetting("eqEnabled", enabled);
   s->setSetting("eqGains", gains);
   if (!preset.isEmpty()) s->setSetting("eqPreset", preset);
   s->setSetting("eqStateUpdatedAt", stamp);
+  if (startedTx) s->db().commit();
   recovery.requestSave();
   emit settingsChanged();
 }
@@ -1662,17 +1774,33 @@ QString App::time(double value) const {
          QString::number(n % 60).rightJustified(2, '0');
 }
 void App::save() {
-  if(savedPlayback.value("queue").toList()!=entries) reconcileQueueOrder();
-  const QVariantMap snapshot{{"queue",entries},{"queueOrder",normalQueueOrder},
-      {"mode",m_mode},{"queueIndex",index},{"queueContext",m_context},{"queueSource",m_source},
-      {"position",music.position()},{"volume",music.volume()},{"youtubeVolume",youtube.volume()}};
+  const bool queueChangedFlag = (savedQueueVersion != queueVersion);
+  if (queueChangedFlag) reconcileQueueOrder();
+  QVariantMap scalarSnapshot{
+      {"mode", m_mode},
+      {"queueIndex", index},
+      {"queueContext", m_context},
+      {"queueSource", m_source},
+      {"position", music.position()},
+      {"volume", music.volume()},
+      {"youtubeVolume", youtube.volume()}};
   QVariantMap updates;
-  for(auto it=snapshot.cbegin();it!=snapshot.cend();++it)
-    if(!savedPlayback.contains(it.key()) || savedPlayback.value(it.key())!=it.value())updates.insert(it.key(),it.value());
-  if(updates.isEmpty())return;
-  s->db().transaction();
-  for(auto it=updates.cbegin();it!=updates.cend();++it)s->setSetting(it.key(),it.value());
-  if(s->db().commit())savedPlayback=snapshot;
+  if (queueChangedFlag) {
+    updates.insert("queue", entries);
+    updates.insert("queueOrder", normalQueueOrder);
+  }
+  for (auto it = scalarSnapshot.cbegin(); it != scalarSnapshot.cend(); ++it)
+    if (!savedPlayback.contains(it.key()) || savedPlayback.value(it.key()) != it.value())
+      updates.insert(it.key(), it.value());
+  if (updates.isEmpty()) return;
+  const bool startedTx = s->db().transaction();
+  for (auto it = updates.cbegin(); it != updates.cend(); ++it)
+    s->setSetting(it.key(), it.value());
+  if (!startedTx || s->db().commit()) {
+    for (auto it = scalarSnapshot.cbegin(); it != scalarSnapshot.cend(); ++it)
+      savedPlayback.insert(it.key(), it.value());
+    if (queueChangedFlag) savedQueueVersion = queueVersion;
+  }
 }
 void App::shutdown() {
   if (closing)
@@ -1680,6 +1808,7 @@ void App::shutdown() {
   closing = true;
   saver.stop();
   updateTimer.stop();
+  library.requestStop();
   discord.shutdown();
   sync.shutdown();
   sleepTimer.cancel();

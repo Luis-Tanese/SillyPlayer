@@ -19,7 +19,7 @@ done
 for item in sillyplayer bin/sillyplayer bin/qt.conf lib qml plugins assets/sillyplayer.png; do
   [[ -e "$source_dir/$item" ]] || { printf 'Incomplete release: missing %s.\n' "$item" >&2; exit 1; }
 done
-[[ -x "$source_dir/sillyplayer" && -x "$source_dir/bin/sillyplayer" ]] || { printf 'Release launchers are not executable. Extract the ZIP preserving permissions.\n' >&2; exit 1; }
+[[ -x "$source_dir/sillyplayer" && -x "$source_dir/bin/sillyplayer" ]] || { printf 'Release launchers are not executable. Extract the archive preserving permissions.\n' >&2; exit 1; }
 if [[ -e "$target" && ! -d "$target" ]] || [[ -L "$target" ]]; then
   printf 'Installation path must be a normal directory: %s\n' "$target" >&2
   exit 1
@@ -92,8 +92,11 @@ mv -Tf -- "$stage/launcher" "$launcher"
 mv -Tf -- "$stage/icon" "$icon"
 mv -f -- "$stage/desktop" "$desktop"
 committed=true
-# Retire the incorrectly sized icon installed by older releases.
+# Retire the incorrectly sized icon and any stale staging dirs left by interrupted older installs.
 rm -f -- "$install_root/share/icons/hicolor/256x256/apps/sillyplayer.png" || true
+for stale in "$install_root/opt"/.sillyplayer-stage.*; do
+  [[ -d "$stale" && "$stale" != "$stage" ]] && rm -rf -- "$stale" || true
+done
 if command -v gtk-update-icon-cache >/dev/null; then gtk-update-icon-cache -f -t "$install_root/share/icons/hicolor" >/dev/null 2>&1 || true; fi
 if command -v update-desktop-database >/dev/null; then update-desktop-database "$install_root/share/applications" >/dev/null 2>&1 || true; fi
 if [[ "$updating" == true ]]; then

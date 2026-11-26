@@ -13,7 +13,12 @@ fun sourceThumbnail(raw: String, youtubeId: String): String {
 }
 
 fun thumbnailCandidates(source: String, youtubeId: String = ""): List<String> {
-    val url = source.trim().let { if (it.startsWith("//")) "https:$it" else it }
+    val trimmed = source.trim()
+    // fast path for local file/content artwork URIs (skip protocol-relative // URLs)
+    if (youtubeId.isEmpty() && (trimmed.startsWith("file:") || trimmed.startsWith("content:") || (trimmed.startsWith("/") && !trimmed.startsWith("//")))) {
+        return listOf(trimmed)
+    }
+    val url = if (trimmed.startsWith("//")) "https:$trimmed" else trimmed
     val id = youtubeImage.find(url)?.groupValues?.get(1) ?: youtubeId
     if (videoId.matches(id)) {
         val base = "https://i.ytimg.com/vi/$id"

@@ -29,11 +29,13 @@ int memoryCost(const QVariant &value,int depth=0) {
 }
 ExtractionService::ExtractionService(QObject *parent) : QObject(parent) {
   clock.start(); expiry.setInterval(5000);
-  connect(&expiry,&QTimer::timeout,this,&ExtractionService::pruneExpired); expiry.start();
+  // run expiry timer only while cached extractions exist
+  connect(&expiry,&QTimer::timeout,this,&ExtractionService::pruneExpired);
 }
 void ExtractionService::pruneExpired() {
   const auto now=QDateTime::currentMSecsSinceEpoch();
   for(const auto &key:cache.keys()) {auto entry=cache.object(key);if(entry && (entry->until<=now || clock.elapsed()-entry->inserted>=120000))cache.remove(key);}
+  if (cache.isEmpty() && expiry.isActive()) expiry.stop();
 }
 ExtractionService::~ExtractionService() { shutdown(); }
 QString ExtractionService::key(const QString &input) {
@@ -180,6 +182,7 @@ void ExtractionService::finish(const QString &k, const QVariantMap &d, const QSt
       if (cache.size() >= 32) cache.remove(cache.keys().last());
       cache.insert(k.startsWith("verified:") ? k.mid(9) : k,
                    new Cached{d, until, clock.elapsed()}, qMax(1, int(bytes)));
+      if (!expiry.isActive()) expiry.start();
     }
   }
   for (auto token : operation.consumers) deliver(token, d, error, false);

@@ -59,8 +59,9 @@ internal fun isNewerVersion(latestTag: String, currentVersion: String): Boolean 
 
 class UpdateChecker(private val g: Graph) {
     val state = MutableStateFlow(UpdateState())
+    // share the app OkHttp connection pool and dispatcher instead of spinning up a separate client
     private val http =
-        OkHttpClient.Builder()
+        g.online.http.newBuilder()
             .connectTimeout(10, TimeUnit.SECONDS)
             .readTimeout(10, TimeUnit.SECONDS)
             .build()

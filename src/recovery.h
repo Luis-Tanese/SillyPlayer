@@ -37,13 +37,19 @@ private:
   std::function<QString()> folderProvider;
   std::function<bool()> busyGuard;
   QString m_status;
+  QString inspectedFolder;
   qint64 m_lastSaved = 0;
   int newestSlot = -1;
   bool m_saving = false;
+  bool saveAgain = false;
   bool closing = false;
   QTimer debounce;
   QFutureWatcher<QVariantMap> worker;
 
   QVariantMap saveInternal(bool allowEmpty, bool createMissingDir);
-  static QVariantMap readMeta(const QString &dbFile);
+  void startAsyncSave();
+  static QVariantMap runSnapshotWorker(const QString &sourceDbPath, const QString &folder,
+                                       int prevSlot, qint64 prevSaved, bool allowEmpty,
+                                       bool createMissingDir);
+  static QVariantMap readMeta(const QString &dbFile, bool verifyIntegrity = true);
 };

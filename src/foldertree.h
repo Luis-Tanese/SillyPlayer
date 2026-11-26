@@ -70,16 +70,21 @@ inline QVariantMap buildFolderView(const QVariantList &tracks,
   }
 
   // make sure standalone imported tracks or downloads outside watched roots still show up
+  QSet<QString> seenRoots(candidateRoots.begin(), candidateRoots.end());
   for (const auto &item : items) {
     bool covered = false;
     for (const auto &r : candidateRoots) {
       if (pathIsWithinFolder(item.dir, r)) { covered = true; break; }
     }
     if (!covered && !cleanMusicDir.isEmpty() && pathIsWithinFolder(item.dir, cleanMusicDir)) {
-      candidateRoots << cleanMusicDir;
+      if (!seenRoots.contains(cleanMusicDir)) {
+        seenRoots.insert(cleanMusicDir);
+        candidateRoots << cleanMusicDir;
+      }
       covered = true;
     }
-    if (!covered && !candidateRoots.contains(item.dir)) {
+    if (!covered && !seenRoots.contains(item.dir)) {
+      seenRoots.insert(item.dir);
       candidateRoots << item.dir;
     }
   }

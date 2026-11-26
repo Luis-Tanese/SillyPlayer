@@ -116,8 +116,8 @@ class OnlineRepository(private val g: Graph) {
             )
         )
     val collection = MutableStateFlow<CollectionState?>(null)
-    val jobs = g.dao.observeJobs().stateIn(g.scope, SharingStarted.Eagerly, emptyList())
-    val history = g.dao.observeSearches().stateIn(g.scope, SharingStarted.Eagerly, emptyList())
+    val jobs = g.dao.observeJobs().stateIn(g.scope, SharingStarted.WhileSubscribed(5000), emptyList())
+    val history = g.dao.observeSearches().stateIn(g.scope, SharingStarted.WhileSubscribed(5000), emptyList())
     val resolving = MutableStateFlow(false)
     val opened = MutableStateFlow<Source?>(null)
     private val pages = mutableMapOf<String, Page?>()
@@ -130,8 +130,9 @@ class OnlineRepository(private val g: Graph) {
     private val transport = ExtractorTransport(http)
     private val catalogue = Mutex()
 
+    @Volatile private var newPipeReady = false
+
     init {
-        NewPipe.init(transport)
         g.task {
             for (job in g.dao.jobs()) if (
                 job.state in listOf("Active", "Resolving", "Post-processing")
@@ -142,8 +143,20 @@ class OnlineRepository(private val g: Graph) {
         }
     }
 
-    private fun service(provider: String): StreamingService =
-        NewPipe.getService(if (provider == "soundcloud") "SoundCloud" else "YouTube")
+    private fun ensureNewPipe() {
+        if (newPipeReady) return
+        synchronized(this) {
+            if (!newPipeReady) {
+                NewPipe.init(transport)
+                newPipeReady = true
+            }
+        }
+    }
+
+    private fun service(provider: String): StreamingService {
+        ensureNewPipe()
+        return NewPipe.getService(if (provider == "soundcloud") "SoundCloud" else "YouTube")
+    }
 
     private fun row(item: StreamInfoItem, provider: String) =
         Source(

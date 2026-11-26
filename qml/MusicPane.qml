@@ -19,10 +19,12 @@ Item {
     property bool collectionSortAsc: true
     property int artistSortIndex: 0
     property bool artistSortAsc: true
+    property int playlistTabSortIndex: 0
+    property bool playlistTabSortAsc: true
     property bool pendingSongsTop: false
     property bool pendingCollectionsTop: false
     property var selectedCollection: {
-        let observed = revision;
+        let observed = collectionsRevision;
         return collectionId ? app.collections.find(c => c.id === collectionId) || ({}) : ({});
     }
     property bool editable: !!selectedCollection.id && !["generated", "artist"].includes(selectedCollection.kind)
@@ -34,6 +36,8 @@ Item {
     onCollectionSortAscChanged: { pendingSongsTop = true; }
     onArtistSortIndexChanged: { pendingCollectionsTop = true; }
     onArtistSortAscChanged: { pendingCollectionsTop = true; }
+    onPlaylistTabSortIndexChanged: { pendingCollectionsTop = true; }
+    onPlaylistTabSortAscChanged: { pendingCollectionsTop = true; }
     property bool selectionMode: false
     property var selectedKeys: ({})
     property string selectionAnchor: ""
@@ -81,8 +85,11 @@ Item {
         return true;
     }
     onVisibleTracksChanged: {
-        let keys = ({}); orderedTracks.forEach(t => { if (selectedKeys[rowKey(t)]) keys[rowKey(t)] = true; });
-        selectedKeys = keys;
+        if (Object.keys(selectedKeys).length > 0) {
+            let keys = ({});
+            orderedTracks.forEach(t => { if (selectedKeys[rowKey(t)]) keys[rowKey(t)] = true; });
+            selectedKeys = keys;
+        }
         cancelReorder();
     }
     property string dragMember: ""
@@ -126,11 +133,16 @@ Item {
         }
     }
 
-    property int revision: 0
+    property int songsRevision: 0
+    property int collectionsRevision: 0
     property int likedCount: library.likedCount
     property int recentCount: app.recentCount
     property string appliedQuery: ""
     property var tracksById: ({})
+    readonly property var textCollator: (typeof Intl !== "undefined" && Intl.Collator) ? new Intl.Collator(undefined, { sensitivity: "base" }) : null
+    function compareText(a, b) {
+        return textCollator ? textCollator.compare(a || "", b || "") : (a || "").localeCompare(b || "");
+    }
     onOrderedTracksChanged: {
         const lookup = {};
         for(const row of orderedTracks) {
@@ -141,55 +153,70 @@ Item {
     }
     Timer { id: searchDelay; interval: 120; onTriggered: pane.appliedQuery = filter.text.toLowerCase() }
     property var orderedTracks: {
-        let observed = revision;
+        let observed = songsRevision;
         let dir = songSortAsc ? 1 : -1;
         let list = (collectionId ? app.collectionTracks(collectionId) : library.tracks).slice();
         if (!collectionId) {
+            // SQLite already returns Songs ordered by added DESC, title COLLATE NOCASE
             if (songSortIndex === 1)
-                list.sort((a, b) => dir * (a.title || "").localeCompare(b.title || ""));
+                list.sort((a, b) => dir * compareText(a.title, b.title));
             else if (songSortIndex === 2)
-                list.sort((a, b) => (dir * (a.artist || "").localeCompare(b.artist || "")) || (a.title || "").localeCompare(b.title || ""));
+                list.sort((a, b) => (dir * compareText(a.artist, b.artist)) || compareText(a.title, b.title));
             else if (songSortIndex === 3)
-                list.sort((a, b) => (dir * ((a.duration || 0) - (b.duration || 0))) || (a.title || "").localeCompare(b.title || ""));
-            else
-                list.sort((a, b) => (dir * ((a.added || 0) - (b.added || 0))) || (a.title || "").localeCompare(b.title || ""));
+                list.sort((a, b) => (dir * ((a.duration || 0) - (b.duration || 0))) || compareText(a.title, b.title));
+            else if (songSortAsc)
+                list.sort((a, b) => (dir * ((a.added || 0) - (b.added || 0))) || compareText(a.title, b.title));
         } else {
             let cdir = collectionSortAsc ? 1 : -1;
             if (collectionSortIndex === 1)
-                list.sort((a, b) => (cdir * ((a.added || 0) - (b.added || 0))) || (a.title || "").localeCompare(b.title || ""));
+                list.sort((a, b) => (cdir * ((a.added || 0) - (b.added || 0))) || compareText(a.title, b.title));
             else if (collectionSortIndex === 2)
-                list.sort((a, b) => cdir * (a.title || "").localeCompare(b.title || ""));
+                list.sort((a, b) => cdir * compareText(a.title, b.title));
             else if (collectionSortIndex === 3)
-                list.sort((a, b) => (cdir * (a.artist || "").localeCompare(b.artist || "")) || (a.title || "").localeCompare(b.title || ""));
+                list.sort((a, b) => (cdir * compareText(a.artist, b.artist)) || compareText(a.title, b.title));
             else if (collectionSortIndex === 4)
-                list.sort((a, b) => (cdir * ((a.duration || 0) - (b.duration || 0))) || (a.title || "").localeCompare(b.title || ""));
+                list.sort((a, b) => (cdir * ((a.duration || 0) - (b.duration || 0))) || compareText(a.title, b.title));
             else if (!collectionSortAsc)
                 list.reverse();
         }
         // keep a plain JS snapshot so field patches remain available when a later search/sort rebuilds the view, without invalidating that view now
         return list.map(row => Object.assign({},row));
     }
-    property var visibleTracks: orderedTracks.filter(t => !appliedQuery || ((t.title || "") + " " + (t.artist || "") + " " + (t.album || "")).toLowerCase().includes(appliedQuery))
-    property var matchingCollections: visibleCollections.filter(c => c.name.toLowerCase().includes(collectionFilter.text.toLowerCase()))
+    property var visibleTracks: !appliedQuery ? orderedTracks : orderedTracks.filter(t => ((t.title || "") + " " + (t.artist || "") + " " + (t.album || "")).toLowerCase().includes(appliedQuery))
+    property var matchingCollections: !collectionFilter.text ? visibleCollections : visibleCollections.filter(c => c.name.toLowerCase().includes(collectionFilter.text.toLowerCase()))
     property var pinnedMatchingPlaylists: tab === "Playlists" && !collectionId ? matchingCollections.filter(c => !!c.pinned) : []
     property var listCollections: tab === "Playlists" && !collectionId ? matchingCollections.filter(c => !c.pinned) : matchingCollections
     property var visibleCollections: {
-        let observed = revision;
-        if(tab === "Songs" || tab === "Folders" || collectionId)return [];
+        let observed = collectionsRevision;
+        if (tab === "Songs" || tab === "Folders") return [];
         let list = app.collections.filter(c => tab === "Playlists" ? c.kind === "playlist" : c.kind === (tab === "Artists" ? "artist" : albumView === "Generated" ? "generated" : "custom")).slice();
-        if (tab === "Artists") {
+        if (tab === "Playlists") {
+            let dir = playlistTabSortAsc ? 1 : -1;
+            list.sort((a, b) => {
+                if (!!a.pinned !== !!b.pinned) return a.pinned ? -1 : 1;
+                if (playlistTabSortIndex === 1)
+                    return dir * compareText(a.name, b.name);
+                if (playlistTabSortIndex === 2)
+                    return (dir * ((a.count || 0) - (b.count || 0))) || compareText(a.name, b.name);
+                if (playlistTabSortIndex === 3)
+                    return (dir * ((a.totalDuration || 0) - (b.totalDuration || 0))) || compareText(a.name, b.name);
+                if (playlistTabSortIndex === 4)
+                    return (dir * ((a.latestAdded || 0) - (b.latestAdded || 0))) || compareText(a.name, b.name);
+                return dir * ((a.sortOrder || 0) - (b.sortOrder || 0));
+            });
+        } else if (tab === "Artists") {
             let dir = artistSortAsc ? 1 : -1;
             list.sort((a, b) => {
                 if (!!a.pinned !== !!b.pinned) return a.pinned ? -1 : 1;
                 if (artistSortIndex === 1)
-                    return (dir * ((a.count || 0) - (b.count || 0))) || (a.name || "").localeCompare(b.name || "");
-                return dir * (a.name || "").localeCompare(b.name || "");
+                    return (dir * ((a.count || 0) - (b.count || 0))) || compareText(a.name, b.name);
+                return dir * compareText(a.name, b.name);
             });
         }
         return list;
     }
     property var folderData: {
-        let observed = revision;
+        let observed = collectionsRevision;
         if (tab !== "Folders" || collectionId) return ({ path: "", name: "Folders", parentPath: "", breadcrumbs: [], folders: [], tracks: [], allTracks: [] });
         return app.folderView(folderPath);
     }
@@ -206,19 +233,25 @@ Item {
     Connections {
         target: app
         function onCollectionsChanged() {
-            pane.revision++;
+            pane.collectionsRevision++;
+            // only rebuild song list when viewing a collection, not on the Songs tab
+            if (pane.collectionId) pane.songsRevision++;
         }
-        function onRecentChanged() { if(pane.collectionId === "recent") pane.revision++; }
+        function onRecentChanged() { if(pane.collectionId === "recent") pane.songsRevision++; }
     }
     Connections {
         target: library
+        function onChanged() {
+            pane.collectionsRevision++;
+            pane.songsRevision++;
+        }
         function onTracksUpdated(patches) {
             for(const id in patches)for(const row of pane.tracksById[id] || [])Object.assign(row,patches[id]);
             songModel.patchTracks(patches);
             // membership changes affect Liked Songs only
             // ordinary song lists, artist/album groups and the saved playback queue keep their order
             if(pane.collectionId === "liked") {
-                for(const id in patches)if(patches[id].liked !== undefined){pane.revision++;break;}
+                for(const id in patches)if(patches[id].liked !== undefined){pane.songsRevision++;break;}
             }
         }
     }
@@ -431,6 +464,34 @@ Item {
                 Layout.alignment: Qt.AlignVCenter
             }
             AppCombo {
+                id: playlistTabSortCombo
+                objectName: "playlistTabSort"
+                visible: pane.tab === "Playlists"
+                model: ["Default order", "Name", "Songs", "Duration", "Recently updated"]
+                currentIndex: pane.playlistTabSortIndex
+                Layout.minimumWidth: 148
+                Layout.preferredWidth: 162
+                Layout.preferredHeight: 42
+                Layout.alignment: Qt.AlignVCenter
+                onActivated: idx => {
+                    pane.playlistTabSortIndex = idx;
+                    pane.playlistTabSortAsc = (idx === 0 || idx === 1);
+                }
+            }
+            FlatButton {
+                objectName: "playlistTabSortDirection"
+                visible: pane.tab === "Playlists"
+                outlined: true
+                Layout.preferredWidth: 42
+                Layout.preferredHeight: 42
+                Layout.alignment: Qt.AlignVCenter
+                glyph: pane.playlistTabSortAsc ? "arrow-up" : "arrow-down"
+                hint: pane.playlistTabSortAsc
+                    ? (["Default order", "Name A–Z", "Fewest songs first", "Shortest first", "Oldest updated first"][pane.playlistTabSortIndex] + " (click to reverse)")
+                    : (["Reverse default order", "Name Z–A", "Most songs first", "Longest first", "Recently updated first"][pane.playlistTabSortIndex] + " (click to reverse)")
+                onClicked: pane.playlistTabSortAsc = !pane.playlistTabSortAsc
+            }
+            AppCombo {
                 id: artistSortCombo
                 visible: pane.tab === "Artists"
                 model: ["Name", "Songs"]
@@ -614,6 +675,7 @@ Item {
             id: songs
             objectName: "musicSongList"
             reuseItems: false
+            cacheBuffer: 800
             interactive: !pane.dragMember
             visible: pane.tab === "Songs" || !!pane.collectionId
             Layout.fillWidth: true
@@ -699,7 +761,7 @@ Item {
                 horizontalAlignment: Text.AlignHCenter
                 wrapMode: Text.WordWrap
                 visible: songs.count === 0
-                text: filter.text ? "No matching songs" : library.scanning ? "Reading your music…" : library.tracks.length ? "No songs here yet" : "Bring your music along.\nAdd a folder to get started."
+                text: filter.text ? "No matching songs" : library.scanning ? "Reading your music…" : library.trackCount ? "No songs here yet" : "Bring your music along.\nAdd a folder to get started."
                 color: Theme.muted
                 lineHeight: 1.5
             }
@@ -709,6 +771,7 @@ Item {
             visible: pane.tab !== "Songs" && pane.tab !== "Folders" && !pane.collectionId
             Layout.fillWidth: true
             Layout.fillHeight: true
+            cacheBuffer: 800
             clip: true
             model: StableListModel {
                 id: collectionsModel
@@ -756,14 +819,14 @@ Item {
                 }
                 CollectionRow {
                     width: parent.width
-                    title: "Liked Songs"; subtitle: pane.likedCount + " songs"; glyph: "heart"
+                    title: "Liked Songs"; subtitle: pane.likedCount + " songs"; cover: library.likedCover; glyph: "heart"
                     visible: pane.tab === "Playlists" && "liked songs".includes(collectionFilter.text.toLowerCase()); height: visible ? 68 : 0
                     onClicked: { pane.collectionId = "liked"; pane.collectionName = "Liked Songs"; }
                 }
                 CollectionRow {
                     objectName: "recentlyPlayedCollection"
                     width: parent.width
-                    title: "Recently Played"; subtitle: pane.recentCount + " songs"; glyph: "rotate-ccw"
+                    title: "Recently Played"; subtitle: pane.recentCount + " songs"; cover: app.recentCover; glyph: "rotate-ccw"
                     visible: pane.tab === "Playlists" && "recently played".includes(collectionFilter.text.toLowerCase()); height: visible ? 68 : 0
                     onClicked: { pane.collectionId = "recent"; pane.collectionName = "Recently Played"; }
                 }

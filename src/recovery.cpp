@@ -18,6 +18,7 @@ const QStringList kSlotNames = {".sillyplayer-library-0.sqlite3", ".sillyplayer-
 const QStringList kPortableSettings = {
     "palette",
     "light",
+    "cropArtwork",
     "pauseFadeEnabled",
     "pauseFadeMs",
     "crossfadeMs",
@@ -54,14 +55,33 @@ void cleanupSidecars(const QString &path) {
 
 DesktopRecovery::DesktopRecovery(Store *store, QObject *parent) : QObject(parent), s(store) {
   debounce.setSingleShot(true);
-  debounce.setInterval(4000);
+  // debounce auto-saves to 20s and run them on a worker thread so VACUUM INTO never freezes the UI
+  debounce.setInterval(20000);
   connect(&debounce, &QTimer::timeout, this, [this] {
     if (closing) return;
     if (busyGuard && busyGuard()) {
-      debounce.start(1500);
+      debounce.start(3000);
       return;
     }
-    saveInternal(false, false);
+    startAsyncSave();
+  });
+  connect(&worker, &QFutureWatcher<QVariantMap>::finished, this, [this] {
+    if (!worker.future().isValid()) return;
+    const auto res = worker.result();
+    worker.setFuture({});
+    if (res.value("ok").toBool()) {
+      newestSlot = res.value("slot", newestSlot).toInt();
+      m_lastSaved = res.value("lastSaved", m_lastSaved).toLongLong();
+      m_status = res.value("message").toString();
+    } else if (!res.value("skipped").toBool() && !res.value("message").toString().isEmpty()) {
+      m_status = res.value("message").toString();
+    }
+    m_saving = false;
+    emit changed();
+    if (saveAgain && !closing) {
+      saveAgain = false;
+      debounce.start(5000);
+    }
   });
 }
 
@@ -73,7 +93,7 @@ void DesktopRecovery::shutdown() {
   if (worker.isRunning()) worker.waitForFinished();
 }
 
-QVariantMap DesktopRecovery::readMeta(const QString &dbFile) {
+QVariantMap DesktopRecovery::readMeta(const QString &dbFile, bool verifyIntegrity) {
   QFileInfo fi(dbFile);
   if (!fi.isFile() || fi.size() < 100) return {};
   const QString conn = "recovery-inspect-" + QUuid::createUuid().toString(QUuid::WithoutBraces);
@@ -83,9 +103,13 @@ QVariantMap DesktopRecovery::readMeta(const QString &dbFile) {
     db.setDatabaseName(dbFile);
     db.setConnectOptions("QSQLITE_OPEN_READONLY");
     if (db.open()) {
-      QSqlQuery check(db);
-      if (check.exec("PRAGMA integrity_check") && check.next() &&
-          check.value(0).toString().compare("ok", Qt::CaseInsensitive) == 0) {
+      bool intact = true;
+      if (verifyIntegrity) {
+        QSqlQuery check(db);
+        intact = check.exec("PRAGMA integrity_check") && check.next() &&
+                 check.value(0).toString().compare("ok", Qt::CaseInsensitive) == 0;
+      }
+      if (intact) {
         QSqlQuery q(db);
         if (q.exec("SELECT key,value FROM sillyplayer_portable_meta")) {
           while (q.next()) meta.insert(q.value(0).toString(), q.value(1).toString());
@@ -101,67 +125,119 @@ QVariantMap DesktopRecovery::readMeta(const QString &dbFile) {
 }
 
 void DesktopRecovery::inspectFolder(const QString &folder) {
-  if (folder.trimmed().isEmpty()) return;
-  QDir dir(folder);
-  if (!dir.exists()) return;
+  const QString cleaned = folder.trimmed();
+  if (cleaned.isEmpty()) return;
+  const bool folderChanged = (inspectedFolder != cleaned);
+  inspectedFolder = cleaned;
   qint64 newest = 0;
   int slot = -1;
-  for (int i = 0; i < kSlotNames.size(); ++i) {
-    const auto meta = readMeta(dir.filePath(kSlotNames[i]));
-    const qint64 created = meta.value("created").toLongLong();
-    if (created > newest) {
-      newest = created;
-      slot = i;
+  QDir dir(cleaned);
+  if (dir.exists()) {
+    // skip full PRAGMA integrity_check during routine metadata inspection; reserve it for actual recovery
+    for (int i = 0; i < kSlotNames.size(); ++i) {
+      const auto meta = readMeta(dir.filePath(kSlotNames[i]), false);
+      const qint64 created = meta.value("created").toLongLong();
+      if (created > newest) {
+        newest = created;
+        slot = i;
+      }
     }
   }
   if (newest > 0) {
     newestSlot = slot;
     m_lastSaved = newest;
     emit changed();
+  } else if (folderChanged && (newestSlot != -1 || m_lastSaved != 0)) {
+    // switching to a new or empty music folder resets the previous folder's slot state
+    newestSlot = -1;
+    m_lastSaved = 0;
+    emit changed();
   }
 }
 
 void DesktopRecovery::requestSave() {
   if (closing || qEnvironmentVariableIsSet("SILLYPLAYER_NO_AUTO_RECOVERY")) return;
+  if (m_saving) {
+    saveAgain = true;
+    return;
+  }
   debounce.start();
+}
+
+void DesktopRecovery::startAsyncSave() {
+  if (closing || m_saving) return;
+  const QString folder = folderProvider ? folderProvider().trimmed() : QString();
+  if (folder.isEmpty()) return;
+  if (inspectedFolder != folder) inspectFolder(folder);
+  const QString dbPath = s->db().databaseName();
+  if (dbPath.isEmpty() || dbPath == ":memory:") return;
+  m_saving = true;
+  emit changed();
+  const int prevSlot = newestSlot;
+  const qint64 prevSaved = m_lastSaved;
+  worker.setFuture(QtConcurrent::run([dbPath, folder, prevSlot, prevSaved] {
+    return runSnapshotWorker(dbPath, folder, prevSlot, prevSaved, false, false);
+  }));
 }
 
 QVariantMap DesktopRecovery::saveNow(bool allowEmpty) {
   debounce.stop();
+  saveAgain = false;
+  if (worker.isRunning()) worker.waitForFinished();
   return saveInternal(allowEmpty, true);
 }
 
-QVariantMap DesktopRecovery::saveInternal(bool allowEmpty, bool createMissingDir) {
-  if (closing || m_saving) return {{"ok", false}, {"message", "Database mirror is already saving"}};
-  const QString folder = folderProvider ? folderProvider().trimmed() : QString();
-  if (folder.isEmpty()) return {{"ok", false}, {"message", "Choose a music folder first"}};
+QVariantMap DesktopRecovery::runSnapshotWorker(const QString &sourceDbPath, const QString &folder,
+                                               int prevSlot, qint64 prevSaved, bool allowEmpty,
+                                               bool createMissingDir) {
   QDir dir(folder);
   if (!dir.exists()) {
-    if (!createMissingDir) return {{"ok", false}, {"message", ""}};
+    if (!createMissingDir) return {{"ok", false}, {"skipped", true}, {"message", ""}};
     if (!dir.mkpath(".")) {
-      m_status = "Cannot create music folder for library mirror";
-      emit changed();
-      return {{"ok", false}, {"message", m_status}};
+      return {{"ok", false}, {"message", "Cannot create music folder for library mirror"}};
     }
   }
-  if (!allowEmpty) {
-    const bool hasTracks = !s->rows("SELECT id FROM tracks WHERE deleted=0 LIMIT 1").isEmpty();
-    const bool hasCollections = !s->rows("SELECT id FROM collections LIMIT 1").isEmpty();
-    // dont wipe a surviving folder mirror when starting up with an empty library
-    if (!hasTracks && !hasCollections)
-      return {{"ok", false}, {"message", "Library is empty; skipping mirror save"}};
-  }
-
-  inspectFolder(folder);
-  m_saving = true;
-  emit changed();
 
   const QString stage = tempDbPath();
   cleanupSidecars(stage);
-  const qint64 created = qMax(QDateTime::currentMSecsSinceEpoch(), m_lastSaved + 1);
-  bool ok = s->exec("VACUUM INTO ?", {stage});
-  QString err = ok ? QString() : s->error();
+  bool ok = true;
+  QString err;
 
+  const QString srcConn = "recovery-src-" + QUuid::createUuid().toString(QUuid::WithoutBraces);
+  {
+    QSqlDatabase src = QSqlDatabase::addDatabase("QSQLITE", srcConn);
+    src.setDatabaseName(sourceDbPath);
+    src.setConnectOptions("QSQLITE_OPEN_READONLY");
+    if (!src.open()) {
+      ok = false;
+      err = src.lastError().text();
+    } else {
+      QSqlQuery q(src);
+      q.exec("PRAGMA busy_timeout=5000");
+      if (!allowEmpty) {
+        const bool hasTracks = q.exec("SELECT id FROM tracks WHERE deleted=0 LIMIT 1") && q.next();
+        const bool hasCollections =
+            hasTracks || (q.exec("SELECT id FROM collections LIMIT 1") && q.next());
+        // dont wipe a surviving folder mirror when starting up with an empty library
+        if (!hasTracks && !hasCollections) {
+          src.close();
+          QSqlDatabase::removeDatabase(srcConn);
+          cleanupSidecars(stage);
+          return {{"ok", false}, {"skipped", true}, {"message", "Library is empty; skipping mirror save"}};
+        }
+      }
+      q.prepare("VACUUM INTO ?");
+      q.addBindValue(stage);
+      if (!q.exec()) {
+        ok = false;
+        err = q.lastError().text();
+      }
+      src.close();
+    }
+  }
+  QSqlDatabase::removeDatabase(srcConn);
+
+  const qint64 created = qMax(QDateTime::currentMSecsSinceEpoch(), prevSaved + 1);
   if (ok) {
     const QString conn = "recovery-stage-" + QUuid::createUuid().toString(QUuid::WithoutBraces);
     {
@@ -217,8 +293,8 @@ QVariantMap DesktopRecovery::saveInternal(bool allowEmpty, bool createMissingDir
     QSqlDatabase::removeDatabase(conn);
   }
 
+  int targetSlot = prevSlot == 0 ? 1 : 0;
   if (ok) {
-    const int targetSlot = newestSlot == 0 ? 1 : 0;
     const QString destPath = dir.filePath(kSlotNames[targetSlot]);
     QFile in(stage);
     QSaveFile out(destPath);
@@ -239,20 +315,38 @@ QVariantMap DesktopRecovery::saveInternal(bool allowEmpty, bool createMissingDir
         err = out.errorString();
       }
     }
-    if (ok) {
-      newestSlot = targetSlot;
-      m_lastSaved = created;
-      m_status = "Library database saved in your music folder";
-    }
   }
   cleanupSidecars(stage);
 
-  if (!ok) {
-    m_status = err.isEmpty() ? "Could not save library database" : ("Library database mirror: " + err);
+  if (ok) {
+    return {{"ok", true},
+            {"slot", targetSlot},
+            {"lastSaved", created},
+            {"message", "Library database saved in your music folder"}};
+  }
+  return {{"ok", false},
+          {"message", err.isEmpty() ? "Could not save library database" : ("Library database mirror: " + err)}};
+}
+
+QVariantMap DesktopRecovery::saveInternal(bool allowEmpty, bool createMissingDir) {
+  if (closing || m_saving) return {{"ok", false}, {"message", "Database mirror is already saving"}};
+  const QString folder = folderProvider ? folderProvider().trimmed() : QString();
+  if (folder.isEmpty()) return {{"ok", false}, {"message", "Choose a music folder first"}};
+  if (inspectedFolder != folder) inspectFolder(folder);
+  m_saving = true;
+  emit changed();
+  const auto res = runSnapshotWorker(s->db().databaseName(), folder, newestSlot, m_lastSaved,
+                                     allowEmpty, createMissingDir);
+  if (res.value("ok").toBool()) {
+    newestSlot = res.value("slot", newestSlot).toInt();
+    m_lastSaved = res.value("lastSaved", m_lastSaved).toLongLong();
+  }
+  if (!res.value("message").toString().isEmpty()) {
+    m_status = res.value("message").toString();
   }
   m_saving = false;
   emit changed();
-  return {{"ok", ok}, {"message", m_status}, {"lastSaved", m_lastSaved}};
+  return {{"ok", res.value("ok").toBool()}, {"message", m_status}, {"lastSaved", m_lastSaved}};
 }
 
 QVariantMap DesktopRecovery::recoverFromFolder(const QString &folderInput) {
@@ -353,6 +447,7 @@ QVariantMap DesktopRecovery::recoverFromFolder(const QString &folderInput) {
   QSqlDatabase::removeDatabase(conn);
 
   if (ok) {
+    inspectedFolder = folder;
     newestSlot = slot;
     m_lastSaved = newest;
     m_status = QString("Recovered library database (%1 songs, %2 playlists)")

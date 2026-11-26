@@ -9,6 +9,8 @@ object NativeMedia {
 
     external fun tags(fd: Int, name: String): String
 
+    external fun inspect(fd: Int, name: String, outArt: Array<ByteArray?>): String
+
     external fun artwork(fd: Int, name: String): ByteArray?
 
     external fun edit(path: String, tags: String, cover: String): Boolean

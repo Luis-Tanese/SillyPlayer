@@ -35,10 +35,6 @@ fun BrowseScreen(g: Graph, pickers: Pickers) {
     var collectionUrl by remember { mutableStateOf("") }
     var downloading by remember { mutableStateOf<Source?>(null) }
     val holder = rememberSaveableStateHolder()
-    val engine by g.engine.collectAsStateWithLifecycle()
-    val playback by
-        (engine?.state ?: remember { kotlinx.coroutines.flow.MutableStateFlow(PlaybackState()) })
-            .collectAsStateWithLifecycle()
     LaunchedEffect(opened?.provider) { opened?.let { provider = it.provider } }
     Column(Modifier.fillMaxSize()) {
         Row(
@@ -137,6 +133,11 @@ fun BrowseScreen(g: Graph, pickers: Pickers) {
                 }
                 if (opened != null && opened?.provider == provider) {
                     val source = opened!!
+                    // collect engine playback state only while the online player view is open
+                    val engine by g.engine.collectAsStateWithLifecycle()
+                    val playback by
+                        (engine?.state ?: remember { kotlinx.coroutines.flow.MutableStateFlow(PlaybackState()) })
+                            .collectAsStateWithLifecycle()
                     Column(
                         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(14.dp)
                     ) {
@@ -220,15 +221,16 @@ fun BrowseScreen(g: Graph, pickers: Pickers) {
                         }
                     }
                 } else if (state.query.isBlank() && !state.loading) {
+                    val providerHistory = remember(history, provider) { history.filter { it.provider == provider } }
                     LazyColumn(state = list, contentPadding = PaddingValues(12.dp)) {
-                        item {
+                        item(contentType = "hint") {
                             Hint(
                                 if (provider == "direct")
                                     "Use a link to an audio file. Local music remains available offline."
                                 else "Search for audio or paste a link."
                             )
                         }
-                        items(history.filter { it.provider == provider }, key = { it.query }) {
+                        items(providerHistory, key = { it.query }, contentType = { "history" }) {
                             entry ->
                             Row(
                                 Modifier.fillMaxWidth().clickable {
@@ -248,8 +250,8 @@ fun BrowseScreen(g: Graph, pickers: Pickers) {
                                 }
                             }
                         }
-                        if (history.any { it.provider == provider })
-                            item {
+                        if (providerHistory.isNotEmpty())
+                            item(contentType = "action") {
                                 Action("Clear search history", "trash-2") {
                                     g.task { g.dao.clearSearches(provider) }
                                 }
@@ -260,9 +262,9 @@ fun BrowseScreen(g: Graph, pickers: Pickers) {
                         state = list,
                         contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
                     ) {
-                        if (state.loading) item { Progress("Searching") }
-                        if (state.message.isNotBlank()) item { Hint(state.message) }
-                        itemsIndexed(state.rows, key = { i, row -> "$i:${row.url}" }) { _, source ->
+                        if (state.loading) item(contentType = "progress") { Progress("Searching") }
+                        if (state.message.isNotBlank()) item(contentType = "hint") { Hint(state.message) }
+                        itemsIndexed(state.rows, key = { i, row -> "$i:${row.url}" }, contentType = { _, _ -> "result" }) { _, source ->
                             Row(
                                 Modifier.fillMaxWidth()
                                     .clickable(enabled = source.playable) { g.online.play(source) }
@@ -575,22 +577,24 @@ fun DownloadsScreen(g: Graph) {
             Action("Clear failed", "trash-2") { g.task { g.online.clearHistory(true) } }
             Action("Clear history") { g.task { g.online.clearHistory(false) } }
         }
-        val order =
-            listOf(
-                "Active",
-                "Resolving",
-                "Queued",
-                "Post-processing",
-                "Paused",
-                "Interrupted",
-                "Failed",
-                "Completed",
-                "Cancelled",
-            )
         val sorted =
-            jobs.sortedWith(
-                compareBy<DownloadJob> { order.indexOf(it.state) }.thenByDescending { it.created }
-            )
+            remember(jobs) {
+                val order =
+                    listOf(
+                        "Active",
+                        "Resolving",
+                        "Queued",
+                        "Post-processing",
+                        "Paused",
+                        "Interrupted",
+                        "Failed",
+                        "Completed",
+                        "Cancelled",
+                    )
+                jobs.sortedWith(
+                    compareBy<DownloadJob> { order.indexOf(it.state) }.thenByDescending { it.created }
+                )
+            }
         LazyColumn {
             itemsIndexed(sorted, key = { _, j -> j.id }) { i, job ->
                 Column(Modifier.fillMaxWidth().padding(vertical = 10.dp)) {

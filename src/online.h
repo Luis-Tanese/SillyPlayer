@@ -94,6 +94,9 @@ private:
   QHash<QString,SearchState> searchStates;
   QHash<QString,DirectTransfer *> transfers;
   QVariantList m_results, m_jobs;
+  mutable QVariantList historyCache;
+  mutable QString historyProvider;
+  mutable bool historyValid = false;
   QHash<QString, QVariantMap> savedJobs;
   QTimer progressNotifications;
   QVariantMap m_details;
@@ -110,6 +113,7 @@ private:
   QNetworkAccessManager images;
   QNetworkReply *imageReply = nullptr;
   quint64 imageGeneration = 0;
+  int artworkSavesSincePrune = 0;
   void cacheArtwork(const QVariantMap &details, int attempt = 0);
   QHash<QString, QProcess *> workers;
   QHash<QString, quint64> jobRequests;

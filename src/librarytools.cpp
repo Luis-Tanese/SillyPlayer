@@ -98,8 +98,14 @@ QVariantMap LibraryTools::cached(const QVariantMap &track) const {
 }
 void LibraryTools::findMissing() {
   emit opened(); if(!begin()) return; mode="missing"; matches.clear();
+  // bulk-load track_roots in 1 query instead of N+1 per-track queries on the UI thread
+  QHash<QString, QVariantList> rootsByTrack;
+  for (const auto &v : s->rows("SELECT track_roots.track, roots.* FROM roots JOIN track_roots ON roots.id=track_roots.root")) {
+    const auto row = v.toMap();
+    rootsByTrack[row["track"].toString()] << row;
+  }
   auto tracks=s->rows("SELECT * FROM tracks WHERE deleted=0 AND mergedInto='' ORDER BY title COLLATE NOCASE");
-  for(auto &v:tracks) { auto t=v.toMap(); t["roots"]=s->rows("SELECT roots.* FROM roots JOIN track_roots ON roots.id=track_roots.root WHERE track_roots.track=?",{t["id"]}); v=t; }
+  for(auto &v:tracks) { auto t=v.toMap(); t["roots"]=rootsByTrack.value(t["id"].toString()); v=t; }
   auto stop=stopped;
   launch("Finding missing files",[this,tracks,stop] {
     QVariantList rows;
@@ -135,9 +141,20 @@ void LibraryTools::prepareFolder(const QString &id,const QString &path) {
   emit opened(); if(!begin()) return; mode="recover"; rootId=id; newRoot=QFileInfo(path).canonicalFilePath();
   const auto root=s->rows("SELECT * FROM roots WHERE id=?",{id}).value(0).toMap();
   if(root.isEmpty() || newRoot.isEmpty() || !s->rows("SELECT id FROM roots WHERE path=? AND id<>?",{newRoot,id}).isEmpty()) { status="Choose a readable folder that is not registered separately"; release(); return; }
+  QHash<QString, QVariantMap> hashesByTrack;
+  for (const auto &v : s->rows("SELECT * FROM track_hashes")) {
+    const auto row = v.toMap();
+    hashesByTrack.insert(row["track"].toString(), row);
+  }
   QVariantList requests;
   const QString prefix=QDir::cleanPath(root["path"].toString())+"/";
-  for(auto v:s->rows("SELECT * FROM tracks WHERE mergedInto=''")) { auto t=v.toMap(); const QString old=t["path"].toString(); if(old.startsWith(prefix) && !QFileInfo(old).isFile()) requests<<QVariantMap{{"track",cached(t)},{"path",QDir(newRoot).absoluteFilePath(old.mid(prefix.size()))}}; }
+  for(auto v:s->rows("SELECT * FROM tracks WHERE mergedInto=''")) {
+    auto t=v.toMap(); const QString old=t["path"].toString();
+    if(old.startsWith(prefix) && !QFileInfo(old).isFile()) {
+      t["cache"] = hashesByTrack.value(t["id"].toString());
+      requests<<QVariantMap{{"track",t},{"path",QDir(newRoot).absoluteFilePath(old.mid(prefix.size()))}};
+    }
+  }
   auto stop=stopped;
   launch("Checking replacement files",[this,requests,stop] { try { return QVariantMap{{"matches",candidatesFor(requests,stop,[this](auto a,auto b,const auto &c){report(a,b,c);})}}; } catch(const std::exception &e) {return errorResult(e);} });
 }
@@ -162,7 +179,19 @@ void LibraryTools::recover() {
 }
 void LibraryTools::findDuplicates() {
   emit opened(); if(!begin()) return; mode="duplicates"; duplicates.clear();
-  QVariantList tracks; for(auto v:s->rows("SELECT * FROM tracks WHERE deleted=0 AND mergedInto='' ORDER BY added,id")) tracks<<cached(v.toMap()); auto stop=stopped;
+  // bulk-load cached file hashes in 1 query instead of N+1 selects
+  QHash<QString, QVariantMap> hashesByTrack;
+  for (const auto &v : s->rows("SELECT * FROM track_hashes")) {
+    const auto row = v.toMap();
+    hashesByTrack.insert(row["track"].toString(), row);
+  }
+  QVariantList tracks;
+  for(auto v:s->rows("SELECT * FROM tracks WHERE deleted=0 AND mergedInto='' ORDER BY added,id")) {
+    auto t = v.toMap();
+    t["cache"] = hashesByTrack.value(t["id"].toString());
+    tracks << t;
+  }
+  auto stop=stopped;
   const QString loaded=player->mediaPath(),loadedId=player->loaded() && currentTrack?currentTrack():QString();
   launch("Finding exact duplicates",[this,tracks,stop,loaded,loadedId] {
     try {

@@ -84,7 +84,7 @@ private:
   quint16 listenPort;
   qint64 pairUntil = 0, prepareTotal = 0;
   double progressValue = -1;
-  bool preparing = false, exchanging = false, resolving = false, resolutionCancelled = false, closing = false;
+  bool preparing = false, exchanging = false, resolving = false, resolutionCancelled = false, closing = false, legacyRepairRan = false;
   QVariantMap resolutionResult;
   std::function<bool()> maintenanceGuard;
   bool maintenance() const { return maintenanceGuard && maintenanceGuard(); }

@@ -1,5 +1,6 @@
 #include "app.h"
 #include "artworknetwork.h"
+#include "roundedart.h"
 #ifdef Q_OS_LINUX
 #include "mpris.h"
 #endif
@@ -143,6 +144,8 @@ int main(int argc, char **argv) {
     ArtworkNetworkFactory artworkNetwork(cache + "/remote-art");
     QQmlApplicationEngine engine;
     engine.setNetworkAccessManagerFactory(&artworkNetwork);
+    engine.addImageProvider("art", new RoundedArtProvider);
+    engine.rootContext()->setContextProperty("artProviderReady", true);
     engine.rootContext()->setContextProperty("app", &app);
     engine.rootContext()->setContextProperty("library", &app.library);
     engine.rootContext()->setContextProperty("music", &app.music);

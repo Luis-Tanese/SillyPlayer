@@ -74,12 +74,19 @@ class BackupRepository(private val g: Graph) {
                 var done = 0L
                 val total = tracks.sumOf { it.size.coerceAtLeast(0) }
                 var currentTrackIndex = 0
+                var lastProgressAt = 0L
+                val ioBuffer = ByteArray(256 * 1024)
+                val extPattern = Regex("[a-z0-9]{1,10}")
+                val hex64 = Regex("[a-f0-9]{64}")
                 g.output(uri).use { raw ->
                     ZipOutputStream(BufferedOutputStream(raw, 256 * 1024)).use { zip ->
-                        suspend fun add(source: String, kind: String, extension: String): String {
-                            val hash = g.input(source).use { it.sha256() }
+                        suspend fun add(source: String, kind: String, extension: String, knownHash: String = ""): String {
+                            // reuse verified track/art SHA-256 when available to avoid reading every file twice over SAF
+                            val hash =
+                                if (knownHash.isNotBlank() && hex64.matches(knownHash)) knownHash
+                                else g.input(source).use { it.sha256() }
                             val ext =
-                                extension.lowercase().takeIf { it.matches(Regex("[a-z0-9]{1,10}")) }
+                                extension.lowercase().takeIf { extPattern.matches(it) }
                                     ?: "bin"
                             val name = "$kind/$hash.$ext"
                             if (name in assets) return name
@@ -87,25 +94,28 @@ class BackupRepository(private val g: Graph) {
                             val digest = MessageDigest.getInstance("SHA-256")
                             var count = 0L
                             g.input(source).use { input ->
-                                val buffer = ByteArray(256 * 1024)
                                 while (true) {
                                     currentCoroutineContext().ensureActive()
-                                    val n = input.read(buffer)
+                                    val n = input.read(ioBuffer)
                                     if (n < 0) break
-                                    zip.write(buffer, 0, n)
-                                    digest.update(buffer, 0, n)
+                                    zip.write(ioBuffer, 0, n)
+                                    digest.update(ioBuffer, 0, n)
                                     count += n
                                     if (kind == "media") done += n
-                                    val frac =
-                                        if (total > 0) (done.toFloat() / total).coerceIn(0f, 1f)
-                                        else if (tracks.isNotEmpty()) (currentTrackIndex.toFloat() / tracks.size).coerceIn(0f, 1f)
-                                        else -1f
-                                    state.value =
-                                        BackupState(
-                                            true,
-                                            "Backing up audio ($currentTrackIndex/${tracks.size})",
-                                            frac,
-                                        )
+                                    val now = android.os.SystemClock.elapsedRealtime()
+                                    if (now - lastProgressAt >= 120L) {
+                                        lastProgressAt = now
+                                        val frac =
+                                            if (total > 0) (done.toFloat() / total).coerceIn(0f, 1f)
+                                            else if (tracks.isNotEmpty()) (currentTrackIndex.toFloat() / tracks.size).coerceIn(0f, 1f)
+                                            else -1f
+                                        state.value =
+                                            BackupState(
+                                                true,
+                                                "Backing up audio ($currentTrackIndex/${tracks.size})",
+                                                frac,
+                                            )
+                                    }
                                 }
                             }
                             zip.closeEntry()
@@ -123,21 +133,28 @@ class BackupRepository(private val g: Graph) {
                         }
                         for (track in tracks) {
                             currentTrackIndex++
-                            if (
-                                !track.available ||
-                                    runCatching { g.input(track.uri).use { it.read() } }.isFailure
-                            ) {
+                            if (!track.available || track.uri.isBlank()) {
                                 omitted += track.title
                                 continue
                             }
                             val fileName =
-                                DocumentFile.fromSingleUri(g.context, Uri.parse(track.uri))?.name
-                                    ?: Uri.parse(track.uri).lastPathSegment
-                                    ?: "audio.mp3"
-                            val media = add(track.uri, "media", fileName.substringAfterLast('.'))
+                                track.fileName.ifBlank {
+                                    DocumentFile.fromSingleUri(g.context, Uri.parse(track.uri))?.name
+                                        ?: Uri.parse(track.uri).lastPathSegment
+                                        ?: "audio.mp3"
+                                }
+                            val media =
+                                try {
+                                    add(track.uri, "media", fileName.substringAfterLast('.'), track.hash)
+                                } catch (e: kotlinx.coroutines.CancellationException) {
+                                    throw e
+                                } catch (_: Exception) {
+                                    omitted += track.title
+                                    continue
+                                }
                             val art =
                                 if (track.art.isNotBlank())
-                                    runCatching { add(track.art, "art", "img") }.onFailure { if (it is kotlinx.coroutines.CancellationException) throw it }.getOrDefault("")
+                                    runCatching { add(track.art, "art", "img", track.artHash) }.onFailure { if (it is kotlinx.coroutines.CancellationException) throw it }.getOrDefault("")
                                 else ""
                             val map = JsonCodec.encodeToJsonElement(track).jsonObject.toMutableMap()
                             for (key in
@@ -284,8 +301,10 @@ class BackupRepository(private val g: Graph) {
         val archiveLength = runCatching { DocumentFile.fromSingleUri(g.context, Uri.parse(uri))?.length() ?: 0L }.getOrDefault(0L)
         val inspectionLimit = StatFs(g.context.cacheDir.path).availableBytes
         val pattern = Regex("(media|art)/[a-f0-9]{64}\\.[a-z0-9]{1,10}")
+        val discard = ByteArray(256 * 1024)
+        var lastProgressAt = 0L
         g.input(uri).use { raw ->
-            ZipInputStream(BufferedInputStream(raw)).use { zip ->
+            ZipInputStream(BufferedInputStream(raw, 256 * 1024)).use { zip ->
                 while (true) {
                     val entry = zip.nextEntry ?: break
                     currentCoroutineContext().ensureActive()
@@ -304,7 +323,6 @@ class BackupRepository(private val g: Graph) {
                         manifest = JsonCodec.parseToJsonElement(out.toString("UTF-8")).jsonObject
                     } else {
                         require(pattern.matches(entry.name) && !entry.isDirectory) { "Unsafe ZIP entry" }
-                        val discard = ByteArray(128 * 1024)
                         while (true) {
                             currentCoroutineContext().ensureActive()
                             val n = zip.read(discard)
@@ -312,11 +330,15 @@ class BackupRepository(private val g: Graph) {
                             inspectedBytes += n
                             require(inspectedBytes <= inspectionLimit) { "Not enough storage to stage this archive" }
                             if (archiveLength > 0L) {
-                                state.value = BackupState(
-                                    true,
-                                    "Reading backup",
-                                    (inspectedBytes.toFloat() / archiveLength).coerceIn(0f, 1f),
-                                )
+                                val now = android.os.SystemClock.elapsedRealtime()
+                                if (now - lastProgressAt >= 120L) {
+                                    lastProgressAt = now
+                                    state.value = BackupState(
+                                        true,
+                                        "Reading backup",
+                                        (inspectedBytes.toFloat() / archiveLength).coerceIn(0f, 1f),
+                                    )
+                                }
                             }
                         }
                     }
@@ -399,9 +421,11 @@ class BackupRepository(private val g: Graph) {
 
     private suspend fun extractRestoreArchive(uri: String, archive: RestoreArchive, stage: File) {
         var done = 0L
+        var lastProgressAt = 0L
+        val buffer = ByteArray(256 * 1024)
         val extracted = mutableSetOf<String>()
         g.input(uri).use { raw ->
-            ZipInputStream(BufferedInputStream(raw)).use { zip ->
+            ZipInputStream(BufferedInputStream(raw, 256 * 1024)).use { zip ->
                 while (true) {
                     val entry = zip.nextEntry ?: break
                     require(extracted.add(entry.name)) { "Duplicate ZIP entry during restore" }
@@ -416,7 +440,6 @@ class BackupRepository(private val g: Graph) {
                     val hash = MessageDigest.getInstance("SHA-256")
                     var written = 0L
                     target.outputStream().use { out ->
-                        val buffer = ByteArray(256 * 1024)
                         while (true) {
                             currentCoroutineContext().ensureActive()
                             val n = zip.read(buffer)
@@ -426,8 +449,12 @@ class BackupRepository(private val g: Graph) {
                             out.write(buffer, 0, n)
                             hash.update(buffer, 0, n)
                             done += n
-                            state.value = BackupState(true, "Verifying backup",
-                                if (archive.total > 0) done.toFloat() / archive.total else -1f)
+                            val now = android.os.SystemClock.elapsedRealtime()
+                            if (now - lastProgressAt >= 120L) {
+                                lastProgressAt = now
+                                state.value = BackupState(true, "Verifying backup",
+                                    if (archive.total > 0) done.toFloat() / archive.total else -1f)
+                            }
                         }
                     }
                     require(written == expected && hash.digest().joinToString("") { "%02x".format(it) } ==
