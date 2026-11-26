@@ -6,11 +6,13 @@ import androidx.compose.foundation.*
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.*
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.*
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -404,38 +406,67 @@ fun QueuePanel(g: Graph, state: PlaybackState, onDismiss: () -> Unit) {
                 },
             )
         }
-    ModalBottomSheet(onDismissRequest = onDismiss) {
-        Column(Modifier.fillMaxWidth().fillMaxHeight(.85f).padding(horizontal = 12.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    "Queue · " + state.context,
-                    Modifier.weight(1f),
-                    fontSize = 18.sp,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                Action("Clear upcoming", enabled = state.queue.size > 1) { engine?.clearUpcoming() }
+    AppModalSheet(onDismissRequest = onDismiss) {
+        Column(
+            Modifier.fillMaxWidth().fillMaxHeight(.86f).padding(horizontal = 16.dp, vertical = 6.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Row(
+                Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        "Playback queue",
+                        fontSize = 18.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        "${state.context} · ${rows.size} ${if (rows.size == 1) "song" else "songs"}",
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                ToolPillButton("Clear upcoming", "trash-2", enabled = state.queue.size > 1) {
+                    engine?.clearUpcoming()
+                }
             }
-            Hint(when (state.mode) {
-                1 -> "Repeat one · the current song repeats. Other queued songs are kept."
-                2 -> "Shuffle · shown in playback order"
-                else -> "Repeat queue · shown in upcoming order"
-            })
-            LazyColumn(state = queueListState) {
+            ModalSectionCard {
+                Text(
+                    when (state.mode) {
+                        1 -> "Repeat one · the current song repeats. Other queued songs are kept."
+                        2 -> "Shuffle · shown in playback order"
+                        else -> "Repeat queue · shown in upcoming order"
+                    },
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            LazyColumn(Modifier.weight(1f), state = queueListState, contentPadding = PaddingValues(bottom = 16.dp)) {
                 itemsIndexed(rows, key = { _, e -> e.id }) { index, entry ->
                     val dragging = reorderState.draggedKey == entry.id
+                    val isCurrent = entry.id == currentId
                     Row(
                         Modifier.fillMaxWidth()
                             .draggableRow(reorderState, entry.id)
                             .background(
-                                if (dragging) MaterialTheme.colorScheme.surfaceContainerHigh
-                                else androidx.compose.ui.graphics.Color.Transparent
+                                when {
+                                    dragging -> MaterialTheme.colorScheme.surfaceContainerHighest
+                                    isCurrent -> MaterialTheme.colorScheme.primary.copy(alpha = 0.09f)
+                                    else -> androidx.compose.ui.graphics.Color.Transparent
+                                },
+                                RoundedCornerShape(12.dp),
                             )
                             .clickable { engine?.queuePlay(entry.id) }
-                            .padding(vertical = 8.dp),
+                            .padding(horizontal = 4.dp, vertical = 8.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        if (entry.id == currentId) Spacer(Modifier.width(38.dp))
+                        if (isCurrent) Spacer(Modifier.width(38.dp))
                         else DragReorderHandle(reorderState, entry.id, index)
                         Artwork(entry.track.art, 40)
                         Spacer(Modifier.width(10.dp))
@@ -445,17 +476,18 @@ fun QueuePanel(g: Graph, state: PlaybackState, onDismiss: () -> Unit) {
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis,
                                 fontSize = 14.sp,
+                                fontWeight = if (isCurrent) FontWeight.SemiBold else FontWeight.Normal,
+                                color = if (isCurrent) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
                             )
                             Text(
-                                if (entry.id == currentId) "Current · " + entry.track.artist
-                                else entry.track.artist,
+                                if (isCurrent) "Playing now · " + entry.track.artist else entry.track.artist,
                                 fontSize = 12.sp,
-                                color =
-                                    if (entry.id == currentId) MaterialTheme.colorScheme.primary
-                                    else MaterialTheme.colorScheme.onSurfaceVariant,
+                                color = if (isCurrent) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
                             )
                         }
-                        IconAction("x", "Remove from queue", entry.id != currentId) {
+                        IconAction("x", "Remove from queue", !isCurrent) {
                             engine?.removeQueue(entry.id)
                         }
                     }
@@ -465,31 +497,35 @@ fun QueuePanel(g: Graph, state: PlaybackState, onDismiss: () -> Unit) {
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun SleepDialog(g: Graph, onDismiss: () -> Unit) {
     var minutes by remember { mutableStateOf("30") }
     val engine by g.engine.collectAsStateWithLifecycle()
-    AlertDialog(
+    AppModalDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Sleep timer") },
-        text = {
-            Column {
-                Row { for (n in listOf(15, 30, 60)) Action("${n}m") { minutes = n.toString() } }
-                Input(minutes, { minutes = it }, "Minutes (1–1440)")
-                Action("Cancel timer") {
-                    engine?.sleep(0)
-                    onDismiss()
-                }
+        title = "Sleep timer",
+        subtitle = "Pause playback automatically",
+        icon = "clock",
+        actions = {
+            ModalTonalButton("Turn off") {
+                engine?.sleep(0)
+                onDismiss()
             }
-        },
-        confirmButton = {
-            Action("Start", enabled = minutes.toIntOrNull() in 1..1440) {
+            ModalTonalButton("Cancel", onClick = onDismiss)
+            ModalPrimaryButton("Start", icon = "check", enabled = minutes.toIntOrNull() in 1..1440) {
                 engine?.sleep(minutes.toInt())
                 onDismiss()
             }
         },
-        dismissButton = { Action("Close") { onDismiss() } },
-    )
+    ) {
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            for (n in listOf(15, 30, 45, 60)) {
+                ToolPillButton("${n}m", active = minutes == n.toString()) { minutes = n.toString() }
+            }
+        }
+        Input(minutes, { minutes = it }, "Minutes (1–1440)")
+    }
 }
 
 @OptIn(ExperimentalLayoutApi::class)
@@ -501,7 +537,6 @@ fun SongActionDialog(
     action: String,
     onDismiss: () -> Unit,
 ) {
-    var duplicate by remember { mutableStateOf<String?>(null) }
     when (action) {
         "next",
         "like" ->
@@ -513,24 +548,17 @@ fun SongActionDialog(
         "speed" -> ModifierDialog(g, track, false, onDismiss)
         "volume" -> ModifierDialog(g, track, true, onDismiss)
         "eq" -> EqualizerDialog(g, onDismiss)
-        "add" -> {
-            PlaylistChooser(g, listOf(track.id), onDismiss) { id, allow ->
+        "add" ->
+            PlaylistChooser(g, listOf(track.id), onDismiss) { id ->
+                onDismiss()
                 g.task {
-                    if (g.library.add(id, listOf(track.id), allow)) onDismiss() else duplicate = id
+                    val res = g.library.addToCollection(id, listOf(track.id))
+                    val target = if (id == "liked") "Liked Songs" else "playlist"
+                    g.message.value =
+                        if (res.added > 0) "Added to $target"
+                        else "Already in $target (skipped)"
                 }
             }
-            duplicate?.let { id ->
-                Confirmation(
-                    "Song already in playlist",
-                    "Add another occurrence?",
-                    "Add again",
-                    { duplicate = null },
-                ) {
-                    g.task { g.library.add(id, listOf(track.id), true) }
-                    onDismiss()
-                }
-            }
-        }
         "trash" ->
             Confirmation(
                 if (track.available && track.uri.isNotBlank()) "Move song to Trash?" else "Remove song from library?",
@@ -543,14 +571,14 @@ fun SongActionDialog(
             }
         "metadata" -> MetadataDialog(g, pickers, track, onDismiss)
         "link" ->
-            AlertDialog(
+            AppModalDialog(
                 onDismissRequest = onDismiss,
-                title = { Text("Link") },
-                text = {
-                    Text(track.sourceUrl.ifBlank { "No source link is saved for this song" })
-                },
-                confirmButton = {
-                    Action("Share", enabled = track.sourceUrl.startsWith("http")) {
+                title = "Source link",
+                subtitle = track.title,
+                icon = "external-link",
+                actions = {
+                    ModalTonalButton("Close", onClick = onDismiss)
+                    ModalPrimaryButton("Share", icon = "external-link", enabled = track.sourceUrl.startsWith("http")) {
                         g.context.startActivity(
                             Intent.createChooser(
                                     Intent(Intent.ACTION_SEND).apply {
@@ -563,36 +591,43 @@ fun SongActionDialog(
                         )
                     }
                 },
-                dismissButton = { Action("Close") { onDismiss() } },
-            )
+            ) {
+                Text(
+                    track.sourceUrl.ifBlank { "No source link is saved for this song" },
+                    fontSize = 14.sp,
+                    color = if (track.sourceUrl.isBlank()) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.onSurface,
+                )
+            }
         "info" ->
-            AlertDialog(
+            AppModalDialog(
                 onDismissRequest = onDismiss,
-                title = { Text("Information") },
-                text = {
-                    Column(Modifier.verticalScroll(rememberScrollState())) {
-                        for ((label, value) in
-                            listOf(
-                                "Title" to track.title,
-                                "Artist" to track.artist,
-                                "Album" to track.album,
-                                "Album artist" to track.albumArtist,
-                                "Duration" to time((track.duration * 1000).toLong()),
-                                "Source uploader" to track.uploader,
-                                "Source title" to track.videoTitle,
-                                "Source URL" to track.sourceUrl,
-                                "File" to track.uri,
-                                "Song ID" to track.id,
-                                "Modifiers" to modifierLabel(track),
-                            )) Text(
-                            "$label: $value",
-                            Modifier.padding(vertical = 4.dp),
-                            fontSize = 13.sp,
-                        )
+                title = "Song information",
+                subtitle = track.title,
+                icon = "info",
+                actions = { ModalPrimaryButton("Close", onClick = onDismiss) },
+            ) {
+                Column(Modifier.heightIn(max = 380.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    for ((label, value) in
+                        listOf(
+                            "Title" to track.title,
+                            "Artist" to track.artist,
+                            "Album" to track.album,
+                            "Album artist" to track.albumArtist,
+                            "Duration" to time((track.duration * 1000).toLong()),
+                            "Source uploader" to track.uploader,
+                            "Source title" to track.videoTitle,
+                            "Source URL" to track.sourceUrl,
+                            "File" to track.uri,
+                            "Song ID" to track.id,
+                            "Modifiers" to modifierLabel(track),
+                        ).filter { it.second.isNotBlank() }) {
+                        ModalSectionCard {
+                            Text(label, fontSize = 11.sp, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Medium)
+                            Text(value, fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurface)
+                        }
                     }
-                },
-                confirmButton = { Action("Close") { onDismiss() } },
-            )
+                }
+            }
     }
 }
 
@@ -600,9 +635,16 @@ fun SongActionDialog(
 @Composable
 private fun ModifierDialog(g: Graph, track: Track, volume: Boolean, onDismiss: () -> Unit) {
     var value by
-        remember(track.id) { mutableFloatStateOf(if (volume) track.volumePercent else track.speed) }
+        remember(track.id, volume) { mutableFloatStateOf(if (volume) track.volumePercent else track.speed) }
     var pitch by remember(track.id) { mutableStateOf(track.nightcore) }
-    var number by remember { mutableStateOf(value.toString()) }
+    // key number on track.id and mode too so switching songs doesnt leave stale text in the box
+    var number by
+        remember(track.id, volume) {
+            mutableStateOf(
+                if (volume) track.volumePercent.roundToInt().toString()
+                else "%.2f".format(java.util.Locale.ROOT, track.speed)
+            )
+        }
     var changed by remember { mutableStateOf(false) }
     var preview by remember { mutableStateOf<Job?>(null) }
     val scope = rememberCoroutineScope()
@@ -627,24 +669,37 @@ private fun ModifierDialog(g: Graph, track: Track, volume: Boolean, onDismiss: (
         commit()
         onDismiss()
     }
-    AlertDialog(
+    AppModalDialog(
         onDismissRequest = ::dismiss,
-        title = { Text(if (volume) "Song volume" else "Song playback speed") },
-        text = {
-            Column(Modifier.verticalScroll(rememberScrollState())) {
-                Hint(track.title)
-                FlowRow {
-                    for (n in
-                        if (volume) listOf(50f, 75f, 100f, 125f, 150f, 200f, 250f, 300f)
-                        else listOf(.5f, .75f, 1f, 1.25f, 1.5f, 2f)) Action(
-                        if (volume) "${n.toInt()}%" else "%.2f×".format(n)
-                    ) {
+        title = if (volume) "Song volume" else "Song playback speed",
+        subtitle = track.title,
+        icon = if (volume) "volume-2" else "play",
+        actions = {
+            ModalTonalButton(if (volume) "Reset 100%" else "Reset 1.00×", icon = "rotate-ccw") {
+                value = if (volume) 100f else 1f
+                number = value.toString()
+                pitch = false
+                changed = true
+                commit()
+            }
+            ModalPrimaryButton("Done", icon = "check", onClick = ::dismiss)
+        },
+    ) {
+        Column(Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                for (n in
+                    if (volume) listOf(50f, 75f, 100f, 125f, 150f, 200f, 250f, 300f)
+                    else listOf(.5f, .75f, 1f, 1.25f, 1.5f, 2f)) {
+                    val active = kotlin.math.abs(value - n) < 0.01f
+                    ToolPillButton(if (volume) "${n.toInt()}%" else "%.2f×".format(n), active = active) {
                         value = n
                         number = if (volume) n.toInt().toString() else n.toString()
                         changed = true
                         commit()
                     }
                 }
+            }
+            ModalSectionCard {
                 Slider(
                     value,
                     {
@@ -685,29 +740,21 @@ private fun ModifierDialog(g: Graph, track: Track, volume: Boolean, onDismiss: (
                         changed = true
                         commit()
                     }
-                Action(if (volume) "Reset to 100%" else "Reset to 1.00×", "rotate-ccw") {
-                    value = if (volume) 100f else 1f
-                    number = value.toString()
-                    pitch = false
-                    changed = true
-                    commit()
-                }
-                Hint("Saved for this song only")
-                if (volume)
-                    Hint(
-                        "Main ${prefs.master.toInt()}% · Signal ${(songOutputGain(prefs.master,value) * 100).toInt()}%\nSignal caps at 300%; boost can distort peaks. Both settings keep their values."
-                    )
             }
-        },
-        confirmButton = { Action("Close") { dismiss() } },
-    )
+            Hint("Saved for this song only")
+            if (volume)
+                Hint(
+                    "Main ${prefs.master.toInt()}% · Signal ${(songOutputGain(prefs.master,value) * 100).toInt()}%\nSignal caps at 300%; boost can distort peaks. Both settings keep their values."
+                )
+        }
+    }
 }
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun EqualizerDialog(g: Graph, onDismiss: () -> Unit) {
     val prefs by g.prefs.state.collectAsStateWithLifecycle()
-    val presets =
+    val builtins =
         linkedMapOf(
             "Flat" to List(10) { 0f },
             "Bass Boost" to listOf(6f, 5f, 4f, 2f, 0f, 0f, 0f, 0f, 0f, 0f),
@@ -715,71 +762,184 @@ fun EqualizerDialog(g: Graph, onDismiss: () -> Unit) {
             "Pop" to listOf(-1f, 1f, 3f, 4f, 3f, 1f, 0f, -1f, 0f, 1f),
             "Classical" to listOf(3f, 2f, 1f, 0f, -1f, -1f, 0f, 2f, 3f, 3f),
         )
-    var gains by remember { mutableStateOf(prefs.eq) }
-    var enabled by remember { mutableStateOf(prefs.eqEnabled) }
+    val customPresets =
+        remember(prefs.eqPresets) {
+            prefs.eqPresets.filter { !it.deleted && it.name.isNotBlank() }.sortedBy { it.name.lowercase() }
+        }
+    val allPresetNames =
+        remember(customPresets) { builtins.keys.toList() + customPresets.map { it.name } + "Custom" }
+    val activeCustom =
+        remember(prefs.eqPreset, customPresets) {
+            customPresets.firstOrNull { it.name.equals(prefs.eqPreset, ignoreCase = true) }
+        }
+    // always normalize to 10 bands so slider writes cant crash if saved prefs ever had fewer entries
+    var gains by remember(prefs.eq) { mutableStateOf(normalizeEqGains(prefs.eq)) }
+    var enabled by remember(prefs.eqEnabled) { mutableStateOf(prefs.eqEnabled) }
+    var savingPreset by remember { mutableStateOf(false) }
+    var presetName by remember { mutableStateOf("") }
+    var presetError by remember { mutableStateOf("") }
     fun apply(name: String = "Custom") {
-        val copy = gains
+        val copy = normalizeEqGains(gains)
         val on = enabled
-        g.task { g.prefs.update { it.copy(eq = copy, eqEnabled = on, eqPreset = name) } }
-    }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Equalizer") },
-        text = {
-            Column {
-                Choice("Enable", enabled) {
-                    enabled = it
-                    apply()
-                }
-                PickMenu(prefs.eqPreset, presets.keys.toList() + "Custom") { name ->
-                    if (name in presets) {
-                        gains = presets.getValue(name)
-                        apply(name)
-                    }
-                }
-                Column(Modifier.heightIn(max = 380.dp).verticalScroll(rememberScrollState())) {
-                    for ((i, f) in
-                        listOf(
-                                "31 Hz",
-                                "62 Hz",
-                                "125 Hz",
-                                "250 Hz",
-                                "500 Hz",
-                                "1 kHz",
-                                "2 kHz",
-                                "4 kHz",
-                                "8 kHz",
-                                "16 kHz",
-                            )
-                            .withIndex()) Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(f, Modifier.width(58.dp), fontSize = 11.sp)
-                        Slider(
-                            gains.getOrElse(i) { 0f },
-                            { n ->
-                                gains =
-                                    gains.toMutableList().also { it[i] = n.roundToInt().toFloat() }
-                            },
-                            Modifier.weight(1f),
-                            valueRange = -12f..12f,
-                            steps = 23,
-                            onValueChangeFinished = { apply() },
-                        )
-                        Text(
-                            "${gains.getOrElse(i){0f}.toInt()} dB",
-                            Modifier.width(42.dp),
-                            fontSize = 11.sp,
-                        )
-                    }
-                }
-                Action("Reset", "rotate-ccw") {
-                    gains = List(10) { 0f }
-                    apply("Flat")
-                }
-                Hint("Automatic preamp reduction limits clipping.")
+        val now = System.currentTimeMillis()
+        g.task {
+            g.prefs.update {
+                it.copy(
+                    eq = copy,
+                    eqEnabled = on,
+                    eqPreset = name,
+                    eqStateUpdatedAt = maxOf(now, it.eqStateUpdatedAt + 1),
+                )
             }
+        }
+    }
+    fun saveCustomPreset() {
+        val trimmed = presetName.trim()
+        if (trimmed.isEmpty()) {
+            presetError = "Enter a preset name"
+            return
+        }
+        val reserved = builtins.keys + "Custom"
+        if (reserved.any { it.equals(trimmed, ignoreCase = true) }) {
+            presetError = "Choose a name different from built-in presets"
+            return
+        }
+        val normalized = normalizeEqGains(gains)
+        val now = System.currentTimeMillis()
+        savingPreset = false
+        presetError = ""
+        g.task {
+            g.prefs.update { p ->
+                val matching = p.eqPresets.filter { it.name.equals(trimmed, ignoreCase = true) }
+                val existingActive = matching.firstOrNull { !it.deleted }
+                // stay strictly newer than any prior revision so slight clock skew with desktop cant drop local saves
+                val prevMax = matching.maxOfOrNull { it.updatedAt } ?: 0L
+                val stamp = maxOf(now, prevMax + 1)
+                val entry =
+                    EqPreset(
+                        id = existingActive?.id ?: uuid(),
+                        name = trimmed,
+                        gains = normalized,
+                        updatedAt = stamp,
+                        deleted = false,
+                    )
+                p.copy(
+                    eq = normalized,
+                    eqEnabled = enabled,
+                    eqPreset = trimmed,
+                    eqPresets = mergeEqPresets(p.eqPresets, listOf(entry)),
+                    eqStateUpdatedAt = maxOf(stamp, p.eqStateUpdatedAt + 1),
+                )
+            }
+        }
+    }
+    fun deleteCustomPreset(preset: EqPreset) {
+        val now = System.currentTimeMillis()
+        g.task {
+            g.prefs.update { p ->
+                val prevMax =
+                    p.eqPresets
+                        .filter { it.id == preset.id || it.name.equals(preset.name, ignoreCase = true) }
+                        .maxOfOrNull { it.updatedAt } ?: preset.updatedAt
+                // keep tombstone strictly newer so local deletes stick even under clock drift
+                val stamp = maxOf(now, prevMax + 1)
+                val tombstone = preset.copy(gains = emptyList(), updatedAt = stamp, deleted = true)
+                val activeRemoved = p.eqPreset.equals(preset.name, ignoreCase = true)
+                val nextName = if (activeRemoved) "Custom" else p.eqPreset
+                p.copy(
+                    eqPreset = nextName,
+                    eqPresets = mergeEqPresets(p.eqPresets, listOf(tombstone)),
+                    eqStateUpdatedAt = if (activeRemoved) maxOf(stamp, p.eqStateUpdatedAt + 1) else p.eqStateUpdatedAt,
+                )
+            }
+        }
+    }
+    AppModalDialog(
+        onDismissRequest = onDismiss,
+        title = "Equalizer",
+        subtitle = if (enabled) "Active · ${prefs.eqPreset}" else "Disabled",
+        icon = "settings",
+        actions = {
+            ModalTonalButton("Reset", icon = "rotate-ccw") {
+                gains = List(10) { 0f }
+                apply("Flat")
+            }
+            ModalPrimaryButton("Done", icon = "check", onClick = onDismiss)
         },
-        confirmButton = { Action("Close") { onDismiss() } },
-    )
+    ) {
+        ModalSectionCard {
+            Choice("Enable equalizer", enabled) {
+                enabled = it
+                apply(prefs.eqPreset)
+            }
+            Row(
+                Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                // match case-insensitively like activeCustom does so capitalization tweaks dont show "Custom"
+                PickMenu(
+                    allPresetNames.firstOrNull { it.equals(prefs.eqPreset, ignoreCase = true) } ?: "Custom",
+                    allPresetNames,
+                ) { name ->
+                    if (name in builtins) {
+                        gains = builtins.getValue(name)
+                        apply(name)
+                    } else {
+                        customPresets.firstOrNull { it.name == name }?.let { saved ->
+                            gains = normalizeEqGains(saved.gains)
+                            apply(saved.name)
+                        }
+                    }
+                }
+                Spacer(Modifier.weight(1f))
+                ToolPillButton(if (activeCustom != null) "Update" else "Save preset", "plus") {
+                    presetName = activeCustom?.name.orEmpty()
+                    presetError = ""
+                    savingPreset = true
+                }
+                if (activeCustom != null) {
+                    IconAction("trash-2", "Delete saved preset", tint = MaterialTheme.colorScheme.error) {
+                        deleteCustomPreset(activeCustom)
+                    }
+                }
+            }
+            if (savingPreset) {
+                ModalSectionCard(highlighted = true) {
+                    Input(presetName, { presetName = it; presetError = "" }, "Preset name (syncs with desktop)")
+                    if (presetError.isNotBlank()) Text(presetError, fontSize = 12.sp, color = MaterialTheme.colorScheme.error)
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End)) {
+                        ModalTonalButton("Cancel") { savingPreset = false; presetError = "" }
+                        ModalPrimaryButton("Save", icon = "check", enabled = presetName.isNotBlank()) { saveCustomPreset() }
+                    }
+                }
+            }
+        }
+        ModalSectionCard {
+            Column(Modifier.heightIn(max = 310.dp).verticalScroll(rememberScrollState())) {
+                for ((i, f) in
+                    listOf("31 Hz", "62 Hz", "125 Hz", "250 Hz", "500 Hz", "1 kHz", "2 kHz", "4 kHz", "8 kHz", "16 kHz")
+                        .withIndex()) Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(f, Modifier.width(54.dp), fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Slider(
+                        gains.getOrElse(i) { 0f },
+                        { n -> gains = gains.toMutableList().also { it[i] = n.roundToInt().toFloat() } },
+                        Modifier.weight(1f),
+                        valueRange = -12f..12f,
+                        steps = 23,
+                        onValueChangeFinished = { apply() },
+                    )
+                    Text(
+                        "${gains.getOrElse(i){0f}.toInt()} dB",
+                        Modifier.width(42.dp),
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Medium,
+                    )
+                }
+            }
+        }
+        Hint("Automatic preamp reduction limits clipping.")
+    }
 }
 
 @Composable
@@ -791,21 +951,42 @@ private fun MetadataDialog(g: Graph, pickers: Pickers, track: Track, onDismiss: 
     var cover by remember { mutableStateOf("") }
     var searching by remember { mutableStateOf(false) }
     var candidates by remember { mutableStateOf(listOf<Pair<String, String>>()) }
-    AlertDialog(
+    AppModalDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Edit metadata") },
-        text = {
-            Column(Modifier.verticalScroll(rememberScrollState())) {
-                Input(title, { title = it }, "Title")
-                val cleanedTitle = remember(title) { cleanSongTitle(title) }
-                if (cleanedTitle != title) {
-                    Action("Clean title → $cleanedTitle", "check") { title = cleanedTitle }
-                }
-                Input(artist, { artist = it }, "Artist / creator")
-                Input(album, { album = it }, "Album")
-                Input(albumArtist, { albumArtist = it }, "Album artist")
-                Action("Change cover", "image") { pickers.image { cover = it } }
-                Action(if (searching) "Searching…" else "Look up metadata", "search", !searching) {
+        title = "Edit metadata",
+        subtitle = track.title,
+        icon = "pencil",
+        actions = {
+            ModalTonalButton("Cancel", onClick = onDismiss)
+            ModalPrimaryButton("Save", icon = "check") {
+                g.task { g.library.editTags(track.id, title, artist, album, albumArtist, cover) }
+                onDismiss()
+            }
+        },
+    ) {
+        Column(Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Input(title, { title = it }, "Title")
+            val cleanedTitle = remember(title) { cleanSongTitle(title) }
+            if (cleanedTitle != title) {
+                ModalOptionRow("Clean title", cleanedTitle, icon = "check", selected = true) { title = cleanedTitle }
+            }
+            Input(artist, { artist = it }, "Artist / creator")
+            Input(album, { album = it }, "Album")
+            Input(albumArtist, { albumArtist = it }, "Album artist")
+            ModalOptionRow(
+                title = if (cover.isNotBlank()) "Artwork selected" else "Change cover artwork",
+                subtitle = if (cover.isNotBlank()) "Tap to choose another image" else "Pick an image from device storage",
+                icon = "image",
+                selected = cover.isNotBlank(),
+            ) {
+                pickers.image { cover = it }
+            }
+            ModalOptionRow(
+                title = if (searching) "Searching MusicBrainz…" else "Look up metadata",
+                subtitle = "Match title and artist online",
+                icon = "search",
+            ) {
+                if (!searching) {
                     searching = true
                     g.task {
                         try {
@@ -815,22 +996,19 @@ private fun MetadataDialog(g: Graph, pickers: Pickers, track: Track, onDismiss: 
                         }
                     }
                 }
-                for (c in candidates) TextButton({
-                    title = c.first
-                    artist = c.second
-                    candidates = emptyList()
-                }) {
-                    Text(c.first + " · " + c.second)
+            }
+            if (candidates.isNotEmpty()) {
+                ModalSectionCard {
+                    for (c in candidates) {
+                        ModalOptionRow(c.first, c.second, icon = "music-2") {
+                            title = c.first
+                            artist = c.second
+                            candidates = emptyList()
+                        }
+                    }
                 }
-                Hint("Writes embedded tags when the file and provider are writable.")
             }
-        },
-        confirmButton = {
-            Action("Save") {
-                g.task { g.library.editTags(track.id, title, artist, album, albumArtist, cover) }
-                onDismiss()
-            }
-        },
-        dismissButton = { Action("Cancel") { onDismiss() } },
-    )
+            Hint("Writes embedded tags when the file and provider are writable.")
+        }
+    }
 }

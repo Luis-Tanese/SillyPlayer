@@ -434,6 +434,15 @@ class LibraryRepository(private val g: Graph) {
                 (knownTrash?.contains(matching.id) ?: g.dao.trash().any { it.track == matching.id }).not())
                 old = matching
         }
+        val extracted =
+            if (source == null)
+                extractSourceMetadata(
+                    listOf(tags.optString("comment"), tags.optString("purl")),
+                    name,
+                )
+            else null
+        val existingSourceUrl = old?.sourceUrl.orEmpty()
+        val existingSourceItem = old?.sourceItemId.orEmpty()
         val value =
             (old ?: Track()).copy(
                 uri = uri,
@@ -456,11 +465,15 @@ class LibraryRepository(private val g: Graph) {
                 size = size,
                 hash = hash,
                 fileName = name,
-                sourceUrl = source?.url ?: old?.sourceUrl ?: "",
-                uploader = source?.uploader ?: old?.uploader ?: "",
-                videoTitle = source?.title ?: old?.videoTitle ?: "",
-                sourceProvider = source?.provider ?: old?.sourceProvider ?: "unknown",
-                sourceItemId = source?.id ?: old?.sourceItemId ?: "",
+                sourceUrl = source?.url ?: existingSourceUrl.ifBlank { extracted?.url ?: "" },
+                uploader = source?.uploader ?: old?.uploader?.ifBlank { extracted?.uploader ?: "" } ?: "",
+                videoTitle = source?.title ?: old?.videoTitle?.ifBlank { extracted?.title ?: "" } ?: "",
+                sourceProvider =
+                    source?.provider
+                        ?: old?.sourceProvider?.takeIf { it.isNotBlank() && it != "unknown" }
+                        ?: extracted?.provider
+                        ?: "unknown",
+                sourceItemId = source?.id ?: existingSourceItem.ifBlank { extracted?.itemId ?: "" },
                 managed = source != null || old?.managed == true,
             )
         val recovered = recoverIndexedMetadata(value, old)
@@ -608,26 +621,79 @@ class LibraryRepository(private val g: Graph) {
         }
     }
 
-    suspend fun add(
+    data class PlaylistAddResult(val added: Int, val skipped: Int)
+
+    suspend fun addToCollection(
         collection: String,
         ids: List<String>,
-        allowDuplicates: Boolean = false,
-    ): Boolean {
+        allowDuplicates: Boolean? = null,
+    ): PlaylistAddResult {
+        if (collection == "liked") {
+            return g.db.withTransaction {
+                val distinct = ids.distinct()
+                var added = 0
+                for (id in distinct) {
+                    val t = g.dao.track(id)
+                    if (t == null || t.deleted) continue
+                    if (!g.dao.isLiked(id)) {
+                        g.dao.putLike(Like(id))
+                        journal("likes", id, buildJsonObject { put("track", id) })
+                        added++
+                    }
+                }
+                PlaylistAddResult(added, ids.size - added)
+            }
+        }
+        val allow = allowDuplicates ?: g.prefs.state.value.allowPlaylistDuplicates
         return g.db.withTransaction {
             require(g.dao.collection(collection)?.kind in listOf("playlist", "custom")) { "This collection cannot be edited" }
-            val tracks = if (allowDuplicates) ids else ids.distinct()
-            require(tracks.all { g.dao.track(it)?.let { track -> !track.deleted } == true }) { "A selected song is no longer available" }
+            val candidates = if (allow) ids else ids.distinct()
+            require(candidates.all { g.dao.track(it)?.let { track -> !track.deleted } == true }) { "A selected song is no longer available" }
             val existing = g.dao.members(collection)
             val existingTracks = existing.asSequence().map { it.track }.toHashSet()
-            if (!allowDuplicates && tracks.any { it in existingTracks }) return@withTransaction false
+            val toAdd = if (allow) candidates else candidates.filter { it !in existingTracks }
+            val skipped = ids.size - toAdd.size
+            if (toAdd.isEmpty()) return@withTransaction PlaylistAddResult(0, skipped)
             var pos = (existing.maxOfOrNull { it.position } ?: -1) + 1
-            for (id in tracks) {
+            for (id in toAdd) {
                 val m = Member(collection = collection, track = id, position = pos++)
                 g.dao.putMember(m)
                 journal("members", m.id, JsonCodec.encodeToJsonElement(m))
             }
             order(collection)
-            true
+            PlaylistAddResult(toAdd.size, skipped)
+        }
+    }
+
+    suspend fun add(
+        collection: String,
+        ids: List<String>,
+        allowDuplicates: Boolean = false,
+    ): Boolean {
+        val result = addToCollection(collection, ids, allowDuplicates)
+        return allowDuplicates || result.added > 0 || ids.isEmpty()
+    }
+
+    suspend fun removeDuplicates(collection: String): Int {
+        return g.db.withTransaction {
+            require(g.dao.collection(collection)?.kind in listOf("playlist", "custom")) { "This collection cannot be edited" }
+            val existing = g.dao.members(collection)
+            val seen = HashSet<String>()
+            val kept = mutableListOf<Member>()
+            val duplicates = mutableListOf<Member>()
+            for (m in existing) {
+                if (seen.add(m.track)) kept += m else duplicates += m
+            }
+            if (duplicates.isEmpty()) return@withTransaction 0
+            for (m in duplicates) {
+                g.dao.deleteMember(m.id)
+                journal("members", m.id, null)
+            }
+            kept.forEachIndexed { index, m ->
+                if (m.position != index) g.dao.putMember(m.copy(position = index))
+            }
+            order(collection)
+            duplicates.size
         }
     }
 
@@ -660,6 +726,40 @@ class LibraryRepository(private val g: Graph) {
                 journal("likes", id, buildJsonObject { put("track", id) })
             }
         }
+    }
+
+    suspend fun unlikeAll(ids: List<String>): Int =
+        g.db.withTransaction {
+            var removed = 0
+            for (id in ids.distinct()) {
+                if (g.dao.isLiked(id)) {
+                    g.dao.deleteLike(id)
+                    journal("likes", id, null)
+                    removed++
+                }
+            }
+            removed
+        }
+
+    // move songs from one watched folder into recoverable in-app Trash without wiping them permanently
+    suspend fun clearWatchedFolderToTrash(rootId: String): Pair<Int, Int> {
+        val root = g.dao.roots().firstOrNull { it.id == rootId } ?: error("Watched folder not found")
+        val targetTracks =
+            g.dao.tracks().filter { t ->
+                t.root == rootId || (root.uri.isNotBlank() && t.uri.startsWith(root.uri))
+            }
+        if (targetTracks.isEmpty()) return 0 to 0
+        var trashed = 0
+        var failed = 0
+        for (track in targetTracks) {
+            runCatching { trash(listOf(track.id)) }
+                .onSuccess { trashed++ }
+                .onFailure {
+                    if (it is CancellationException) throw it
+                    failed++
+                }
+        }
+        return trashed to failed
     }
 
     fun requireMusicFolder(folder: String = g.prefs.state.value.musicDir): DocumentFile {
@@ -1496,6 +1596,107 @@ class LibraryRepository(private val g: Graph) {
         }
         trash(remove)
         for (id in remove) g.dao.track(id)?.let { g.dao.putTrack(it.copy(mergedInto = keep)) }
+    }
+
+    suspend fun reinstateFolder(treeUri: Uri): String {
+        if (g.resetting.value) return "Wait for library reset to finish first"
+        val folder = DocumentFile.fromTreeUri(g.context, treeUri)
+            ?: return "Could not open the selected folder"
+        if (!folder.canRead()) return "Selected folder is not readable"
+
+        val known = HashMap<String, Track>()
+        val knownHashes = HashMap<String, MutableList<Track>>()
+        for (track in g.dao.recoveryTracks()) {
+            known[documentKey(track.uri)] = track
+            if (!track.deleted && track.mergedInto.isBlank() && track.hash.isNotBlank())
+                knownHashes.getOrPut(track.hash) { mutableListOf() }.add(track)
+        }
+        val knownTrash = g.dao.trash().mapTo(HashSet()) { it.track }
+        val matchedRootId = g.dao.roots().firstOrNull { it.uri == treeUri.toString() }?.id.orEmpty()
+
+        var checked = 0
+        var reinstated = 0
+        var linksRestored = 0
+        var coversRestored = 0
+        var failed = 0
+        val visited = mutableSetOf<String>()
+
+        // walk the picked folder, force-recheck tags/art/links, reinstate missing songs, and save to db mirror
+        suspend fun walk(uri: Uri, depth: Int = 0) {
+            if (depth >= 64 || !visited.add(documentKey(uri.toString()))) return
+            val children =
+                DocumentsContract.buildChildDocumentsUriUsingTree(
+                    uri,
+                    DocumentsContract.getDocumentId(uri),
+                )
+            val projection =
+                arrayOf(
+                    DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                    DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                    DocumentsContract.Document.COLUMN_MIME_TYPE,
+                )
+            val cursor =
+                g.context.contentResolver.query(children, projection, null, null, null) ?: return
+            cursor.use { c ->
+                while (c.moveToNext()) {
+                    currentCoroutineContext().ensureActive()
+                    val name = c.getString(1) ?: ""
+                    if (name.startsWith(".sillyplayer")) continue
+                    val child = DocumentsContract.buildDocumentUriUsingTree(uri, c.getString(0))
+                    val mime = c.getString(2) ?: ""
+                    if (mime == DocumentsContract.Document.MIME_TYPE_DIR) {
+                        walk(child, depth + 1)
+                    } else if (name.substringAfterLast('.').lowercase() in audio || mime.startsWith("audio/")) {
+                        ++checked
+                        val key = documentKey(child.toString())
+                        val prev = known[key]
+                        if (prev != null && (prev.id in knownTrash || prev.mergedInto == "sync-deleted")) continue
+                        try {
+                            g.fileGate.withLock {
+                                val updated =
+                                    indexUnlocked(
+                                        child.toString(),
+                                        force = true,
+                                        rootId = matchedRootId,
+                                        knownTrack = prev,
+                                        knownHashes = knownHashes,
+                                        knownTrash = knownTrash,
+                                    )
+                                known[key] = updated
+                                knownHashes[updated.hash]?.removeAll { it.id == updated.id }
+                                if (prev == null || prev.deleted) ++reinstated
+                                if (prev?.sourceUrl.isNullOrBlank() && updated.sourceUrl.isNotBlank()) ++linksRestored
+                                if (prev?.art.isNullOrBlank() && updated.art.isNotBlank()) ++coversRestored
+                            }
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (_: Exception) {
+                            ++failed
+                        }
+                        status.value = "Reinstating folder… $checked files checked"
+                    }
+                }
+            }
+        }
+
+        walk(folder.uri)
+        if (checked == 0) return "No audio files found in that folder"
+        val savedDb =
+            runCatching {
+                    recovery.saveNow(allowEmpty = false)
+                    g.prefs.state.value.musicDir.isNotBlank()
+                }
+                .getOrDefault(false)
+        status.value = "Library up to date"
+        val parts = mutableListOf("Checked $checked ${if (checked == 1) "file" else "files"}")
+        if (reinstated > 0) parts += "$reinstated reinstated"
+        if (linksRestored > 0) parts += "$linksRestored source ${if (linksRestored == 1) "link" else "links"} restored"
+        if (coversRestored > 0) parts += "$coversRestored ${if (coversRestored == 1) "cover" else "covers"} restored"
+        if (failed > 0) parts += "$failed unreadable"
+        if (reinstated == 0 && linksRestored == 0 && coversRestored == 0 && failed == 0)
+            parts += "everything already up to date"
+        if (savedDb) parts += "Database saved"
+        return parts.joinToString(" · ")
     }
 
     suspend fun locate(id: String, uri: String) =

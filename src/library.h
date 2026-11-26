@@ -28,6 +28,7 @@ public:
   Q_INVOKABLE void rescan();
   Q_INVOKABLE QVariantMap track(const QString &id) const;
   Q_INVOKABLE bool removeRecords(const QStringList &ids);
+  QVariantMap reinstateFolder(const QString &folderPath);
   bool trashFile(const QString &id);
   bool trashing() const { return m_trashing; }
   bool trashFiles(const QStringList &ids);

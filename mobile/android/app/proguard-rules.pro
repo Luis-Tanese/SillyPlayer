@@ -11,3 +11,12 @@
 -dontwarn org.mozilla.javascript.JavaToJSONConverters
 -dontwarn javax.script.**
 -dontwarn jdk.dynalink.**
+
+# Protobuf Lite reflects on message fields in R8 minified builds
+-keepclassmembers class * extends com.google.protobuf.GeneratedMessageLite {
+    <fields>;
+}
+-keep class org.schabi.newpipe.extractor.services.youtube.protos.** { *; }
+-keepclassmembers class * extends androidx.datastore.preferences.protobuf.GeneratedMessageLite {
+    <fields>;
+}

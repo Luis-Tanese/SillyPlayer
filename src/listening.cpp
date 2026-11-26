@@ -132,10 +132,11 @@ QVariantList Listening::recentTracks() const {
   return s->rows("SELECT t.*,EXISTS(SELECT 1 FROM likes WHERE track=t.id) AS liked FROM track_listens l JOIN tracks t ON t.id=l.track WHERE t.deleted=0 ORDER BY l.lastPlayed DESC,t.id LIMIT 100");
 }
 QVariantList Listening::mostPlayed(const QString &period,bool artists) const {
-  const qint64 now=QDateTime::currentMSecsSinceEpoch();
-  qint64 cutoff=now-30LL*86400000;
-  if(period=="day") cutoff=QDateTime(QDate::currentDate(),QTime(0,0)).toMSecsSinceEpoch();
-  else if(period=="week") cutoff=now-7LL*86400000;
+  // match the calendar-midnight cutoffs used by insights so totalPlays and chart sums actually agree
+  const QDate today=QDate::currentDate();
+  qint64 cutoff=QDateTime(today.addDays(-29),QTime(0,0)).toMSecsSinceEpoch();
+  if(period=="day") cutoff=QDateTime(today,QTime(0,0)).toMSecsSinceEpoch();
+  else if(period=="week") cutoff=QDateTime(today.addDays(-6),QTime(0,0)).toMSecsSinceEpoch();
   const bool all=period=="all";
   const QString source=all ? "SELECT track,plays,lastPlayed FROM track_listens" : "SELECT track,COUNT(*) AS plays,MAX(playedAt) AS lastPlayed FROM listening_plays WHERE playedAt>=? GROUP BY track";
   const QVariantList args=all ? QVariantList{} : QVariantList{cutoff};
@@ -291,6 +292,15 @@ QVariantMap Listening::insights(const QString &period) const {
 void Listening::reload() {
   const auto value=s->rows("SELECT milliseconds FROM listening_totals WHERE id=1").value(0).toMap()["milliseconds"].toDouble();
   totalMs=value;emit summaryChanged();emit rankingsChanged();
+}
+void Listening::resetState() {
+  poller.stop();
+  track.clear(); path.clear(); session.clear();
+  totalMs=realMs=mediaMs=wallBudget=audioBudget=0;
+  qualified=false; dirty=false; pendingPlays.clear(); previous={};
+  const auto totals=s->rows("SELECT * FROM listening_totals WHERE id=1").value(0).toMap();
+  started=totals.value("started").toLongLong();
+  emit summaryChanged(); emit rankingsChanged();
 }
 void Listening::shutdown() {
   if(closed) return;

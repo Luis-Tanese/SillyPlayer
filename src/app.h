@@ -5,6 +5,7 @@
 #include "catalogue.h"
 #include "listening.h"
 #include "backup.h"
+#include "recovery.h"
 #include "sleeptimer.h"
 #include "librarytools.h"
 #include "sync.h"
@@ -24,6 +25,7 @@ class App : public QObject {
   Q_PROPERTY(QObject *statistics READ statistics CONSTANT)
   Q_PROPERTY(QObject *sleepTimer READ timerObject CONSTANT)
   Q_PROPERTY(QObject *backup READ backupObject CONSTANT)
+  Q_PROPERTY(QObject *recovery READ recoveryObject CONSTANT)
   Q_PROPERTY(QObject *libraryTools READ toolsObject CONSTANT)
   Q_PROPERTY(QObject *sync READ syncObject CONSTANT)
   Q_PROPERTY(QObject *discord READ discordObject CONSTANT)
@@ -41,6 +43,7 @@ public:
   Listening listening;
   SleepTimer sleepTimer;
   Backup backup;
+  DesktopRecovery recovery;
   LibraryTools libraryTools;
   SyncManager sync;
   DiscordRpc discord;
@@ -49,6 +52,7 @@ public:
   QObject *toolsObject() { return &libraryTools; }
   QObject *timerObject() { return &sleepTimer; }
   QObject *backupObject() { return &backup; }
+  QObject *recoveryObject() { return &recovery; }
   QObject *statistics() { return &listening; }
   QVariantMap settings() const;
   QVariantList collections() const;
@@ -78,6 +82,8 @@ public:
   Q_INVOKABLE void playNext(const QString &id);
   Q_INVOKABLE QVariantMap queueTracks(const QStringList &tracks, bool next);
   Q_INVOKABLE QVariantMap addTracksToCollection(const QString &collection, const QStringList &tracks, const QString &policy = "ask");
+  Q_INVOKABLE int countPlaylistDuplicates(const QString &collection) const;
+  Q_INVOKABLE QVariantMap removePlaylistDuplicates(const QString &collection);
   Q_INVOKABLE QVariantMap removeMembers(const QString &collection, const QStringList &members);
   Q_INVOKABLE QVariantMap unlikeTracks(const QStringList &tracks);
   Q_INVOKABLE bool trashTracks(const QStringList &tracks);
@@ -115,6 +121,9 @@ public:
   Q_INVOKABLE void removeLibraryTrack(const QString &id);
   Q_INVOKABLE void trashTrack(const QString &id);
   Q_INVOKABLE QVariantMap clearMusicFolder(const QString &folderPath = {});
+  Q_INVOKABLE QVariantMap reinstateFolder(const QString &folderPath = {});
+  Q_INVOKABLE QVariantMap repairDownloadedSongs();
+  Q_INVOKABLE QVariantMap resetDesktopLibrary(bool removeCachedMedia = false);
   Q_INVOKABLE QVariantMap exportPlaylistM3u(const QString &collectionId);
   Q_INVOKABLE QVariantMap importPlaylistM3u();
   Q_INVOKABLE QString cleanTitle(const QString &title) const;
@@ -122,6 +131,8 @@ public:
   Q_INVOKABLE QString speedLabel(const QVariantMap &track) const;
   Q_INVOKABLE void applySpeed(double value, bool nightcore);
   Q_INVOKABLE void applyEq(bool enabled, const QVariantList &gains, const QString &preset = {});
+  Q_INVOKABLE QVariantMap saveEqPreset(const QString &name, const QVariantList &gains);
+  Q_INVOKABLE QVariantMap deleteEqPreset(const QString &id);
   Q_INVOKABLE QString time(double value) const;
   void save();
   void shutdown();

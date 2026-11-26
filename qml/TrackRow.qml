@@ -24,7 +24,9 @@ Rectangle {
     HoverHandler {
         id: hover
     }
+    // desktop sticks to click plus shift/ctrl selection instead of drag-select
     MouseArea {
+        id: rowMouse
         anchors.fill: parent
         onClicked: mouse => row.activate(mouse.modifiers, false)
     }

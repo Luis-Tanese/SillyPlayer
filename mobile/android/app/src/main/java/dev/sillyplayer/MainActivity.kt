@@ -37,6 +37,8 @@ class MainActivity : ComponentActivity() {
                                 }
                             peer?.let { graph.sync.start(it) }
                         }
+                    } else if (purpose == "reinstate") {
+                        graph.message.value = graph.library.reinstateFolder(uri)
                     } else {
                         graph.library.register(uri)
                         if (purpose.startsWith("replace:"))

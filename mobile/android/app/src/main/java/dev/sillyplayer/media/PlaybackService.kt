@@ -22,6 +22,7 @@ import dev.sillyplayer.data.Track
 import dev.sillyplayer.data.splitArtists
 import dev.sillyplayer.graph
 import dev.sillyplayer.ui.Palettes
+import dev.sillyplayer.ui.canonicalPalette
 import dev.sillyplayer.widget.PlayerWidget
 import dev.sillyplayer.widget.WidgetState
 import java.util.Locale
@@ -399,7 +400,7 @@ class PlaybackService : MediaLibraryService() {
                 return@launch
             }
             combine(engine.state, graph.prefs.state) { state, prefs ->
-                    val palette = Palettes[prefs.palette] ?: Palettes.getValue("Catppuccin")
+                    val palette = Palettes[canonicalPalette(prefs.palette)] ?: Palettes.getValue("Catppuccin")
                     val offset = if (prefs.light) 6 else 0
                     fun color(index: Int) =
                         (0xff000000L or palette[offset + index].toLong(16)).toInt()

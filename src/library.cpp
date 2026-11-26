@@ -4,6 +4,7 @@
 #include "platformfiles.h"
 #include "online.h"
 #include "source.h"
+#include "sourcetags.h"
 #include "tagcleanup.h"
 #include <QBuffer>
 #include <QCryptographicHash>
@@ -68,6 +69,11 @@ static QVariantMap readTrack(const QString &path, const QString &cache) {
     QVariantMap tags;
     const auto originalTags = format["tags"].toMap();
     for (auto it=originalTags.begin(); it!=originalTags.end(); ++it) tags[it.key().toLower()]=it.value();
+    QStringList sourceHints;
+    for (const auto &k : {"comment", "purl", "url", "description", "woas"}) {
+      const QString val = tags.value(k).toString().trimmed();
+      if (!val.isEmpty()) sourceHints << val;
+    }
     return {{"path", fi.absoluteFilePath()},
             {"title", tags.value("title", fi.completeBaseName())},
             {"fallbackTitle", tags.value("title").toString().trimmed().isEmpty()},
@@ -83,6 +89,7 @@ static QVariantMap readTrack(const QString &path, const QString &cache) {
             {"mtime", fi.lastModified().toMSecsSinceEpoch()},
             {"size", fi.size()},
             {"identity", identity(path)},
+            {"extractedSource", extractSourceMetadata(sourceHints, fi.fileName())},
             {"art", ""}};
   }
   if (f.isNull() || !f.tag())
@@ -134,6 +141,20 @@ static QVariantMap readTrack(const QString &path, const QString &cache) {
     m["albumArtist"] = str(props["ALBUMARTIST"].front());
   if (props.contains("DISCNUMBER") && !props["DISCNUMBER"].isEmpty())
     m["disc"] = str(props["DISCNUMBER"].front()).section('/', 0, 0).toInt();
+  // grab source links embedded by yt-dlp/sillyplayer so local rescans keep youtube ids and covers
+  QStringList sourceHints;
+  const QString commentVal = str(t->comment()).trimmed();
+  if (!commentVal.isEmpty()) sourceHints << commentVal;
+  for (const char *key : {"COMMENT", "PURL", "URL", "WOAS", "DESCRIPTION", "WEBSITE"}) {
+    if (props.contains(key)) {
+      for (const auto &v : props[key]) {
+        const QString s = str(v).trimmed();
+        if (!s.isEmpty()) sourceHints << s;
+      }
+    }
+  }
+  const auto extracted = extractSourceMetadata(sourceHints, fi.fileName());
+  if (!extracted.isEmpty()) m["extractedSource"] = extracted;
   QByteArray cover;
   TagLib::Ogg::XiphComment *xiph = nullptr;
   if (auto vorbis = dynamic_cast<TagLib::Ogg::Vorbis::File *>(f.file()))
@@ -579,9 +600,144 @@ bool Library::applyTrack(const QVariantMap &data, const QString &root,
             "WHERE id=?",
             {source.value("webpage_url", ""), source.value("uploader", ""),
              source.value("title", ""), Source::provider(source)=="youtube" ? source.value("id", "") : QVariant(""), Source::provider(source),source.value("id", ""), id});
+  else {
+    const auto extracted = data.value("extractedSource").toMap();
+    // backfill missing source url/videoId from tags or filename without clobbering existing db attribution
+    if (!extracted.isEmpty() &&
+        previous.value("sourceUrl").toString().trimmed().isEmpty() &&
+        previous.value("videoId").toString().trimmed().isEmpty()) {
+      const QString prov = extracted.value("sourceProvider").toString();
+      sql("UPDATE tracks SET sourceUrl=?,uploader=CASE WHEN uploader='' THEN ? ELSE uploader END,"
+          "videoTitle=CASE WHEN videoTitle='' THEN ? ELSE videoTitle END,"
+          "videoId=?,sourceProvider=CASE WHEN sourceProvider='' OR sourceProvider='unknown' THEN ? ELSE sourceProvider END,"
+          "sourceItemId=CASE WHEN sourceItemId='' THEN ? ELSE sourceItemId END WHERE id=?",
+          {extracted.value("sourceUrl", ""), extracted.value("uploader", ""),
+           extracted.value("videoTitle", ""), extracted.value("videoId", ""),
+           prov.isEmpty() ? QStringLiteral("unknown") : prov,
+           extracted.value("sourceItemId", ""), id});
+    }
+  }
   if (!root.isEmpty())
     sql("INSERT OR IGNORE INTO track_roots VALUES(?,?)", {id, root});
   return ok;
+}
+QVariantMap Library::reinstateFolder(const QString &folderPath) {
+  if (m_busy || m_trashing || maintenance)
+    return {{"ok", false}, {"message", "Wait for current library work to finish first"}};
+  const QString clean = QDir::cleanPath(QFileInfo(filePath(folderPath)).absoluteFilePath());
+  const QFileInfo dirInfo(clean);
+  if (clean.isEmpty() || !dirInfo.isDir() || !dirInfo.isReadable())
+    return {{"ok", false}, {"message", "Choose a readable folder first"}};
+
+  static const QStringList exts{"mp3", "flac", "ogg", "oga", "opus", "m4a", "aac", "wav", "webm"};
+  QStringList files;
+  QDirIterator it(clean, QDir::Files, QDirIterator::Subdirectories);
+  while (it.hasNext()) {
+    const QString p = it.next();
+    if (p.contains("/.sillyplayer-restore-") || p.contains("/.sillyplayer/")) continue;
+    const QFileInfo fi = it.fileInfo();
+    if (fi.isSymLink() || !exts.contains(fi.suffix().toLower())) continue;
+    files << fi.absoluteFilePath();
+  }
+  if (files.isEmpty())
+    return {{"ok", true}, {"checked", 0}, {"reinstated", 0}, {"linksRestored", 0}, {"coversRestored", 0},
+            {"message", "No audio files found in that folder"}};
+
+  // match an existing watched root if this folder is inside one so track_roots stays accurate
+  QString matchedRoot;
+  for (const auto &v : s->rows("SELECT id,path FROM roots")) {
+    const auto r = v.toMap();
+    const QString rp = QDir::cleanPath(QFileInfo(r["path"].toString()).absoluteFilePath());
+    if (clean == rp || clean.startsWith(rp + '/')) {
+      matchedRoot = r["id"].toString();
+      break;
+    }
+  }
+
+  int reinstated = 0, linksRestored = 0, coversRestored = 0, failed = 0;
+  if (!s->db().transaction())
+    return {{"ok", false}, {"message", "Could not start database transaction"}};
+  bool ok = true;
+  for (const QString &p : files) {
+    const auto data = readTrack(p, cache);
+    if (data.isEmpty()) {
+      ++failed;
+      continue;
+    }
+    const auto extracted = data.value("extractedSource").toMap();
+    auto existing = s->rows("SELECT * FROM tracks WHERE path=?", {data["path"]});
+    if (existing.isEmpty() && !data["identity"].toString().isEmpty()) {
+      auto moved = s->rows("SELECT * FROM tracks WHERE identity=? AND size=? AND mtime=?",
+                           {data["identity"], data["size"], data["mtime"]});
+      if (moved.size() == 1 && !QFile::exists(moved[0].toMap()["path"].toString()))
+        existing = moved;
+    }
+    if (existing.isEmpty()) {
+      if (applyTrack(data, matchedRoot, false, extracted)) {
+        ++reinstated;
+        if (!extracted.isEmpty()) ++linksRestored;
+        if (!data.value("art").toString().isEmpty()) ++coversRestored;
+      } else {
+        ok = false;
+        break;
+      }
+      continue;
+    }
+    const auto prev = existing.first().toMap();
+    const QString id = prev["id"].toString();
+    const bool wasDeleted = prev["deleted"].toBool() && prev["mergedInto"].toString() != "sync-deleted";
+    const bool wasUnavailable = !prev["available"].toBool();
+    if (wasDeleted || wasUnavailable) {
+      ok = s->exec("UPDATE tracks SET path=?,available=1,deleted=0 WHERE id=?", {data["path"], id}) && ok;
+      if (wasDeleted) ++reinstated;
+    }
+    const QString oldArt = prev["art"].toString();
+    const bool oldArtMissing = oldArt.isEmpty() || !QFileInfo::exists(filePath(oldArt));
+    const QString newArt = data.value("art").toString();
+    if (oldArtMissing && !newArt.isEmpty()) {
+      ok = s->exec("UPDATE tracks SET art=? WHERE id=?", {newArt, id}) && ok;
+      ++coversRestored;
+    }
+    const bool missingSource =
+        prev["videoId"].toString().trimmed().isEmpty() && prev["sourceUrl"].toString().trimmed().isEmpty();
+    if (missingSource && !extracted.isEmpty()) {
+      const QString prov = extracted.value("sourceProvider").toString();
+      ok = s->exec(
+               "UPDATE tracks SET sourceUrl=?,uploader=CASE WHEN uploader='' THEN ? ELSE uploader END,"
+               "videoTitle=CASE WHEN videoTitle='' THEN ? ELSE videoTitle END,"
+               "videoId=?,sourceProvider=CASE WHEN sourceProvider='' OR sourceProvider='unknown' THEN ? ELSE sourceProvider END,"
+               "sourceItemId=CASE WHEN sourceItemId='' THEN ? ELSE sourceItemId END WHERE id=?",
+               {extracted.value("sourceUrl", ""), extracted.value("uploader", ""),
+                extracted.value("videoTitle", ""), extracted.value("videoId", ""),
+                prov.isEmpty() ? QStringLiteral("unknown") : prov,
+                extracted.value("sourceItemId", ""), id}) &&
+           ok;
+      ++linksRestored;
+    }
+    if (!matchedRoot.isEmpty())
+      ok = s->exec("INSERT OR IGNORE INTO track_roots VALUES(?,?)", {id, matchedRoot}) && ok;
+    if (!ok) break;
+  }
+  if (!ok || !s->db().commit()) {
+    s->db().rollback();
+    return {{"ok", false}, {"message", "Could not save reinstated folder changes: " + s->error()}};
+  }
+  emit changed();
+  QStringList parts;
+  parts << QString("Checked %1 %2").arg(files.size()).arg(files.size() == 1 ? "file" : "files");
+  if (reinstated > 0) parts << QString("%1 reinstated").arg(reinstated);
+  if (linksRestored > 0) parts << QString("%1 source %2 restored").arg(linksRestored).arg(linksRestored == 1 ? "link" : "links");
+  if (coversRestored > 0) parts << QString("%1 %2 restored").arg(coversRestored).arg(coversRestored == 1 ? "cover" : "covers");
+  if (failed > 0) parts << QString("%1 unreadable").arg(failed);
+  if (reinstated == 0 && linksRestored == 0 && coversRestored == 0 && failed == 0)
+    parts << "everything already up to date";
+  return {{"ok", true},
+          {"checked", files.size()},
+          {"reinstated", reinstated},
+          {"linksRestored", linksRestored},
+          {"coversRestored", coversRestored},
+          {"failed", failed},
+          {"message", parts.join(QStringLiteral(" · "))}};
 }
 void Library::importFile(const QString &path, const QVariantMap &source) {
   if(maintenance) { deferredImports.append({path,source}); return; }

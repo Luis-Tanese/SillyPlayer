@@ -97,8 +97,58 @@ class NewFeaturesTest {
     fun preferencesDefaultsHaveSmartShuffleOffAndEmptyPins() {
         val prefs = Preferences()
         assertFalse(prefs.smartShuffle)
+        assertFalse(prefs.allowPlaylistDuplicates)
+        assertTrue(prefs.eqPresets.isEmpty())
         assertTrue(prefs.pinnedPlaylists.isEmpty())
         assertTrue(prefs.pinnedArtists.isEmpty())
+    }
+
+    @Test
+    fun normalizeYoutubeCollectionUrlHandlesMusicLinksAndTrackingParams() {
+        assertEquals(
+            "https://www.youtube.com/playlist?list=PLWyngZ1wSkETpYiqDXHs7N1kUkuXj_VIK",
+            dev.sillyplayer.online.normalizeYoutubeCollectionUrl(
+                "https://music.youtube.com/playlist?list=PLWyngZ1wSkETpYiqDXHs7N1kUkuXj_VIK&drli=1"
+            ),
+        )
+        assertEquals(
+            "https://www.youtube.com/playlist?list=PLWyngZ1wSkETpYiqDXHs7N1kUkuXj_VIK",
+            dev.sillyplayer.online.normalizeYoutubeCollectionUrl(
+                "https://music.youtube.com/playlist/?list=PLWyngZ1wSkETpYiqDXHs7N1kUkuXj_VIK&drli=1"
+            ),
+        )
+        assertEquals(
+            "https://www.youtube.com/watch?v=daPIDjeLjPo&list=RDdaPIDjeLjPo",
+            dev.sillyplayer.online.normalizeYoutubeCollectionUrl(
+                "https://music.youtube.com/watch?v=daPIDjeLjPo&list=RDdaPIDjeLjPo&drli=1"
+            ),
+        )
+    }
+
+    @Test
+    fun mergeEqPresetsHandlesLwwUpdatesDeletionsAndNameCollisions() {
+        val local =
+            listOf(
+                EqPreset(id = "p1", name = "Bass", gains = listOf(20f, -20f, 3f), updatedAt = 100L),
+                EqPreset(id = "p2", name = "Chill", gains = listOf(1f, 2f), updatedAt = 200L),
+            )
+        val remote =
+            listOf(
+                EqPreset(id = "p1", name = "Bass", gains = listOf(4f, 5f, 0f), updatedAt = 300L),
+                EqPreset(id = "p2", name = "Chill", gains = emptyList(), updatedAt = 400L, deleted = true),
+                EqPreset(id = "p3", name = "Nightcore", gains = listOf(-1f, 0f, 2f), updatedAt = 500L),
+            )
+        val merged = mergeEqPresets(local, remote)
+        val bass = merged.first { it.id == "p1" }
+        assertFalse(bass.deleted)
+        assertEquals(10, bass.gains.size)
+        assertEquals(listOf(4f, 5f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f), bass.gains)
+
+        val chill = merged.first { it.id == "p2" }
+        assertTrue(chill.deleted)
+
+        val nightcore = merged.first { it.id == "p3" }
+        assertEquals("Nightcore", nightcore.name)
     }
 
     @Test
@@ -150,5 +200,99 @@ class NewFeaturesTest {
         val chill = buildAndroidFolderView(listOf(t1, t2, t3), listOf(root), "Synced/Chill")
         assertEquals(1, chill.tracks.size)
         assertEquals("Synced Song", chill.tracks.first().title)
+    }
+
+    @Test
+    fun folderTreePreservesLiteralPlusSignsInSafFolderNames() {
+        val root =
+            Root(
+                id = "r1",
+                uri = "content://com.android.externalstorage.documents/tree/primary%3AMusic",
+                name = "Music",
+            )
+        val track =
+            Track(
+                id = "tp",
+                title = "Plus Song",
+                root = "r1",
+                uri = "content://com.android.externalstorage.documents/tree/primary%3AMusic/document/primary%3AMusic%2FRock+Pop%2Ftrack.mp3",
+            )
+        val music = buildAndroidFolderView(listOf(track), listOf(root), "Music")
+        assertEquals(listOf("Rock+Pop"), music.folders.map { it.name })
+    }
+
+    @Test
+    fun mergeEqStateSyncsEnabledPresetGainsAndHandlesRemotePresetChanges() {
+        val local = EqStateSync(enabled = false, preset = "Flat", gains = List(10) { 0f }, updatedAt = 100L)
+        val remote = EqStateSync(enabled = true, preset = "Bass", gains = listOf(4f, 3f, 2f, 0f, 0f, 0f, 0f, 0f, 0f, 0f), updatedAt = 200L)
+        val presets = listOf(EqPreset(id = "p1", name = "Bass", gains = listOf(6f, 5f, 4f, 0f, 0f, 0f, 0f, 0f, 0f, 0f), updatedAt = 250L))
+        val merged = mergeEqState(local, remote, presets)
+        assertTrue(merged.enabled)
+        assertEquals("Bass", merged.preset)
+        assertEquals(6f, merged.gains[0])
+
+        val afterDelete = mergeEqState(merged, null, listOf(EqPreset(id = "p1", name = "Bass", gains = emptyList(), updatedAt = 300L, deleted = true)))
+        assertEquals("Custom", afterDelete.preset)
+        assertEquals(6f, afterDelete.gains[0])
+    }
+
+    @Test
+    fun portableSettingsPreservesPinsSmartShuffleAndEqStateTimestamp() {
+        val prefs =
+            Preferences(
+                smartShuffle = true,
+                updateNotifications = false,
+                pinnedPlaylists = listOf("pl-1"),
+                pinnedArtists = listOf("artist:anguish"),
+                eqStateUpdatedAt = 123456L,
+            )
+        val restored = PortableSettings.from(prefs).applyTo(Preferences())
+        assertTrue(restored.smartShuffle)
+        assertFalse(restored.updateNotifications)
+        assertEquals(listOf("pl-1"), restored.pinnedPlaylists)
+        assertEquals(listOf("artist:anguish"), restored.pinnedArtists)
+        assertEquals(123456L, restored.eqStateUpdatedAt)
+    }
+
+    @Test
+    fun canonicalPaletteDeduplicatesAndResolvesLegacyAliases() {
+        assertEquals("Catppuccin", dev.sillyplayer.ui.canonicalPalette("Catppuccin Mocha"))
+        assertEquals("Gruvbox", dev.sillyplayer.ui.canonicalPalette("Gruvbox Dark"))
+        assertEquals("Solarized", dev.sillyplayer.ui.canonicalPalette("Solarized Light"))
+        assertEquals(dev.sillyplayer.ui.Palettes.size, dev.sillyplayer.ui.Palettes.values.toSet().size)
+    }
+
+    @Test
+    fun extractSourceMetadataParsesSillyPlayerCommentsPurlAndFilenames() {
+        val fromComment =
+            extractSourceMetadata(
+                listOf("https://www.youtube.com/watch?v=dQw4w9WgXcQ · Uploader: Rick · Original title: Never Gonna Give You Up"),
+                "renamed.mp3",
+            )
+        assertNotNull(fromComment)
+        assertEquals("youtube", fromComment!!.provider)
+        assertEquals("dQw4w9WgXcQ", fromComment.itemId)
+        assertEquals("Rick", fromComment.uploader)
+        assertEquals("Never Gonna Give You Up", fromComment.title)
+
+        val fromFile = extractSourceMetadata(emptyList(), "G.H.O.S.T. [aBcDeFgHiJk] 1234abcd.opus")
+        assertNotNull(fromFile)
+        assertEquals("youtube", fromFile!!.provider)
+        assertEquals("aBcDeFgHiJk", fromFile.itemId)
+        assertEquals("https://www.youtube.com/watch?v=aBcDeFgHiJk", fromFile.url)
+
+        val fromSoundCloud = extractSourceMetadata(listOf("https://soundcloud.com/artist/track"), "track.mp3")
+        assertNotNull(fromSoundCloud)
+        assertEquals("soundcloud", fromSoundCloud!!.provider)
+    }
+
+    @Test
+    fun perceptualFadeGainUsesSmoothQuadraticCurveAndClampsBounds() {
+        assertEquals(0f, dev.sillyplayer.media.perceptualFadeGain(-0.5f), 0.0001f)
+        assertEquals(0f, dev.sillyplayer.media.perceptualFadeGain(0f), 0.0001f)
+        assertEquals(0.0625f, dev.sillyplayer.media.perceptualFadeGain(0.25f), 0.0001f)
+        assertEquals(0.25f, dev.sillyplayer.media.perceptualFadeGain(0.5f), 0.0001f)
+        assertEquals(1f, dev.sillyplayer.media.perceptualFadeGain(1f), 0.0001f)
+        assertEquals(1f, dev.sillyplayer.media.perceptualFadeGain(2f), 0.0001f)
     }
 }

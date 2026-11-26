@@ -2,6 +2,7 @@ package dev.sillyplayer.ui
 
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.*
+import androidx.compose.foundation.gestures.*
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.*
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -10,7 +11,14 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.*
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.key.*
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.pointerInput
+import kotlin.math.abs
+import kotlin.math.hypot
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -20,7 +28,10 @@ import dev.sillyplayer.Graph
 import dev.sillyplayer.data.*
 import java.util.Locale
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -69,6 +80,8 @@ fun MusicScreen(
     var query by rememberSaveable { mutableStateOf("") }
     var sort by rememberSaveable { mutableStateOf("Recently added") }
     var sortAsc by rememberSaveable { mutableStateOf(false) }
+    var playlistSort by rememberSaveable { mutableStateOf("Playlist order") }
+    var playlistSortAsc by rememberSaveable { mutableStateOf(true) }
     var artistSort by rememberSaveable { mutableStateOf("Name") }
     var artistSortAsc by rememberSaveable { mutableStateOf(true) }
     var albumType by rememberSaveable { mutableStateOf("Generated") }
@@ -81,9 +94,9 @@ fun MusicScreen(
     var rename by remember { mutableStateOf<dev.sillyplayer.data.Collection?>(null) }
     var delete by remember { mutableStateOf<dev.sillyplayer.data.Collection?>(null) }
     var collectionMenu by remember { mutableStateOf<dev.sillyplayer.data.Collection?>(null) }
+    var removeDuplicatesTarget by remember { mutableStateOf<Pair<dev.sillyplayer.data.Collection, Int>?>(null) }
     var artistMenu by remember { mutableStateOf<Pair<String, String>?>(null) }
     var addTo by remember { mutableStateOf(false) }
-    var duplicate by remember { mutableStateOf<Pair<String, List<String>>?>(null) }
     var showSongPicker by rememberSaveable { mutableStateOf(false) }
     var trash by remember { mutableStateOf(false) }
     var batchEdit by remember { mutableStateOf(false) }
@@ -104,6 +117,8 @@ fun MusicScreen(
         collectionId = id
         collectionName = title
         query = ""
+        playlistSort = "Playlist order"
+        playlistSortAsc = true
         closeSelection()
         editing = false
         showSongPicker = false
@@ -119,7 +134,7 @@ fun MusicScreen(
         }
     }
     val orderedState by produceState<Pair<String, List<SongRow>>>(
-        "" to emptyList(), tracks, members, likes, recent, collectionId, sort, sortAsc,
+        "" to emptyList(), tracks, members, likes, recent, collectionId, sort, sortAsc, playlistSort, playlistSortAsc,
     ) {
         value = withContext(Dispatchers.Default) {
             val values: List<SongRow> =
@@ -139,7 +154,8 @@ fun MusicScreen(
                             .map { SongRow(it.id, it) }
                     }
                     collectionId.startsWith("album:") -> {
-                        val targetAlbum = collectionId.removePrefix("album:").substringAfter('|').trim().lowercase(Locale.ROOT)
+                        // dont split on | since generated album ids are just album:<name> and real album titles can contain |
+                        val targetAlbum = collectionId.removePrefix("album:").trim().lowercase(Locale.ROOT)
                         tracks
                             .filter { it.album.trim().lowercase(Locale.ROOT) == targetAlbum }
                             .map { SongRow(it.id, it) }
@@ -150,8 +166,23 @@ fun MusicScreen(
                     else -> tracks.map { SongRow(it.id, it) }
                 }
             val ordered =
-                if (collectionId.isNotBlank()) values
-                else
+                if (collectionId.isNotBlank()) {
+                    when (playlistSort) {
+                        "Recently added" ->
+                            if (playlistSortAsc) values.sortedWith(compareBy<SongRow> { it.track.added }.thenBy { it.track.title.lowercase(Locale.ROOT) })
+                            else values.sortedWith(compareByDescending<SongRow> { it.track.added }.thenBy { it.track.title.lowercase(Locale.ROOT) })
+                        "Title" ->
+                            if (playlistSortAsc) values.sortedBy { it.track.title.lowercase(Locale.ROOT) }
+                            else values.sortedByDescending { it.track.title.lowercase(Locale.ROOT) }
+                        "Artist" ->
+                            if (playlistSortAsc) values.sortedWith(compareBy<SongRow> { it.track.artist.lowercase(Locale.ROOT) }.thenBy { it.track.title.lowercase(Locale.ROOT) })
+                            else values.sortedWith(compareByDescending<SongRow> { it.track.artist.lowercase(Locale.ROOT) }.thenBy { it.track.title.lowercase(Locale.ROOT) })
+                        "Duration" ->
+                            if (playlistSortAsc) values.sortedWith(compareBy<SongRow> { it.track.duration }.thenBy { it.track.title.lowercase(Locale.ROOT) })
+                            else values.sortedWith(compareByDescending<SongRow> { it.track.duration }.thenBy { it.track.title.lowercase(Locale.ROOT) })
+                        else -> if (playlistSortAsc) values else values.reversed()
+                    }
+                } else
                     when (sort) {
                         "Title" ->
                             if (sortAsc) values.sortedBy { it.track.title.lowercase(Locale.ROOT) }
@@ -166,7 +197,7 @@ fun MusicScreen(
                             if (sortAsc) values.sortedWith(compareBy<SongRow> { it.track.added }.thenBy { it.track.title.lowercase(Locale.ROOT) })
                             else values.sortedWith(compareByDescending<SongRow> { it.track.added }.thenBy { it.track.title.lowercase(Locale.ROOT) })
                     }
-            "$collectionId|$sort|$sortAsc" to ordered
+            "$collectionId|$sort|$sortAsc|$playlistSort|$playlistSortAsc" to ordered
         }
     }
     val orderedRows = orderedState.second
@@ -339,6 +370,23 @@ fun MusicScreen(
                             },
                             onToggleDirection = { sortAsc = !sortAsc },
                         )
+                    } else {
+                        val isEditableCollection = collections.any { it.id == collectionId && it.kind in listOf("playlist", "custom") }
+                        val defaultLabel = if (isEditableCollection) "Playlist order" else "Default order"
+                        val currentLabel = if (playlistSort == "Playlist order") defaultLabel else playlistSort
+                        SortControl(
+                            value = currentLabel,
+                            ascending = playlistSortAsc,
+                            options = listOf(defaultLabel, "Recently added", "Title", "Artist", "Duration"),
+                            onPick = { picked ->
+                                val next = if (picked == defaultLabel) "Playlist order" else picked
+                                if (next != playlistSort) {
+                                    playlistSort = next
+                                    playlistSortAsc = next != "Recently added"
+                                }
+                            },
+                            onToggleDirection = { playlistSortAsc = !playlistSortAsc },
+                        )
                     }
                 }
             } else {
@@ -438,9 +486,27 @@ fun MusicScreen(
                                     },
                                 )
                                 HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
-                                if (collectionId.isNotBlank() && chosen.any { it.member != null }) {
+                                if (collectionId == "liked" && chosen.isNotEmpty()) {
                                     DropdownMenuItem(
-                                        text = { Text("Remove from playlist") },
+                                        text = { Text("Remove from Liked Songs") },
+                                        leadingIcon = { Glyph("x") },
+                                        onClick = {
+                                            moreSelectionMenu = false
+                                            val idsToUnlike = chosen.map { it.track.id }.distinct()
+                                            g.task {
+                                                val removed = g.library.unlikeAll(idsToUnlike)
+                                                g.message.value = "Removed $removed from Liked Songs"
+                                            }
+                                            closeSelection()
+                                        },
+                                    )
+                                }
+                                if (collectionId.isNotBlank() && chosen.any { it.member != null }) {
+                                    val removeBulkLabel =
+                                        if (collectionById[collectionId]?.kind == "custom") "Remove from album"
+                                        else "Remove from playlist"
+                                    DropdownMenuItem(
+                                        text = { Text(removeBulkLabel) },
                                         leadingIcon = { Glyph("x") },
                                         onClick = {
                                             moreSelectionMenu = false
@@ -466,7 +532,7 @@ fun MusicScreen(
                     }
                 }
             }
-            val canDragReorder = editing && query.isBlank() && collectionId.isNotBlank() && collections.any { it.id == collectionId }
+            val canDragReorder = editing && query.isBlank() && playlistSort == "Playlist order" && playlistSortAsc && collectionId.isNotBlank() && collections.any { it.id == collectionId }
             var liveOrder by remember(rows, canDragReorder) { mutableStateOf(rows) }
             val displayedRows = if (canDragReorder) liveOrder else rows
             // fresh list state per sort key keeps the view at the top instead of following item 0 to the bottom
@@ -490,13 +556,155 @@ fun MusicScreen(
                         },
                     )
                 }
+            val latestDisplayedRows by rememberUpdatedState(displayedRows)
+            val latestSelectedList by rememberUpdatedState(selected)
+            val latestSelecting by rememberUpdatedState(selecting)
+            val haptic = LocalHapticFeedback.current
+            val railWidthPx = with(LocalDensity.current) { 56.dp.toPx() }
+            val edgeScrollPx = with(LocalDensity.current) { 64.dp.toPx() }
             LazyColumn(
-                Modifier.weight(1f),
+                Modifier.weight(1f)
+                    .pointerInput(rowsState.first, editing) {
+                        if (editing) return@pointerInput
+                        coroutineScope {
+                            // run on Initial pass and eat the final UP so LazyColumn scroll and row clicks dont fight drag-select
+                            awaitEachGesture {
+                                val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                                fun rowIndexAt(y: Float): Int? {
+                                    val visible = songListState.layoutInfo.visibleItemsInfo.filter { it.index in latestDisplayedRows.indices }
+                                    if (visible.isEmpty()) return null
+                                    return visible.firstOrNull { y >= it.offset && y <= it.offset + it.size }?.index
+                                        ?: if (y < visible.first().offset) visible.first().index else visible.last().index
+                                }
+                                val startIdx = rowIndexAt(down.position.y) ?: return@awaitEachGesture
+                                val slop = viewConfiguration.touchSlop
+                                val engagedByRail = latestSelecting && down.position.x <= railWidthPx
+                                var pointerY = down.position.y
+                                val triggered =
+                                    if (engagedByRail) {
+                                        var started = false
+                                        while (true) {
+                                            val event = awaitPointerEvent(PointerEventPass.Initial)
+                                            val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                            if (!change.pressed) break
+                                            val dx = change.position.x - down.position.x
+                                            val dy = change.position.y - down.position.y
+                                            if (abs(dy) >= slop && abs(dy) >= abs(dx)) {
+                                                change.consume()
+                                                pointerY = change.position.y
+                                                started = true
+                                                break
+                                            }
+                                            if (abs(dx) >= slop) break
+                                        }
+                                        started
+                                    } else {
+                                        var held = false
+                                        val cancelled =
+                                            withTimeoutOrNull(viewConfiguration.longPressTimeoutMillis) {
+                                                while (true) {
+                                                    val event = awaitPointerEvent(PointerEventPass.Initial)
+                                                    val change = event.changes.firstOrNull { it.id == down.id } ?: return@withTimeoutOrNull true
+                                                    if (!change.pressed) return@withTimeoutOrNull true
+                                                    val dist = hypot(
+                                                        (change.position.x - down.position.x).toDouble(),
+                                                        (change.position.y - down.position.y).toDouble(),
+                                                    )
+                                                    if (dist > slop) return@withTimeoutOrNull true
+                                                }
+                                            }
+                                        if (cancelled == null) {
+                                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                            held = true
+                                        }
+                                        held
+                                    }
+                                if (!triggered) return@awaitEachGesture
+                                val startRow = latestDisplayedRows.getOrNull(startIdx) ?: return@awaitEachGesture
+                                selecting = true
+                                val base = latestSelectedList.toHashSet()
+                                val fillMode = startRow.key !in base
+                                fun applyRange(endIdx: Int) {
+                                    val lo = minOf(startIdx, endIdx).coerceAtLeast(0)
+                                    val hi = maxOf(startIdx, endIdx).coerceAtMost(latestDisplayedRows.lastIndex)
+                                    val next = LinkedHashSet(base)
+                                    for (i in lo..hi) {
+                                        val k = latestDisplayedRows[i].key
+                                        if (fillMode) next += k else next -= k
+                                    }
+                                    selected = next.toList()
+                                }
+                                applyRange(startIdx)
+                                rowIndexAt(pointerY)?.let(::applyRange)
+                                val autoScrollJob =
+                                    launch {
+                                        while (isActive) {
+                                            val info = songListState.layoutInfo
+                                            val topEdge = info.viewportStartOffset + edgeScrollPx
+                                            val bottomEdge = info.viewportEndOffset - edgeScrollPx
+                                            val speed =
+                                                when {
+                                                    pointerY < topEdge -> -((topEdge - pointerY) / edgeScrollPx).coerceIn(0.2f, 1.5f) * 26f
+                                                    pointerY > bottomEdge -> ((pointerY - bottomEdge) / edgeScrollPx).coerceIn(0.2f, 1.5f) * 26f
+                                                    else -> 0f
+                                                }
+                                            if (speed != 0f) {
+                                                songListState.scrollBy(speed)
+                                                rowIndexAt(pointerY)?.let(::applyRange)
+                                            }
+                                            delay(16)
+                                        }
+                                    }
+                                try {
+                                    while (true) {
+                                        val event = awaitPointerEvent(PointerEventPass.Initial)
+                                        val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                        change.consume()
+                                        if (!change.pressed) break
+                                        pointerY = change.position.y
+                                        rowIndexAt(pointerY)?.let(::applyRange)
+                                    }
+                                } finally {
+                                    autoScrollJob.cancel()
+                                }
+                            }
+                        }
+                    },
                 state = songListState,
                 contentPadding = PaddingValues(bottom = 12.dp),
             ) {
                 itemsIndexed(displayedRows, key = { _, row -> row.key }) { index, row ->
                     val dragging = canDragReorder && reorderState.draggedKey == row.key
+                    val removeLabel =
+                        when {
+                            collectionId == "liked" -> "Remove from Liked Songs"
+                            collectionById[collectionId]?.kind == "custom" -> "Remove from album"
+                            else -> "Remove from playlist"
+                        }
+                    val removeAction: (() -> Unit)? =
+                        when {
+                            row.member != null -> {
+                                val memberId = row.member.id
+                                {
+                                    g.task {
+                                        g.library.removeMember(memberId)
+                                        g.message.value =
+                                            if (collectionById[collectionId]?.kind == "custom") "Removed from album"
+                                            else "Removed from playlist"
+                                    }
+                                }
+                            }
+                            collectionId == "liked" -> {
+                                val trackId = row.track.id
+                                {
+                                    g.task {
+                                        g.library.unlikeAll(listOf(trackId))
+                                        g.message.value = "Removed from Liked Songs"
+                                    }
+                                }
+                            }
+                            else -> null
+                        }
                     TrackListRow(
                         row.track,
                         row.key in selectedKeys,
@@ -514,14 +722,12 @@ fun MusicScreen(
                             if (canDragReorder && row.member != null) {
                                 { DragReorderHandle(reorderState, row.key, index) }
                             } else null,
+                        enableLongClick = false,
                         onSelect = {
                             selected =
                                 if (row.key in selectedKeys) selected - row.key else selected + row.key
                         },
-                        onLong = {
-                            selecting = true
-                            selected = (selected + row.key).distinct()
-                        },
+                        onLong = {},
                         onPlay = {
                             g.engine.value?.playTrack(
                                 row.track,
@@ -540,6 +746,8 @@ fun MusicScreen(
                             onExpand()
                         },
                         onAction = { onAction(row.track, it) },
+                        removeFromCollectionLabel = removeLabel,
+                        onRemoveFromCollection = removeAction,
                     )
                 }
                 if (rows.isEmpty())
@@ -754,22 +962,18 @@ fun MusicScreen(
                                 }
                                 .sortedBy { it.second.lowercase(Locale.ROOT) }
                     else -> {
-                        val playlists =
-                            collections
-                                .filter { it.kind == "playlist" }
-                                .sortedByDescending { it.id in pinnedPlaylists }
-                                .map { c ->
-                                    Triple(
-                                        c.id,
-                                        c.name,
-                                        (membersByCollection[c.id] ?: emptyList())
-                                            .mapNotNull { trackById[it.track] },
-                                    )
-                                }
-                        listOf(
-                            Triple("liked", "Liked Songs", tracks.filter { it.id in likes }),
-                            Triple("recent", "Recently Played", recent.mapNotNull { trackById[it] }),
-                        ) + playlists
+                        // pinned playlists sit above utility actions and unpinned playlists below them
+                        collections
+                            .filter { it.kind == "playlist" }
+                            .sortedByDescending { it.id in pinnedPlaylists }
+                            .map { c ->
+                                Triple(
+                                    c.id,
+                                    c.name,
+                                    (membersByCollection[c.id] ?: emptyList())
+                                        .mapNotNull { trackById[it.track] },
+                                )
+                            }
                     }
                 }
                 "$tab|$albumType|$artistSort|$artistSortAsc" to computed
@@ -803,7 +1007,48 @@ fun MusicScreen(
                 }
             }
             LazyColumn(Modifier.weight(1f), state = collectionListState) {
-                if (tab == "Playlists" || tab == "Albums" && albumType == "Custom")
+                if (tab == "Playlists") {
+                    val pinnedItems = groups.filter { it.first in pinnedPlaylists && (query.isBlank() || it.second.contains(query, true)) }
+                    items(pinnedItems, key = { "pinned:${it.first}" }) { (id, title, values) ->
+                        val collection = collectionById[id]
+                        Row(
+                            Modifier.fillMaxWidth()
+                                .clickable { open(id, title) }
+                                .padding(horizontal = 12.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Artwork(
+                                collection?.art?.takeIf { it.isNotBlank() }
+                                    ?: values.firstOrNull { it.art.isNotBlank() }?.art
+                                    ?: ""
+                            )
+                            Spacer(Modifier.width(12.dp))
+                            Column(Modifier.weight(1f)) {
+                                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                                    Text(
+                                        title,
+                                        Modifier.weight(1f, fill = false),
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        fontSize = 14.sp,
+                                    )
+                                    Glyph("pin", "Pinned", Modifier.size(13.dp), tint = MaterialTheme.colorScheme.primary)
+                                }
+                                Text(
+                                    if (values.size == 1) "1 song" else "${values.size} songs",
+                                    fontSize = 12.sp,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                            if (collection != null) {
+                                IconAction("ellipsis", "Collection actions") {
+                                    collectionMenu = collection
+                                }
+                            }
+                        }
+                    }
+                }
+                if ((tab == "Playlists" || tab == "Albums" && albumType == "Custom") && query.isBlank())
                     item {
                         Row(
                             Modifier.fillMaxWidth()
@@ -831,7 +1076,7 @@ fun MusicScreen(
                             )
                         }
                     }
-                if (tab == "Playlists")
+                if (tab == "Playlists" && query.isBlank())
                     item {
                         Row(
                             Modifier.fillMaxWidth()
@@ -859,8 +1104,44 @@ fun MusicScreen(
                             }
                         }
                     }
+                if (tab == "Playlists") {
+                    val systemGroups =
+                        listOf(
+                            Triple("liked", "Liked Songs", tracks.filter { it.id in likes }),
+                            Triple("recent", "Recently Played", recent.mapNotNull { trackById[it] }),
+                        ).filter { query.isBlank() || it.second.contains(query, true) }
+                    items(systemGroups, key = { "sys:${it.first}" }) { (id, title, values) ->
+                        Row(
+                            Modifier.fillMaxWidth()
+                                .clickable { open(id, title) }
+                                .padding(horizontal = 12.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Artwork(values.firstOrNull { it.art.isNotBlank() }?.art ?: "")
+                            Spacer(Modifier.width(12.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 14.sp)
+                                Text(
+                                    if (values.size == 1) "1 song" else "${values.size} songs",
+                                    fontSize = 12.sp,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                    }
+                }
+                val visibleGroups =
+                    groups.filter {
+                        (tab != "Playlists" || it.first !in pinnedPlaylists) &&
+                            (query.isBlank() || it.second.contains(query, true))
+                    }
+                val hasPlaylistMatches =
+                    tab == "Playlists" &&
+                        (groups.any { it.first in pinnedPlaylists && (query.isBlank() || it.second.contains(query, true)) } ||
+                            listOf("Liked Songs", "Recently Played").any { query.isBlank() || it.contains(query, true) } ||
+                            visibleGroups.isNotEmpty())
                 items(
-                    groups.filter { query.isBlank() || it.second.contains(query, true) },
+                    visibleGroups,
                     key = { it.first },
                 ) { (id, title, values) ->
                     val collection = collectionById[id]
@@ -908,24 +1189,38 @@ fun MusicScreen(
                             }
                     }
                 }
+                if (query.isNotBlank() && ((tab == "Playlists" && !hasPlaylistMatches) || (tab != "Playlists" && visibleGroups.isEmpty()))) {
+                    item {
+                        Box(Modifier.fillMaxWidth().padding(20.dp), contentAlignment = Alignment.Center) {
+                            Hint(
+                                when (tab) {
+                                    "Playlists" -> "No matching playlists"
+                                    "Artists" -> "No matching artists"
+                                    else -> "No matching albums"
+                                }
+                            )
+                        }
+                    }
+                }
             }
         }
     }
     if (create || rename != null)
-        AlertDialog(
+        AppModalDialog(
             onDismissRequest = {
                 create = false
                 rename = null
             },
-            title = {
-                Text(
-                    if (rename != null) "Edit collection"
-                    else if (tab == "Playlists") "New Playlist" else "New Album"
-                )
-            },
-            text = { Input(name, { name = it }, "Name") },
-            confirmButton = {
-                Action("Save", enabled = name.isNotBlank()) {
+            title =
+                if (rename != null) "Edit collection"
+                else if (tab == "Playlists") "New Playlist" else "New Album",
+            icon = if (rename != null) "pencil" else "plus",
+            actions = {
+                ModalTonalButton("Cancel") {
+                    create = false
+                    rename = null
+                }
+                ModalPrimaryButton("Save", icon = "check", enabled = name.isNotBlank()) {
                     val old = rename
                     g.task {
                         g.library.collection(
@@ -939,65 +1234,120 @@ fun MusicScreen(
                     rename = null
                 }
             },
-            dismissButton = {
-                Action("Cancel") {
-                    create = false
-                    rename = null
-                }
-            },
-        )
+        ) {
+            Input(name, { name = it }, "Collection name")
+        }
     collectionMenu?.let { c ->
-        val pinned = c.kind == "playlist" && c.id in pinnedPlaylists
-        AlertDialog(
+        val isCustom = c.kind == "custom"
+        val kindWord = if (isCustom) "album" else "playlist"
+        val pinned = !isCustom && c.id in pinnedPlaylists
+        val cMembers = membersByCollection[c.id].orEmpty()
+        val dupCount =
+            remember(cMembers) {
+                val seen = HashSet<String>()
+                cMembers.count { !seen.add(it.track) }
+            }
+        AppModalDialog(
             onDismissRequest = { collectionMenu = null },
-            title = { Text(c.name) },
-            text = {
-                Column {
-                    if (c.kind == "playlist") {
-                        Action(if (pinned) "Unpin playlist" else "Pin playlist", "pin") {
-                            togglePinPlaylist(c.id)
-                            collectionMenu = null
-                        }
-                    }
-                    Action("Edit playlist", "pencil") {
-                        name = c.name
-                        rename = c
-                        collectionMenu = null
-                    }
-                    Action("Change cover", "image") {
-                        collectionMenu = null
-                        pickers.image { uri ->
-                            g.task { g.library.collection(c.name, c.kind, c.id, uri) }
-                        }
-                    }
-                    Action("Export playlist (.m3u8)", "download") {
-                        collectionMenu = null
-                        pickers.exportPlaylist(c.id, c.name)
-                    }
-                    Action("Delete playlist", "trash-2") {
-                        delete = c
-                        collectionMenu = null
-                    }
-                }
+            title = c.name,
+            subtitle = "${cMembers.size} ${if (cMembers.size == 1) "song" else "songs"}",
+            icon = "list-music",
+            actions = {
+                ModalTonalButton("Close") { collectionMenu = null }
             },
-            confirmButton = { Action("Close") { collectionMenu = null } },
-        )
+        ) {
+            if (!isCustom) {
+                ModalOptionRow(
+                    title = if (pinned) "Unpin playlist" else "Pin playlist",
+                    subtitle = if (pinned) "Remove from top of Playlists" else "Keep at top of Playlists",
+                    icon = "pin",
+                    selected = pinned,
+                ) {
+                    togglePinPlaylist(c.id)
+                    collectionMenu = null
+                }
+            }
+            ModalOptionRow(
+                title = "Edit $kindWord name",
+                icon = "pencil",
+            ) {
+                name = c.name
+                rename = c
+                collectionMenu = null
+            }
+            ModalOptionRow(
+                title = "Change cover artwork",
+                icon = "image",
+            ) {
+                collectionMenu = null
+                pickers.image { uri ->
+                    g.task { g.library.collection(c.name, c.kind, c.id, uri) }
+                }
+            }
+            ModalOptionRow(
+                title = "Export $kindWord (.m3u8)",
+                icon = "download",
+            ) {
+                collectionMenu = null
+                pickers.exportPlaylist(c.id, c.name)
+            }
+            ModalOptionRow(
+                title = "Remove duplicate songs",
+                subtitle =
+                    if (dupCount > 0) "$dupCount duplicate ${if (dupCount == 1) "entry" else "entries"} found"
+                    else "No duplicate songs in this $kindWord",
+                icon = "list-checks",
+            ) {
+                collectionMenu = null
+                if (dupCount > 0) removeDuplicatesTarget = c to dupCount
+                else g.message.value = "No duplicate songs in ${c.name}"
+            }
+            ModalOptionRow(
+                title = "Delete $kindWord",
+                subtitle = "Audio files in storage are kept",
+                icon = "trash-2",
+                danger = true,
+            ) {
+                delete = c
+                collectionMenu = null
+            }
+        }
+    }
+    removeDuplicatesTarget?.let { (c, count) ->
+        val kindWord = if (c.kind == "custom") "album" else "playlist"
+        Confirmation(
+            "Remove $count ${if (count == 1) "duplicate song" else "duplicate songs"}?",
+            "Keeps the first occurrence of each song in \"${c.name}\" in $kindWord order.",
+            "Remove duplicates",
+            { removeDuplicatesTarget = null },
+            danger = true,
+            icon = "list-checks",
+        ) {
+            g.task {
+                val removed = g.library.removeDuplicates(c.id)
+                g.message.value = "Removed $removed duplicate ${if (removed == 1) "song" else "songs"}"
+            }
+        }
     }
     artistMenu?.let { (artistId, artistName) ->
         val pinned = artistId in pinnedArtists
-        AlertDialog(
+        AppModalDialog(
             onDismissRequest = { artistMenu = null },
-            title = { Text(artistName) },
-            text = {
-                Column {
-                    Action(if (pinned) "Unpin artist" else "Pin artist", "pin") {
-                        togglePinArtist(artistId)
-                        artistMenu = null
-                    }
-                }
-            },
-            confirmButton = { Action("Close") { artistMenu = null } },
-        )
+            title = artistName,
+            subtitle = "Artist actions",
+            icon = "music-2",
+            actions = { ModalTonalButton("Close") { artistMenu = null } },
+        ) {
+            ModalOptionRow(
+                title = if (pinned) "Unpin artist" else "Pin artist",
+                subtitle = if (pinned) "Remove from top of Artists" else "Keep at top of Artists",
+                icon = "pin",
+                selected = pinned,
+            ) {
+                togglePinArtist(artistId)
+                artistMenu = null
+            }
+        }
     }
     delete?.let { c ->
         Confirmation("Delete ${c.name}?", "Audio files are kept.", "Delete", { delete = null }) {
@@ -1011,10 +1361,20 @@ fun MusicScreen(
         }
     }
     if (addTo)
-        PlaylistChooser(g, actualIds, { addTo = false }) { collection, duplicates ->
+        PlaylistChooser(g, actualIds, { addTo = false }) { collection ->
+            val idsToAdd = actualIds.toList()
+            addTo = false
+            closeSelection()
             g.task {
-                if (!g.library.add(collection, actualIds, duplicates)) duplicate = collection to actualIds.toList()
-                else addTo = false
+                val res = g.library.addToCollection(collection, idsToAdd)
+                val target = if (collection == "liked") "Liked Songs" else "playlist"
+                g.message.value =
+                    when {
+                        res.added > 0 && res.skipped > 0 -> "Added ${res.added} · ${res.skipped} already in $target"
+                        res.added > 0 -> "Added ${res.added} ${if (res.added == 1) "song" else "songs"} to $target"
+                        res.skipped > 0 -> "Already in $target (${res.skipped} skipped)"
+                        else -> "No songs added"
+                    }
             }
         }
     if (showSongPicker && collections.any { it.id == collectionId && it.kind in listOf("playlist", "custom") })
@@ -1022,20 +1382,16 @@ fun MusicScreen(
             val target = collectionId
             showSongPicker = false
             g.task {
-                if (!g.library.add(target, ids)) duplicate = target to ids
+                val res = g.library.addToCollection(target, ids)
+                g.message.value =
+                    when {
+                        res.added > 0 && res.skipped > 0 -> "Added ${res.added} · ${res.skipped} already in playlist"
+                        res.added > 0 -> "Added ${res.added} ${if (res.added == 1) "song" else "songs"}"
+                        res.skipped > 0 -> "Already in this playlist (${res.skipped} skipped)"
+                        else -> "No songs added"
+                    }
             }
         }
-    duplicate?.let { (id, ids) ->
-        Confirmation(
-            "Already in playlist",
-            "Some selected songs are already in this playlist. Add them again?",
-            "Add again",
-            { duplicate = null },
-        ) {
-            g.task { g.library.add(id, ids, true) }
-            addTo = false
-        }
-    }
     if (trash)
         Confirmation(
             "Move ${actualIds.distinct().size} songs to Trash?",
@@ -1047,26 +1403,16 @@ fun MusicScreen(
             closeSelection()
         }
     if (batchEdit)
-        AlertDialog(
+        AppModalDialog(
             onDismissRequest = { batchEdit = false },
-            title = { Text("Batch edit tags") },
-            text = {
-                Column(Modifier.verticalScroll(rememberScrollState())) {
-                    Hint("${actualIds.distinct().size} selected songs · leave a field blank to keep each song's current value")
-                    Input(batchArtist, { batchArtist = it }, "Artist / creator")
-                    Input(batchAlbum, { batchAlbum = it }, "Album")
-                    Input(batchAlbumArtist, { batchAlbumArtist = it }, "Album artist")
-                    Action(
-                        if (batchCover.isNotBlank()) "Artwork selected" else "Set shared cover",
-                        "image",
-                    ) {
-                        pickers.image { batchCover = it }
-                    }
-                }
-            },
-            confirmButton = {
-                Action(
+            title = "Batch edit tags",
+            subtitle = "${actualIds.distinct().size} selected · blank fields keep existing tags",
+            icon = "pencil",
+            actions = {
+                ModalTonalButton("Cancel") { batchEdit = false }
+                ModalPrimaryButton(
                     "Apply",
+                    icon = "check",
                     enabled =
                         batchArtist.isNotBlank() ||
                             batchAlbum.isNotBlank() ||
@@ -1083,33 +1429,46 @@ fun MusicScreen(
                     g.task { g.message.value = g.library.batchEditTags(ids, a, al, aa, cv) }
                 }
             },
-            dismissButton = { Action("Cancel") { batchEdit = false } },
-        )
-    cleanPreview?.let { changes ->
-        AlertDialog(
-            onDismissRequest = { cleanPreview = null },
-            title = { Text("Clean ${changes.size} song titles?") },
-            text = {
-                Column(Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState())) {
-                    Hint("Removes video/audio junk like (Official Audio), (Official Video), [Lyrics], etc.")
-                    for ((_, before, after) in changes.take(20)) {
-                        Column(Modifier.padding(vertical = 4.dp)) {
-                            Text(before, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            Text("→ $after", fontSize = 13.sp, color = MaterialTheme.colorScheme.primary, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        }
-                    }
+        ) {
+            Column(Modifier.heightIn(max = 380.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Input(batchArtist, { batchArtist = it }, "Artist / creator")
+                Input(batchAlbum, { batchAlbum = it }, "Album")
+                Input(batchAlbumArtist, { batchAlbumArtist = it }, "Album artist")
+                ModalOptionRow(
+                    title = if (batchCover.isNotBlank()) "Artwork selected" else "Set shared cover",
+                    subtitle = if (batchCover.isNotBlank()) "Tap to replace selected image" else "Choose an image for all selected songs",
+                    icon = "image",
+                    selected = batchCover.isNotBlank(),
+                ) {
+                    pickers.image { batchCover = it }
                 }
-            },
-            confirmButton = {
-                Action("Clean titles", "check") {
+            }
+        }
+    cleanPreview?.let { changes ->
+        AppModalDialog(
+            onDismissRequest = { cleanPreview = null },
+            title = "Clean ${changes.size} song titles?",
+            subtitle = "Strips (Official Audio), (Official Video), [Lyrics], etc.",
+            icon = "check",
+            actions = {
+                ModalTonalButton("Cancel") { cleanPreview = null }
+                ModalPrimaryButton("Clean titles", icon = "check") {
                     val ids = changes.map { it.first }
                     cleanPreview = null
                     closeSelection()
                     g.task { g.message.value = g.library.cleanTitles(ids) }
                 }
             },
-            dismissButton = { Action("Cancel") { cleanPreview = null } },
-        )
+        ) {
+            Column(Modifier.heightIn(max = 340.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                for ((_, before, after) in changes.take(20)) {
+                    ModalSectionCard {
+                        Text(before, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text("→ $after", fontSize = 13.sp, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1122,12 +1481,15 @@ fun TrackListRow(
     reordering: Boolean = false,
     modifier: Modifier = Modifier,
     dragHandle: (@Composable () -> Unit)? = null,
+    enableLongClick: Boolean = true,
     onSelect: () -> Unit = {},
     onLong: () -> Unit = {},
     onPlay: () -> Unit,
     onExpand: () -> Unit,
     onAction: (String) -> Unit,
     onStep: (Int) -> Unit = {},
+    removeFromCollectionLabel: String = "Remove from playlist",
+    onRemoveFromCollection: (() -> Unit)? = null,
 ) {
     var menu by remember { mutableStateOf(false) }
     Row(
@@ -1139,12 +1501,12 @@ fun TrackListRow(
             )
             .combinedClickable(
                 onClick = { if (selecting) onSelect() else onPlay() },
-                onLongClick = onLong,
+                onLongClick = if (enableLongClick) onLong else null,
             )
             .padding(start = 12.dp, end = 5.dp, top = 8.dp, bottom = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        if (selecting) Checkbox(selected, { onSelect() }, Modifier.size(32.dp))
+        if (selecting) Checkbox(selected, if (enableLongClick) ({ onSelect() }) else null, Modifier.size(32.dp))
         if (reordering) {
             if (dragHandle != null) dragHandle() else DragGrip(onStep)
         }
@@ -1196,7 +1558,6 @@ fun TrackListRow(
                         Triple("Edit metadata", "metadata", "pencil"),
                         Triple("Information", "info", "info"),
                         Triple("Link", "link", "external-link"),
-                        Triple("Move to Trash", "trash", "trash-2"),
                     )) DropdownMenuItem(
                     text = { Text(label) },
                     leadingIcon = { Glyph(icon) },
@@ -1205,71 +1566,194 @@ fun TrackListRow(
                         onAction(action)
                     },
                 )
+                if (onRemoveFromCollection != null) {
+                    DropdownMenuItem(
+                        text = { Text(removeFromCollectionLabel) },
+                        leadingIcon = { Glyph("x") },
+                        onClick = {
+                            menu = false
+                            onRemoveFromCollection()
+                        },
+                    )
+                }
+                DropdownMenuItem(
+                    text = { Text("Move to Trash", color = MaterialTheme.colorScheme.error) },
+                    leadingIcon = { Glyph("trash-2", tint = MaterialTheme.colorScheme.error) },
+                    onClick = {
+                        menu = false
+                        onAction("trash")
+                    },
+                )
             }
         }
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun PlaylistChooser(
     g: Graph,
     ids: List<String>,
     onDismiss: () -> Unit,
-    onPick: (String, Boolean) -> Unit,
+    onPick: (String) -> Unit,
 ) {
     val collections by g.library.collections.collectAsStateWithLifecycle()
     val playlistMembers by g.library.members.collectAsStateWithLifecycle()
     val libraryTracks by g.library.tracks.collectAsStateWithLifecycle()
+    val likes by g.library.likes.collectAsStateWithLifecycle(emptySet())
+    val prefs by g.prefs.state.collectAsStateWithLifecycle()
+    val pinnedPlaylists = remember(prefs.pinnedPlaylists) { prefs.pinnedPlaylists.toSet() }
     val covers = remember(libraryTracks) { libraryTracks.associate { it.id to it.art } }
     val membersByCollection = remember(playlistMembers) { playlistMembers.groupBy { it.collection } }
     var search by rememberSaveable { mutableStateOf("") }
-    var create by remember { mutableStateOf(false) }
-    var name by remember { mutableStateOf("") }
-    AlertDialog(
+    var confirmName by remember { mutableStateOf("") }
+    var enteringCustomName by remember { mutableStateOf(false) }
+    var customName by remember { mutableStateOf("") }
+    val pinnedEditable =
+        remember(collections, pinnedPlaylists, search) {
+            collections
+                .filter { it.kind in listOf("playlist", "custom") && it.id in pinnedPlaylists && (search.isBlank() || it.name.contains(search, true)) }
+                .sortedBy { it.name.lowercase(Locale.ROOT) }
+        }
+    val unpinnedEditable =
+        remember(collections, pinnedPlaylists, search) {
+            collections
+                .filter { it.kind in listOf("playlist", "custom") && it.id !in pinnedPlaylists && (search.isBlank() || it.name.contains(search, true)) }
+                .sortedBy { it.name.lowercase(Locale.ROOT) }
+        }
+    val showLiked = search.isBlank() || "liked songs".contains(search, true)
+    val singleTrackId = ids.singleOrNull()
+    AppModalDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Add ${ids.size} songs to playlist") },
-        text = {
-            Column {
-                Input(search, { search = it }, "Find a playlist", icon = "search")
-                Action("New Playlist", "plus") { create = true }
-                Column(Modifier.heightIn(max = 350.dp).verticalScroll(rememberScrollState())) {
-                    for (c in collections.filter { it.kind in listOf("playlist", "custom") && it.name.contains(search, true) }) {
-                        Row(
-                            Modifier.fillMaxWidth()
-                                .clickable { onPick(c.id, false) }
-                                .padding(vertical = 10.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            val entries = membersByCollection[c.id].orEmpty()
-                            Artwork(c.art.ifBlank { entries.firstNotNullOfOrNull { covers[it.track]?.takeIf(String::isNotBlank) }.orEmpty() }, 44)
-                            Spacer(Modifier.width(12.dp))
-                            Column(Modifier.weight(1f)) {
-                                Text(c.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                Hint("${entries.size} songs")
+        title = "Add to playlist",
+        subtitle = "${ids.size} ${if (ids.size == 1) "song" else "songs"} selected",
+        icon = "list-music",
+        actions = { ModalTonalButton("Close", onClick = onDismiss) },
+    ) {
+        SearchBarField(
+            value = search,
+            onChange = {
+                search = it
+                if (confirmName.isNotEmpty()) confirmName = ""
+            },
+            placeholder = "Find or name a playlist",
+        )
+        when {
+            confirmName.isNotBlank() -> {
+                ModalSectionCard(highlighted = true) {
+                    Text(
+                        "Create playlist \"$confirmName\" and add ${ids.size} ${if (ids.size == 1) "song" else "songs"}?",
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Medium,
+                    )
+                    FlowRow(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        ModalTonalButton("Edit") {
+                            customName = confirmName
+                            confirmName = ""
+                            enteringCustomName = true
+                        }
+                        ModalTonalButton("Cancel") { confirmName = "" }
+                        ModalPrimaryButton("Create & add", icon = "check") {
+                            val target = confirmName
+                            confirmName = ""
+                            g.task {
+                                val id = g.library.collection(target)
+                                withContext(Dispatchers.Main) { onPick(id) }
                             }
                         }
                     }
                 }
             }
-        },
-        confirmButton = { Action("Close") { onDismiss() } },
-    )
-    if (create)
-        AlertDialog(
-            onDismissRequest = { create = false },
-            title = { Text("New Playlist") },
-            text = { Input(name, { name = it }, "Name") },
-            confirmButton = {
-                Action("Create", enabled = name.isNotBlank()) {
-                    g.task {
-                        val id = g.library.collection(name)
-                        onPick(id, true)
+            enteringCustomName -> {
+                ModalSectionCard {
+                    Input(customName, { customName = it }, "New playlist name")
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End)) {
+                        ModalTonalButton("Cancel") { enteringCustomName = false }
+                        ModalPrimaryButton("Create & add", icon = "check", enabled = customName.isNotBlank()) {
+                            val target = customName.trim()
+                            enteringCustomName = false
+                            g.task {
+                                val id = g.library.collection(target)
+                                withContext(Dispatchers.Main) { onPick(id) }
+                            }
+                        }
                     }
-                    create = false
                 }
-            },
-            dismissButton = { Action("Cancel") { create = false } },
-        )
+            }
+            else -> {
+                val typed = search.trim()
+                ModalOptionRow(
+                    title = if (typed.isNotEmpty()) "Create playlist \"$typed\"" else "Create playlist",
+                    subtitle = if (typed.isNotEmpty()) "Use this name & add selected songs" else "Enter a new playlist name",
+                    icon = "plus",
+                    selected = typed.isNotEmpty(),
+                ) {
+                    if (typed.isNotEmpty()) confirmName = typed
+                    else {
+                        customName = ""
+                        enteringCustomName = true
+                    }
+                }
+            }
+        }
+        Column(
+            Modifier.heightIn(max = 300.dp).verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            @Composable
+            fun playlistRow(c: dev.sillyplayer.data.Collection, pinned: Boolean) {
+                val entries = membersByCollection[c.id].orEmpty()
+                val already = singleTrackId != null && entries.any { it.track == singleTrackId }
+                val cover = c.art.ifBlank { entries.firstNotNullOfOrNull { covers[it.track]?.takeIf(String::isNotBlank) }.orEmpty() }
+                Surface(
+                    onClick = { onPick(c.id) },
+                    shape = RoundedCornerShape(12.dp),
+                    color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Row(
+                        Modifier.padding(horizontal = 10.dp, vertical = 9.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Artwork(cover, 40)
+                        Spacer(Modifier.width(12.dp))
+                        Column(Modifier.weight(1f)) {
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                                Text(c.name, Modifier.weight(1f, fill = false), maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Medium)
+                                if (pinned) Glyph("pin", "Pinned", Modifier.size(13.dp), tint = MaterialTheme.colorScheme.primary)
+                            }
+                            Text(
+                                (if (entries.size == 1) "1 song" else "${entries.size} songs") + if (already) " · Already added" else "",
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        Glyph("chevron-right", modifier = Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+            }
+            for (c in pinnedEditable) playlistRow(c, true)
+            if (showLiked) {
+                val alreadyLiked = singleTrackId != null && singleTrackId in likes
+                ModalOptionRow(
+                    title = "Liked Songs",
+                    subtitle = (if (likes.size == 1) "1 song" else "${likes.size} songs") + if (alreadyLiked) " · Already added" else "",
+                    icon = "heart",
+                    trailingIcon = "chevron-right",
+                ) {
+                    onPick("liked")
+                }
+            }
+            for (c in unpinnedEditable) playlistRow(c, false)
+            if (pinnedEditable.isEmpty() && unpinnedEditable.isEmpty() && !showLiked) {
+                Hint("No matching playlists")
+            }
+        }
+    }
 }
 
 
@@ -1284,40 +1768,53 @@ private fun PlaylistSongPicker(tracks: List<Track>, onDismiss: () -> Unit, onAdd
                 track.artist.contains(query, true) || track.album.contains(query, true)
         }
     }
-    AlertDialog(
+    AppModalDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Add songs") },
-        text = {
-            Column(Modifier.fillMaxWidth()) {
-                Input(query, { query = it }, "Search library", icon = "search")
-                Hint("${selected.size} songs selected")
-                if (filtered.isEmpty()) Hint(if (tracks.isEmpty()) "Your library has no songs yet" else "No matching songs")
-                LazyColumn(Modifier.fillMaxWidth().heightIn(max = 380.dp)) {
-                    items(filtered, key = { it.id }) { track ->
-                        Row(
-                            Modifier.fillMaxWidth().heightIn(min = 56.dp).clickable {
-                                selected = if (track.id in selectedIds) selected - track.id else selected + track.id
-                            }.padding(vertical = 4.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Checkbox(track.id in selectedIds, onCheckedChange = null)
-                            Artwork(track.art, 44)
-                            Spacer(Modifier.width(12.dp))
-                            Column(Modifier.weight(1f)) {
-                                Text(track.title, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                Text(track.artist + if (!track.available) " · Unavailable" else "", fontSize = 12.sp,
-                                    maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            }
+        title = "Add songs",
+        subtitle = "${selected.size} ${if (selected.size == 1) "song" else "songs"} selected",
+        icon = "plus",
+        actions = {
+            ModalTonalButton("Cancel", onClick = onDismiss)
+            ModalPrimaryButton("Add (${selected.size})", icon = "check", enabled = selected.isNotEmpty()) {
+                onAdd(tracks.asSequence().filter { it.id in selectedIds }.map { it.id }.toList())
+            }
+        },
+    ) {
+        SearchBarField(query, { query = it }, "Search library")
+        if (filtered.isEmpty()) Hint(if (tracks.isEmpty()) "Your library has no songs yet" else "No matching songs")
+        LazyColumn(Modifier.fillMaxWidth().heightIn(max = 360.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            items(filtered, key = { it.id }) { track ->
+                val isChecked = track.id in selectedIds
+                Surface(
+                    onClick = {
+                        selected = if (isChecked) selected - track.id else selected + track.id
+                    },
+                    shape = RoundedCornerShape(12.dp),
+                    color = if (isChecked) MaterialTheme.colorScheme.primary.copy(alpha = 0.12f) else MaterialTheme.colorScheme.surfaceContainerHigh,
+                    border = BorderStroke(1.dp, if (isChecked) MaterialTheme.colorScheme.primary.copy(alpha = 0.45f) else MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f)),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Row(
+                        Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 7.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Checkbox(isChecked, onCheckedChange = null)
+                        Spacer(Modifier.width(4.dp))
+                        Artwork(track.art, 42)
+                        Spacer(Modifier.width(10.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text(track.title, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Medium)
+                            Text(
+                                track.artist + if (!track.available) " · Unavailable" else "",
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
                         }
                     }
                 }
             }
-        },
-        confirmButton = {
-            Action("Add selected (${selected.size})", enabled = selected.isNotEmpty()) {
-                onAdd(tracks.asSequence().filter { it.id in selectedIds }.map { it.id }.toList())
-            }
-        },
-        dismissButton = { Action("Cancel", onClick = onDismiss) },
-    )
+        }
+    }
 }

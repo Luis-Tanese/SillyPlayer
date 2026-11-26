@@ -7,6 +7,7 @@ Item {
     objectName: "settingsPane"
     required property var shell
     property string category: "Appearance"
+    property bool modalActive: false
     readonly property var categories: ["Appearance", "Playback", "Library and storage", "Phone sync", "Backup and restore", "Keyboard shortcuts", "About"]
     readonly property var glyphs: ["settings", "music-2", "folder", "rotate-ccw", "download", "list-checks", "info"]
     readonly property bool wide: width >= 820
@@ -129,7 +130,7 @@ Item {
                         }
                         AppCombo {
                             model: Object.keys(Theme.palettes)
-                            currentIndex: model.indexOf(app.settings.palette)
+                            currentIndex: model.indexOf(Theme.canonicalPalette(app.settings.palette))
                             Layout.preferredWidth: 180
                             onActivated: app.setSetting("palette", currentText)
                         }
@@ -321,9 +322,33 @@ Item {
                         checked: !!app.settings.discordRpcEnabled
                         onToggled: app.setSetting("discordRpcEnabled", checked)
                     }
-                    // todo: add options here for users to customize what discord rpc displays
+                    AppCheck {
+                        objectName: "discordRpcLookupCovers"
+                        text: "Look up cover art online for local songs"
+                        enabled: !!app.settings.discordRpcEnabled
+                        checked: app.settings.discordRpcLookupCovers !== false
+                        onToggled: app.setSetting("discordRpcLookupCovers", checked)
+                    }
+                    AppCheck {
+                        objectName: "discordRpcUploadCovers"
+                        text: "Upload embedded cover for unmatched local songs"
+                        enabled: !!app.settings.discordRpcEnabled
+                        checked: !!app.settings.discordRpcUploadCovers
+                        onToggled: app.setSetting("discordRpcUploadCovers", checked)
+                    }
+                    Flow {
+                        Layout.fillWidth: true
+                        spacing: 10
+                        FlatButton {
+                            text: "Refresh cover cache"
+                            glyph: "rotate-ccw"
+                            outlined: true
+                            enabled: !!app.settings.discordRpcEnabled
+                            onClicked: app.discord.clearCoverCache()
+                        }
+                    }
                     Label {
-                        text: "Displays the current song, artist, playback progress, and cover art on your Discord profile when Discord is running."
+                        text: "Uses YouTube thumbnails when available, otherwise looks up public covers via iTunes/Deezer and caches them in the database. Optional upload sends resized embedded art to a temporary 72h host only when lookup finds no match."
                         color: Theme.muted
                         font.pixelSize: 12
                         Layout.fillWidth: true
@@ -340,6 +365,8 @@ Item {
             spacing: 16
             property string pendingClearFolder: ""
             property string clearStatus: ""
+            property string repairStatus: ""
+            Component.onDestruction: pane.modalActive = false
             Label {
                 text: "Library and storage"
                 color: Theme.text
@@ -480,6 +507,29 @@ Item {
                         elide: Text.ElideMiddle
                         font.pixelSize: 12
                     }
+                    Label {
+                        text: "Audio files and a portable SQLite database copy (.sillyplayer-library-*.sqlite3) are kept in this folder so your playlists, likes, listening history and settings can be recovered."
+                        color: Theme.muted
+                        font.pixelSize: 12
+                        wrapMode: Text.WordWrap
+                        Layout.fillWidth: true
+                    }
+                    Label {
+                        text: app.recovery.lastSaved > 0
+                            ? ("Database last saved: " + Qt.formatDateTime(new Date(app.recovery.lastSaved), Qt.DefaultLocaleShortDate))
+                            : "Database not saved to folder yet"
+                        color: Theme.muted
+                        font.pixelSize: 12
+                        Layout.fillWidth: true
+                    }
+                    Label {
+                        visible: !!app.recovery.status
+                        text: app.recovery.status
+                        color: Theme.muted
+                        font.pixelSize: 12
+                        wrapMode: Text.WordWrap
+                        Layout.fillWidth: true
+                    }
                     Flow {
                         Layout.fillWidth: true
                         spacing: 10
@@ -492,6 +542,13 @@ Item {
                                 if (path)
                                     app.setSetting("musicDir", path);
                             }
+                        }
+                        FlatButton {
+                            text: app.recovery.saving ? "Saving database…" : "Save database now"
+                            glyph: "download"
+                            outlined: true
+                            enabled: !!app.settings.musicDir && !app.recovery.saving && !library.scanning && !app.backup.busy
+                            onClicked: app.recovery.saveNow(false)
                         }
                         FlatButton {
                             text: "Clear folder"
@@ -535,7 +592,72 @@ Item {
                         spacing: 10
                         FlatButton { text: "Find missing files"; glyph: "folder"; outlined: true; enabled: !app.libraryTools.busy; onClicked: app.libraryTools.findMissing() }
                         FlatButton { text: "Find exact duplicates"; glyph: "list-checks"; outlined: true; enabled: !app.libraryTools.busy; onClicked: app.libraryTools.findDuplicates() }
+                        FlatButton {
+                            text: "Repair downloaded songs"
+                            glyph: "rotate-ccw"
+                            outlined: true
+                            enabled: !library.scanning && !library.trashing && !app.sync.busy && !app.backup.busy
+                            onClicked: {
+                                const res = app.repairDownloadedSongs();
+                                storageSection.repairStatus = res.message || "";
+                            }
+                        }
+                        FlatButton {
+                            objectName: "reinstateFolderBtn"
+                            text: "Reinstate folder"
+                            glyph: "folder"
+                            outlined: true
+                            enabled: !library.scanning && !library.trashing && !app.sync.busy && !app.backup.busy
+                            onClicked: {
+                                const path = app.chooseFolder(app.settings.musicDir);
+                                if (path) {
+                                    const res = app.reinstateFolder(path);
+                                    storageSection.repairStatus = res.message || "";
+                                }
+                            }
+                        }
                         FlatButton { text: "Open system Trash"; glyph: "trash-2"; outlined: true; onClicked: app.openTrash() }
+                    }
+                    Label {
+                        visible: !!storageSection.repairStatus
+                        text: storageSection.repairStatus
+                        color: Theme.muted
+                        font.pixelSize: 12
+                        wrapMode: Text.WordWrap
+                        Layout.fillWidth: true
+                    }
+                }
+            }
+            Rectangle {
+                Layout.fillWidth: true
+                implicitHeight: playlistsCard.implicitHeight + 36
+                radius: 10
+                color: Theme.surface
+                border.width: 1
+                border.color: Theme.separator
+                ColumnLayout {
+                    id: playlistsCard
+                    anchors.fill: parent
+                    anchors.margins: 18
+                    spacing: 10
+                    Label {
+                        text: "Playlists"
+                        color: Theme.text
+                        font.pixelSize: 15
+                        font.weight: Font.Medium
+                    }
+                    AppCheck {
+                        objectName: "allowPlaylistDuplicates"
+                        text: "Allow duplicate songs in playlists"
+                        checked: !!app.settings.allowPlaylistDuplicates
+                        onToggled: app.setSetting("allowPlaylistDuplicates", checked)
+                    }
+                    Label {
+                        text: "Off by default. When off, adding songs skips entries already in the playlist while keeping existing duplicates intact."
+                        color: Theme.muted
+                        font.pixelSize: 12
+                        Layout.fillWidth: true
+                        wrapMode: Text.WordWrap
                     }
                 }
             }
@@ -545,6 +667,7 @@ Item {
                 width: Math.min(pane.width - 40, 460)
                 title: "Clear music folder?"
                 standardButtons: Dialog.Cancel
+                onOpenedChanged: pane.modalActive = opened
                 ColumnLayout {
                     width: parent.width
                     spacing: 12
@@ -600,7 +723,10 @@ Item {
     Component {
         id: category7
         ColumnLayout {
+            id: aboutSection
             spacing: 16
+            property string resetStatus: ""
+            Component.onDestruction: pane.modalActive = false
             Label {
                 text: "About"
                 color: Theme.text
@@ -711,6 +837,12 @@ Item {
                         }
                     }
                     Rectangle { Layout.fillWidth: true; implicitHeight: 1; color: Theme.separator }
+                    AppCheck {
+                        objectName: "developerModeEnabled"
+                        text: "Developer mode"
+                        checked: !!app.settings.developerMode
+                        onToggled: app.setSetting("developerMode", checked)
+                    }
                     RowLayout {
                         Layout.fillWidth: true
                         spacing: 10
@@ -720,6 +852,98 @@ Item {
                             outlined: true
                             danger: true
                             onClicked: Qt.quit()
+                        }
+                    }
+                }
+            }
+            Rectangle {
+                visible: !!app.settings.developerMode
+                Layout.fillWidth: true
+                implicitHeight: devCard.implicitHeight + 36
+                radius: 10
+                color: Theme.surface
+                border.width: 1
+                border.color: Theme.separator
+                ColumnLayout {
+                    id: devCard
+                    anchors.fill: parent
+                    anchors.margins: 18
+                    spacing: 12
+                    Label {
+                        text: "Developer tools"
+                        color: Theme.text
+                        font.pixelSize: 15
+                        font.weight: Font.Medium
+                    }
+                    Label {
+                        text: "Reset only this computer's local library records. Audio files on disk and paired phones are kept."
+                        color: Theme.muted
+                        font.pixelSize: 12
+                        wrapMode: Text.WordWrap
+                        Layout.fillWidth: true
+                    }
+                    FlatButton {
+                        objectName: "resetDesktopLibraryButton"
+                        text: "Reset desktop library"
+                        glyph: "trash-2"
+                        outlined: true
+                        danger: true
+                        enabled: !library.scanning && !library.trashing && !app.sync.busy && !app.backup.busy
+                        onClicked: {
+                            resetConfirmField.text = "";
+                            resetRemoveCache.checked = false;
+                            resetLibraryDialog.open();
+                        }
+                    }
+                    Label {
+                        visible: !!aboutSection.resetStatus
+                        text: aboutSection.resetStatus
+                        color: Theme.muted
+                        font.pixelSize: 12
+                        wrapMode: Text.WordWrap
+                        Layout.fillWidth: true
+                    }
+                }
+            }
+            AppDialog {
+                id: resetLibraryDialog
+                objectName: "resetDesktopLibraryDialog"
+                anchors.centerIn: Overlay.overlay
+                width: Math.min(pane.width - 40, 460)
+                title: "Reset desktop library?"
+                standardButtons: Dialog.Cancel
+                onOpenedChanged: pane.modalActive = opened
+                ColumnLayout {
+                    width: parent.width
+                    spacing: 12
+                    Label {
+                        text: "Removes songs, playlists, likes, listening and download history, watched folders, and the playback queue from this computer. Original audio files on disk are kept, and paired phones stay paired with reset sync cursors."
+                        color: Theme.muted
+                        font.pixelSize: 12
+                        wrapMode: Text.WordWrap
+                        Layout.fillWidth: true
+                    }
+                    AppCheck {
+                        id: resetRemoveCache
+                        text: "Also delete cached artwork and synced files"
+                        checked: false
+                    }
+                    AppField {
+                        id: resetConfirmField
+                        placeholderText: "Type RESET"
+                        Layout.fillWidth: true
+                    }
+                    FlatButton {
+                        text: "Reset desktop library"
+                        glyph: "trash-2"
+                        danger: true
+                        primary: true
+                        enabled: resetConfirmField.text === "RESET"
+                        Layout.alignment: Qt.AlignRight
+                        onClicked: {
+                            const res = app.resetDesktopLibrary(resetRemoveCache.checked);
+                            aboutSection.resetStatus = res.message || "";
+                            resetLibraryDialog.close();
                         }
                     }
                 }

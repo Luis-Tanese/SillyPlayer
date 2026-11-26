@@ -15,6 +15,8 @@ Item {
     property bool editMode: false
     property int songSortIndex: 0
     property bool songSortAsc: false
+    property int collectionSortIndex: 0
+    property bool collectionSortAsc: true
     property int artistSortIndex: 0
     property bool artistSortAsc: true
     property bool pendingSongsTop: false
@@ -24,10 +26,12 @@ Item {
         return collectionId ? app.collections.find(c => c.id === collectionId) || ({}) : ({});
     }
     property bool editable: !!selectedCollection.id && !["generated", "artist"].includes(selectedCollection.kind)
-    onCollectionIdChanged: { editMode = false; clearSelection(); cancelReorder(); filter.text = ""; songs.contentY = 0; }
+    onCollectionIdChanged: { editMode = false; collectionSortIndex = 0; collectionSortAsc = true; clearSelection(); cancelReorder(); filter.text = ""; songs.contentY = 0; }
     onTabChanged: { clearSelection(); cancelReorder(); if (tab !== "Folders") folderPath = ""; }
     onSongSortIndexChanged: { pendingSongsTop = true; }
     onSongSortAscChanged: { pendingSongsTop = true; }
+    onCollectionSortIndexChanged: { pendingSongsTop = true; }
+    onCollectionSortAscChanged: { pendingSongsTop = true; }
     onArtistSortIndexChanged: { pendingCollectionsTop = true; }
     onArtistSortAscChanged: { pendingCollectionsTop = true; }
     property bool selectionMode: false
@@ -149,12 +153,26 @@ Item {
                 list.sort((a, b) => (dir * ((a.duration || 0) - (b.duration || 0))) || (a.title || "").localeCompare(b.title || ""));
             else
                 list.sort((a, b) => (dir * ((a.added || 0) - (b.added || 0))) || (a.title || "").localeCompare(b.title || ""));
+        } else {
+            let cdir = collectionSortAsc ? 1 : -1;
+            if (collectionSortIndex === 1)
+                list.sort((a, b) => (cdir * ((a.added || 0) - (b.added || 0))) || (a.title || "").localeCompare(b.title || ""));
+            else if (collectionSortIndex === 2)
+                list.sort((a, b) => cdir * (a.title || "").localeCompare(b.title || ""));
+            else if (collectionSortIndex === 3)
+                list.sort((a, b) => (cdir * (a.artist || "").localeCompare(b.artist || "")) || (a.title || "").localeCompare(b.title || ""));
+            else if (collectionSortIndex === 4)
+                list.sort((a, b) => (cdir * ((a.duration || 0) - (b.duration || 0))) || (a.title || "").localeCompare(b.title || ""));
+            else if (!collectionSortAsc)
+                list.reverse();
         }
         // keep a plain JS snapshot so field patches remain available when a later search/sort rebuilds the view, without invalidating that view now
         return list.map(row => Object.assign({},row));
     }
     property var visibleTracks: orderedTracks.filter(t => !appliedQuery || ((t.title || "") + " " + (t.artist || "") + " " + (t.album || "")).toLowerCase().includes(appliedQuery))
     property var matchingCollections: visibleCollections.filter(c => c.name.toLowerCase().includes(collectionFilter.text.toLowerCase()))
+    property var pinnedMatchingPlaylists: tab === "Playlists" && !collectionId ? matchingCollections.filter(c => !!c.pinned) : []
+    property var listCollections: tab === "Playlists" && !collectionId ? matchingCollections.filter(c => !c.pinned) : matchingCollections
     property var visibleCollections: {
         let observed = revision;
         if(tab === "Songs" || tab === "Folders" || collectionId)return [];
@@ -368,6 +386,36 @@ Item {
                     : (["Newest first", "Title Z–A", "Artist Z–A", "Longest first"][pane.songSortIndex] + " (click to reverse)")
                 onClicked: pane.songSortAsc = !pane.songSortAsc
             }
+            AppCombo {
+                id: collectionSort
+                objectName: "collectionSort"
+                currentIndex: pane.collectionSortIndex
+                onActivated: idx => {
+                    pane.clearSelection();
+                    pane.cancelReorder();
+                    pane.collectionSortIndex = idx;
+                    pane.collectionSortAsc = (idx !== 1);
+                }
+                model: pane.editable ? ["Playlist order", "Recently added", "Title", "Artist", "Duration"] : ["Default order", "Recently added", "Title", "Artist", "Duration"]
+                Layout.minimumWidth: 156
+                Layout.preferredWidth: 168
+                Layout.preferredHeight: 42
+                Layout.alignment: Qt.AlignVCenter
+                visible: !!pane.collectionId
+            }
+            FlatButton {
+                objectName: "collectionSortDirection"
+                visible: !!pane.collectionId
+                outlined: true
+                Layout.preferredWidth: 42
+                Layout.preferredHeight: 42
+                Layout.alignment: Qt.AlignVCenter
+                glyph: pane.collectionSortAsc ? "arrow-up" : "arrow-down"
+                hint: pane.collectionSortAsc
+                    ? ([(pane.editable ? "Playlist order" : "Default order"), "Oldest first", "Title A–Z", "Artist A–Z", "Shortest first"][pane.collectionSortIndex] + " (click to reverse)")
+                    : ([(pane.editable ? "Playlist order reversed" : "Reversed"), "Newest first", "Title Z–A", "Artist Z–A", "Longest first"][pane.collectionSortIndex] + " (click to reverse)")
+                onClicked: pane.collectionSortAsc = !pane.collectionSortAsc
+            }
         }
         RowLayout {
             visible: pane.tab !== "Songs" && pane.tab !== "Folders" && !pane.collectionId
@@ -566,6 +614,7 @@ Item {
             id: songs
             objectName: "musicSongList"
             reuseItems: false
+            interactive: !pane.dragMember
             visible: pane.tab === "Songs" || !!pane.collectionId
             Layout.fillWidth: true
             Layout.fillHeight: true
@@ -598,8 +647,8 @@ Item {
                     objectName: "memberGrip-" + memberRow.index
                     glyph: "grip-vertical"
                     visible: pane.editMode && pane.editable
-                    enabled: !filter.text && !pane.selectionMode
-                    hint: filter.text ? "Clear search to reorder" : pane.selectionMode ? "Finish selection to reorder" : "Drag to reorder"
+                    enabled: !filter.text && !pane.selectionMode && pane.collectionSortIndex === 0 && pane.collectionSortAsc
+                    hint: filter.text ? "Clear search to reorder" : pane.selectionMode ? "Finish selection to reorder" : (pane.collectionSortIndex !== 0 || !pane.collectionSortAsc) ? "Switch to Playlist order (ascending) to reorder" : "Drag to reorder"
                     checked: pane.dragMember === memberRow.record.memberId
                     MouseArea {
                         anchors.fill: parent
@@ -663,13 +712,27 @@ Item {
             clip: true
             model: StableListModel {
                 id: collectionsModel
-                rows: pane.matchingCollections
+                rows: pane.listCollections
                 onRowsChanged: if (pane.pendingCollectionsTop) { pane.pendingCollectionsTop = false; Qt.callLater(() => collections.positionViewAtBeginning()); }
             }
             ScrollBar.vertical: ScrollBar {
             }
             header: Column {
                 width: collections.width
+                Repeater {
+                    model: pane.pinnedMatchingPlaylists
+                    delegate: CollectionRow {
+                        required property var modelData
+                        width: collections.width
+                        title: modelData.name
+                        subtitle: (modelData.owner ? modelData.owner + " · " : "") + modelData.count + (modelData.count === 1 ? " song" : " songs")
+                        cover: modelData.cover || ""
+                        pinned: true
+                        actions: true
+                        onClicked: { pane.collectionId = modelData.id; pane.collectionName = modelData.name; }
+                        onMenuRequested: anchor => shell.collectionMenu(modelData, anchor)
+                    }
+                }
                 CollectionRow {
                     width: parent.width
                     title: pane.tab === "Playlists" ? "New Playlist" : "New Custom Album"
@@ -708,8 +771,9 @@ Item {
             Label {
                 anchors.horizontalCenter: parent.horizontalCenter
                 y: collections.headerItem ? collections.headerItem.height + 24 : 24
-                visible: pane.tab === "Playlists" && !!collectionFilter.text && pane.matchingCollections.length === 0 && !"liked songs".includes(collectionFilter.text.toLowerCase()) && !"recently played".includes(collectionFilter.text.toLowerCase())
-                text: "No matching playlists"; color: Theme.muted
+                visible: !!collectionFilter.text && pane.matchingCollections.length === 0 && (pane.tab !== "Playlists" || (!"liked songs".includes(collectionFilter.text.toLowerCase()) && !"recently played".includes(collectionFilter.text.toLowerCase())))
+                text: pane.tab === "Playlists" ? "No matching playlists" : pane.tab === "Artists" ? "No matching artists" : "No matching albums"
+                color: Theme.muted
             }
             delegate: CollectionRow {
                 required property var record

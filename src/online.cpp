@@ -890,6 +890,77 @@ void Online::clearFailed() {
     }
   persist(); emit jobsChanged();
 }
+QString Online::streamQualityLabel(const QVariantMap &details) const {
+  if (details.isEmpty() || Source::provider(details) == "direct") return {};
+  QVariantMap audio = details;
+  for (const auto &v : details.value("requested_formats").toList()) {
+    const auto f = v.toMap();
+    if (f.value("acodec").toString() != "none") {
+      audio = f;
+      break;
+    }
+  }
+  QStringList parts;
+  const double abr = audio.value("abr").toDouble();
+  const double tbr = audio.value("tbr").toDouble();
+  const double rate = abr > 0 ? abr : tbr;
+  if (rate > 0) parts << QString("%1 kbps").arg(qRound(rate));
+  const QString ext = audio.value("ext").toString().trimmed().toUpper();
+  if (!ext.isEmpty()) parts << ext;
+  const QString acodec = audio.value("acodec").toString().trimmed();
+  if (!acodec.isEmpty() && acodec != "none") {
+    const QString shortCodec = acodec.section('.', 0, 0).toUpper();
+    if (shortCodec != ext) parts << shortCodec;
+  }
+  qint64 bytes = audio.value("filesize").toLongLong();
+  if (bytes <= 0) bytes = audio.value("filesize_approx").toLongLong();
+  if (bytes > 0) {
+    const double mb = double(bytes) / (1024.0 * 1024.0);
+    parts << (mb >= 1.0 ? QString("~%1 MB").arg(QString::number(mb, 'f', 1))
+                        : QString("~%1 KB").arg(qMax(1LL, bytes / 1024)));
+  }
+  return parts.join(" · ");
+}
+QVariantMap Online::repairDownloadedSongs() {
+  int repaired = 0, missing = 0;
+  QSet<QString> seenPaths;
+  for (const auto &v : m_jobs) {
+    const auto job = v.toMap();
+    if (job.value("state").toString() != "Completed" || job.value("kind").toString() == "Video")
+      continue;
+    const QString path = job.value("path").toString();
+    if (path.isEmpty() || seenPaths.contains(path)) continue;
+    seenPaths.insert(path);
+    if (!QFileInfo(path).isFile()) {
+      ++missing;
+      continue;
+    }
+    // skip songs the user deleted on purpose so repair doesnt resurrect trashed downloads
+    const auto existing = s->rows("SELECT deleted FROM tracks WHERE path=? LIMIT 1", {path}).value(0).toMap();
+    if (!existing.isEmpty() && existing.value("deleted").toBool()) continue;
+    emit musicDownloaded(path, job.value("source").toMap());
+    ++repaired;
+  }
+  restorePlaylistDownloads();
+  QString msg = repaired > 0
+                    ? QString("Re-indexing %1 downloaded %2…").arg(repaired).arg(repaired == 1 ? "song" : "songs")
+                    : QString("No completed downloaded songs needed repair");
+  if (missing > 0) msg += QString(" · %1 missing on disk").arg(missing);
+  return {{"ok", true}, {"repaired", repaired}, {"missing", missing}, {"message", msg}};
+}
+void Online::resetJobs() {
+  cancelResolution();
+  if (searchProcess) { discardProcess(searchProcess, this); searchProcess = nullptr; }
+  searching = false;
+  m_results.clear();
+  m_details.clear();
+  searchStates.clear();
+  m_jobs.clear();
+  savedJobs.clear();
+  emit searchChanged();
+  emit detailsChanged();
+  emit jobsChanged();
+}
 void Online::shutdown() {
   if (closing)
     return;

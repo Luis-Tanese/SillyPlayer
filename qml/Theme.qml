@@ -395,177 +395,28 @@ QtObject {
                 "#24292e",
                 "#586069",
                 "#0366d6"
-        ],
-        "Catppuccin Latte": [
-                "#1e1e2e",
-                "#181825",
-                "#313244",
-                "#cdd6f4",
-                "#a6adc8",
-                "#cba6f7",
-                "#eff1f5",
-                "#e6e9ef",
-                "#ccd0da",
-                "#4c4f69",
-                "#6c6f85",
-                "#8839ef"
-        ],
-        "Catppuccin Mocha": [
-                "#1e1e2e",
-                "#181825",
-                "#313244",
-                "#cdd6f4",
-                "#a6adc8",
-                "#cba6f7",
-                "#eff1f5",
-                "#e6e9ef",
-                "#ccd0da",
-                "#4c4f69",
-                "#6c6f85",
-                "#8839ef"
-        ],
-        "Base16 Ocean Light": [
-                "#2b303b",
-                "#232833",
-                "#4f5b66",
-                "#c0c5ce",
-                "#a7adba",
-                "#8fa1b3",
-                "#ffffff",
-                "#f6f8fa",
-                "#e5e9ef",
-                "#24292e",
-                "#586069",
-                "#0366d6"
-        ],
-        "Coldark Cold": [
-                "#111b27",
-                "#0b141f",
-                "#213043",
-                "#e3eaf2",
-                "#8da1b9",
-                "#66b3ff",
-                "#ffffff",
-                "#f6f8fa",
-                "#e5e9ef",
-                "#24292e",
-                "#586069",
-                "#0366d6"
-        ],
-        "Coldark Dark": [
-                "#111b27",
-                "#0b141f",
-                "#213043",
-                "#e3eaf2",
-                "#8da1b9",
-                "#66b3ff",
-                "#ffffff",
-                "#f6f8fa",
-                "#e5e9ef",
-                "#24292e",
-                "#586069",
-                "#0366d6"
-        ],
-        "Gruvbox Dark": [
-                "#282828",
-                "#1d2021",
-                "#3c3836",
-                "#ebdbb2",
-                "#bdae93",
-                "#d8a657",
-                "#fbf1c7",
-                "#f2e5bc",
-                "#ebdbb2",
-                "#3c3836",
-                "#665c54",
-                "#9d5b16"
-        ],
-        "Gruvbox Light": [
-                "#282828",
-                "#1d2021",
-                "#3c3836",
-                "#ebdbb2",
-                "#bdae93",
-                "#d8a657",
-                "#fbf1c7",
-                "#f2e5bc",
-                "#ebdbb2",
-                "#3c3836",
-                "#665c54",
-                "#9d5b16"
-        ],
-        "Monokai Extended Light": [
-                "#272822",
-                "#1e1f1c",
-                "#49483e",
-                "#f8f8f2",
-                "#a6a69c",
-                "#a6e22e",
-                "#ffffff",
-                "#f6f8fa",
-                "#e5e9ef",
-                "#24292e",
-                "#586069",
-                "#0366d6"
-        ],
-        "One Half Dark": [
-                "#282c34",
-                "#21252b",
-                "#3e4451",
-                "#dcdfe4",
-                "#a0a7b4",
-                "#61afef",
-                "#ffffff",
-                "#f6f8fa",
-                "#e5e9ef",
-                "#24292e",
-                "#586069",
-                "#0366d6"
-        ],
-        "One Half Light": [
-                "#282c34",
-                "#21252b",
-                "#3e4451",
-                "#dcdfe4",
-                "#a0a7b4",
-                "#61afef",
-                "#ffffff",
-                "#f6f8fa",
-                "#e5e9ef",
-                "#24292e",
-                "#586069",
-                "#0366d6"
-        ],
-        "Solarized Dark": [
-                "#002b36",
-                "#00212b",
-                "#073642",
-                "#eee8d5",
-                "#93a1a1",
-                "#2aa198",
-                "#fdf6e3",
-                "#eee8d5",
-                "#ddd6c1",
-                "#586e75",
-                "#657b83",
-                "#167d77"
-        ],
-        "Solarized Light": [
-                "#002b36",
-                "#00212b",
-                "#073642",
-                "#eee8d5",
-                "#93a1a1",
-                "#2aa198",
-                "#fdf6e3",
-                "#eee8d5",
-                "#ddd6c1",
-                "#586e75",
-                "#657b83",
-                "#167d77"
         ]
-})
-    readonly property var p: palettes[app.settings.palette] || palettes.Catppuccin
+    })
+    // old duplicate palette names map back here so nobody loses their saved theme
+    readonly property var paletteAliases: ({
+        "Catppuccin Latte": "Catppuccin",
+        "Catppuccin Mocha": "Catppuccin",
+        "Base16 Ocean Light": "Base16 Ocean",
+        "Coldark Cold": "Coldark",
+        "Coldark Dark": "Coldark",
+        "Gruvbox Dark": "Gruvbox",
+        "Gruvbox Light": "Gruvbox",
+        "Monokai Extended Light": "Monokai Extended",
+        "One Half Dark": "One Half",
+        "One Half Light": "One Half",
+        "Solarized Dark": "Solarized",
+        "Solarized Light": "Solarized"
+    })
+    function canonicalPalette(name) {
+        const mapped = paletteAliases[name] || name;
+        return palettes[mapped] ? mapped : "Catppuccin";
+    }
+    readonly property var p: palettes[canonicalPalette(app.settings.palette)] || palettes.Catppuccin
     readonly property int offset: light ? 6 : 0
     readonly property color bg: p[offset]
     readonly property color base: p[offset + 1]

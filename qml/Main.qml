@@ -13,9 +13,12 @@ ApplicationWindow {
     visible: true
     title: "SillyPlayer"
     color: Theme.bg
-    property string page: ["Music", "Browse", "Split", "Downloads", "Me!", "Settings"].includes(app.settings.lastPage) ? app.settings.lastPage : "Music"
+    property string page: "Music"
     property bool geometryReady: false
     Component.onCompleted: {
+        // restore lastPage once so later settingsChanged signals cant snap the active page back
+        if (["Music", "Browse", "Split", "Downloads", "Me!", "Settings"].includes(app.settings.lastPage))
+            page = app.settings.lastPage;
         // restore window geometry once so later setting changes cannot snap a maximized window back
         width = Math.max(minimumWidth, Number(app.settings.windowWidth) || 1160);
         height = Math.max(minimumHeight, Number(app.settings.windowHeight) || 800);
@@ -76,15 +79,14 @@ ApplicationWindow {
     property string collectionKind: "playlist"
     property bool renameMode: false
     property var downloadDetails: ({})
-    property string pendingAddCollection: ""
     property string addSongsCollection: ""
-    property bool createAndAdd: false
     property string duplicatePath: ""
     property bool editingText: activeFocusItem && (activeFocusItem.hasOwnProperty("selectedText") || activeFocusItem.hasOwnProperty("inputMethodComposing"))
     property bool videoKeyboard: youtubePane.activeFocus && videoOpen && (page === "Browse" || page === "Split")
     property bool videoVisible: videoOpen && !expanded && (page === "Browse" || (page === "Split" && (width >= 960 || narrowPane.currentIndex === 1)))
     property bool playerKeyboard: expanded || compactPlayer.activeFocus || videoKeyboard
-    property bool modalActive: libraryToolsDialog.opened || playlistDownloadDialog.opened || sleepDialog.opened || musicPane.bulkModalActive || errorDialog.opened || nameDialog.opened || deleteDialog.opened || addDialog.opened || metadataDialog.opened || catalogueDialog.opened || infoDialog.opened || speedDialog.opened || songVolumeDialog.opened || eqDialog.opened || downloadDialog.opened || duplicateDialog.opened || duplicateTrackDialog.opened || addSongsDialog.opened || detailsDialog.opened || trashDialog.opened || linkDialog.opened || songMenu.opened || expandedMenu.opened || collectionActions.opened
+    // track settingsPane modals too so global shortcuts stay paused when clear/reset dialogs are open
+    property bool modalActive: libraryToolsDialog.opened || playlistDownloadDialog.opened || sleepDialog.opened || musicPane.bulkModalActive || settingsPane.modalActive || errorDialog.opened || nameDialog.opened || deleteDialog.opened || removeDuplicatesDialog.opened || addDialog.opened || metadataDialog.opened || catalogueDialog.opened || infoDialog.opened || speedDialog.opened || songVolumeDialog.opened || eqDialog.opened || downloadDialog.opened || duplicateDialog.opened || addSongsDialog.opened || detailsDialog.opened || trashDialog.opened || linkDialog.opened || songMenu.opened || expandedMenu.opened || collectionActions.opened
     property var orderedJobs: online.jobs.slice().sort((a, b) => {
             const states = ["Active", "Resolving", "Post-processing", "Queued", "Paused", "Interrupted", "Failed", "Completed", "Cancelled"];
             return states.indexOf(a.state) - states.indexOf(b.state);
@@ -529,6 +531,7 @@ ApplicationWindow {
                 shell: root
             }
             SettingsPane {
+                id: settingsPane
                 anchors.fill: parent
                 anchors.margins: root.width > 876 ? 28 : 20
                 visible: root.page === "Settings"
@@ -910,7 +913,7 @@ ApplicationWindow {
             onTriggered: app.togglePin(root.selectedCollection.kind, root.selectedCollection.id)
         }
         AppMenuItem {
-            text: "Edit Playlist"
+            text: root.selectedCollection.kind === "custom" ? "Edit Custom Album" : "Edit Playlist"
             glyph: "pencil"
             visible: root.selectedCollection.kind !== "artist"
             height: visible ? implicitHeight : 0
@@ -928,7 +931,7 @@ ApplicationWindow {
             onTriggered: app.coverCollection(root.selectedCollection.id)
         }
         AppMenuItem {
-            text: "Export playlist (.m3u8)"
+            text: root.selectedCollection.kind === "custom" ? "Export album (.m3u8)" : "Export playlist (.m3u8)"
             glyph: "download"
             visible: root.selectedCollection.kind !== "artist"
             height: visible ? implicitHeight : 0
@@ -938,11 +941,60 @@ ApplicationWindow {
             }
         }
         AppMenuItem {
-            text: "Delete Playlist"
+            objectName: "removePlaylistDuplicatesAction"
+            text: "Remove duplicate songs"
+            glyph: "list-checks"
+            visible: root.selectedCollection.kind === "playlist" || root.selectedCollection.kind === "custom"
+            height: visible ? implicitHeight : 0
+            onTriggered: {
+                const count = app.countPlaylistDuplicates(root.selectedCollection.id);
+                if (count <= 0) {
+                    musicPane.resultMessage = root.selectedCollection.kind === "custom" ? "No duplicate songs in this album" : "No duplicate songs in this playlist";
+                    return;
+                }
+                removeDuplicatesDialog.duplicateCount = count;
+                removeDuplicatesDialog.open();
+            }
+        }
+        AppMenuItem {
+            text: root.selectedCollection.kind === "custom" ? "Delete Custom Album" : "Delete Playlist"
             glyph: "trash-2"
             visible: root.selectedCollection.kind !== "artist"
             height: visible ? implicitHeight : 0
             onTriggered: deleteDialog.open()
+        }
+    }
+    AppDialog {
+        id: removeDuplicatesDialog
+        objectName: "removeDuplicatesDialog"
+        anchors.centerIn: parent
+        width: Math.min(root.width - 40, 440)
+        title: "Remove duplicate songs?"
+        standardButtons: Dialog.Cancel
+        property int duplicateCount: 0
+        ColumnLayout {
+            width: parent.width; spacing: 14
+            Label {
+                text: 'Remove ' + removeDuplicatesDialog.duplicateCount + (removeDuplicatesDialog.duplicateCount === 1 ? ' duplicate entry' : ' duplicate entries') + ' from "' + (root.selectedCollection.name || "") + '"?'
+                color: Theme.text; Layout.fillWidth: true; wrapMode: Text.WordWrap
+            }
+            Label {
+                text: "The first occurrence of each song is kept in playlist order."
+                color: Theme.muted; font.pixelSize: 12; Layout.fillWidth: true; wrapMode: Text.WordWrap
+            }
+            FlatButton {
+                objectName: "confirmRemovePlaylistDuplicates"
+                text: "Remove duplicates"; glyph: "list-checks"; primary: true; Layout.alignment: Qt.AlignRight
+                onClicked: {
+                    const res = app.removePlaylistDuplicates(root.selectedCollection.id);
+                    removeDuplicatesDialog.close();
+                    if (res.status === "done")
+                        musicPane.resultMessage = "Removed " + res.removed + (res.removed === 1 ? " duplicate song" : " duplicate songs");
+                    else if (res.message) {
+                        errorLabel.text = res.message; errorDialog.open();
+                    }
+                }
+            }
         }
     }
     AppDialog {
@@ -1021,12 +1073,8 @@ ApplicationWindow {
         }
         onAccepted: {
             if (root.renameMode) app.renameCollection(root.selectedCollection.id, nameInput.text);
-            else {
-                const id = app.createCollection(nameInput.text, root.collectionKind);
-                if (root.createAndAdd && id) { root.insertTrack(id); root.createAndAdd = false; addDialog.close(); }
-            }
+            else app.createCollection(nameInput.text, root.collectionKind);
         }
-        onRejected: root.createAndAdd = false
         onOpened: {
             nameInput.forceActiveFocus();
             nameDialog.standardButton(Dialog.Save).enabled = Qt.binding(() => nameInput.text.trim().length > 0);
@@ -1041,13 +1089,25 @@ ApplicationWindow {
             text: "Audio files will be kept."
             color: Theme.text
         }
-        onAccepted: app.deleteCollection(root.selectedCollection.id)
+        onAccepted: {
+            // back out if the user deleted the playlist theyre currently looking at
+            const deletedId = root.selectedCollection.id;
+            app.deleteCollection(deletedId);
+            if (musicPane.collectionId === deletedId) {
+                musicPane.collectionId = "";
+                musicPane.collectionName = "";
+            }
+        }
     }
     function insertTrack(collection, again = false) {
-        const result = app.addToCollection(collection, root.selectedTrack.id, again);
-        if (result === "duplicate") { pendingAddCollection = collection; duplicateTrackDialog.open(); }
-        else if (result === "added") addDialog.close();
-        else if (result === "invalid") { errorLabel.text = "Choose a valid library song and editable playlist"; errorDialog.open(); }
+        const result = app.addTracksToCollection(collection, [root.selectedTrack.id], again ? "duplicates" : "auto");
+        if (result.status === "done") {
+            addDialog.close();
+            if (result.added > 0) musicPane.resultMessage = "Added to playlist";
+            else if (result.skipped > 0) musicPane.resultMessage = "Already in playlist (skipped)";
+        } else if (result.message) {
+            errorLabel.text = result.message; errorDialog.open();
+        }
     }
     function addSongs(collection) { addSongsDialog.selectedIds = ({}); addSongsDialog.anchorIndex = -1; addSongsDialog.feedback = ""; addSongsCollection = collection; addSongSearch.text = ""; addSongsDialog.open(); }
     AppDialog {
@@ -1060,38 +1120,112 @@ ApplicationWindow {
         }
     }
     AppDialog {
-        id: duplicateTrackDialog
-        objectName: "duplicateTrackDialog"
-        anchors.centerIn: parent; width: Math.min(root.width - 40, 420)
-        title: "Already in this playlist"; standardButtons: Dialog.Cancel
-        ColumnLayout {
-            width: parent.width; spacing: 16
-            Label { text: "This song is already included. Add another entry?"; color: Theme.text; Layout.fillWidth: true; wrapMode: Text.WordWrap }
-            FlatButton { text: "Add again"; glyph: "plus"; Layout.alignment: Qt.AlignRight; onClicked: { root.insertTrack(root.pendingAddCollection, true); duplicateTrackDialog.close(); } }
-        }
-    }
-    AppDialog {
         id: addDialog
         objectName: "addToPlaylistDialog"
         anchors.centerIn: parent; width: Math.min(root.width - 40, 460)
         title: "Add to Playlist"; standardButtons: Dialog.Close
-        onOpened: playlistSearch.text = ""
+        property string pendingCreateName: ""
+        property bool enteringCustomName: false
+        onOpened: {
+            playlistSearch.text = "";
+            pendingCreateName = "";
+            enteringCustomName = false;
+            inlinePlaylistName.text = "";
+        }
         ColumnLayout {
             width: parent.width; spacing: 10
             Label { text: root.selectedTrack.title || ""; color: Theme.muted; elide: Text.ElideRight; Layout.fillWidth: true }
-            AppField { id: playlistSearch; search: true; placeholderText: "Find a playlist"; Layout.fillWidth: true }
+            AppField {
+                id: playlistSearch; search: true; placeholderText: "Find or name a playlist"; Layout.fillWidth: true
+                onTextChanged: if (addDialog.pendingCreateName) addDialog.pendingCreateName = ""
+            }
             CollectionRow {
-                Layout.fillWidth: true; title: "New Playlist"; glyph: "plus"
-                onClicked: { root.newCollection("playlist"); root.createAndAdd = true; }
+                Layout.fillWidth: true
+                visible: !addDialog.pendingCreateName && !addDialog.enteringCustomName
+                title: playlistSearch.text.trim() ? 'Create playlist "' + playlistSearch.text.trim() + '"' : "Create playlist"
+                subtitle: playlistSearch.text.trim() ? "Use this name & add song" : "Type a name above or tap to enter"
+                glyph: "plus"
+                onClicked: {
+                    const typed = playlistSearch.text.trim();
+                    if (typed.length > 0) addDialog.pendingCreateName = typed;
+                    else { inlinePlaylistName.text = ""; addDialog.enteringCustomName = true; inlinePlaylistName.forceActiveFocus(); }
+                }
+            }
+            Rectangle {
+                Layout.fillWidth: true
+                visible: !!addDialog.pendingCreateName
+                implicitHeight: inlineConfirmCol.implicitHeight + 24
+                radius: 10; color: Qt.alpha(Theme.accent, 0.08); border.width: 1; border.color: Qt.alpha(Theme.accent, 0.35)
+                ColumnLayout {
+                    id: inlineConfirmCol
+                    anchors.fill: parent; anchors.margins: 12; spacing: 10
+                    Label {
+                        text: 'Create playlist "' + addDialog.pendingCreateName + '" and add this song?'
+                        color: Theme.text; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.weight: Font.Medium
+                    }
+                    RowLayout {
+                        Layout.alignment: Qt.AlignRight; spacing: 8
+                        FlatButton { text: "Edit name"; onClicked: { inlinePlaylistName.text = addDialog.pendingCreateName; addDialog.pendingCreateName = ""; addDialog.enteringCustomName = true; inlinePlaylistName.forceActiveFocus(); } }
+                        FlatButton { text: "Cancel"; onClicked: addDialog.pendingCreateName = "" }
+                        FlatButton {
+                            text: "Create & add"; glyph: "check"; primary: true
+                            onClicked: {
+                                const id = app.createCollection(addDialog.pendingCreateName, "playlist");
+                                addDialog.pendingCreateName = "";
+                                if (id) root.insertTrack(id);
+                            }
+                        }
+                    }
+                }
+            }
+            Rectangle {
+                Layout.fillWidth: true
+                visible: addDialog.enteringCustomName
+                implicitHeight: inlineCreateCol.implicitHeight + 24
+                radius: 10; color: Theme.surface; border.width: 1; border.color: Theme.separator
+                ColumnLayout {
+                    id: inlineCreateCol
+                    anchors.fill: parent; anchors.margins: 12; spacing: 10
+                    AppField {
+                        id: inlinePlaylistName; placeholderText: "New playlist name"; Layout.fillWidth: true
+                        onAccepted: if (text.trim().length > 0) {
+                            const id = app.createCollection(text.trim(), "playlist");
+                            addDialog.enteringCustomName = false;
+                            if (id) root.insertTrack(id);
+                        }
+                    }
+                    RowLayout {
+                        Layout.alignment: Qt.AlignRight; spacing: 8
+                        FlatButton { text: "Cancel"; onClicked: addDialog.enteringCustomName = false }
+                        FlatButton {
+                            text: "Create & add"; glyph: "check"; primary: true
+                            enabled: inlinePlaylistName.text.trim().length > 0
+                            onClicked: {
+                                const id = app.createCollection(inlinePlaylistName.text.trim(), "playlist");
+                                addDialog.enteringCustomName = false;
+                                if (id) root.insertTrack(id);
+                            }
+                        }
+                    }
+                }
             }
             ListView {
-                Layout.fillWidth: true; Layout.preferredHeight: Math.min(300, root.height - 360)
-                clip: true; model: addDialog.visible ? [{id:"liked", name:"Liked Songs",kind:"liked",count:library.likedCount}].concat(app.collections.filter(c => c.kind === "playlist" || c.kind === "custom")).filter(c => c.name.toLowerCase().includes(playlistSearch.text.toLowerCase())) : []
+                Layout.fillWidth: true; Layout.preferredHeight: Math.min(300, root.height - 380)
+                clip: true
+                model: {
+                    if (!addDialog.visible) return [];
+                    const editable = app.collections.filter(c => c.kind === "playlist" || c.kind === "custom");
+                    const pinned = editable.filter(c => !!c.pinned);
+                    const rest = editable.filter(c => !c.pinned);
+                    return pinned.concat([{id:"liked", name:"Liked Songs", kind:"liked", count:library.likedCount}], rest)
+                        .filter(c => c.name.toLowerCase().includes(playlistSearch.text.toLowerCase()));
+                }
                 ScrollBar.vertical: ScrollBar {}
                 delegate: CollectionRow {
                     required property var modelData
                     width: ListView.view.width
                     title: modelData.name; cover: modelData.cover || ""; glyph: modelData.kind === "liked" ? "heart" : ""
+                    pinned: !!modelData.pinned
                     subtitle: (modelData.count || 0) + " songs" + (app.collectionContains(modelData.id, root.selectedTrack.id) ? " · Already added" : "")
                     onClicked: root.insertTrack(modelData.id)
                 }
@@ -1159,7 +1293,7 @@ ApplicationWindow {
                 enabled: Object.keys(addSongsDialog.selectedIds).length > 0
                 onClicked: {
                     const ids = library.tracks.filter(t => !!addSongsDialog.selectedIds[t.id]).map(t => t.id);
-                    const result = app.addTracksToCollection(root.addSongsCollection, ids, "skip");
+                    const result = app.addTracksToCollection(root.addSongsCollection, ids, "auto");
                     addSongsDialog.feedback = result.status === "error" ? result.message : result.added + " added · " + result.skipped + " skipped";
                     if (result.status === "done") addSongsDialog.selectedIds = ({});
                 }
@@ -1479,18 +1613,49 @@ ApplicationWindow {
         title: "Equalizer"
         standardButtons: Dialog.Close
         property var gains: app.settings.eqGains
+        property bool savingPreset: false
+        property string presetError: ""
+        readonly property var builtinPresets: [
+            { name: "Flat", gains: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0], custom: false },
+            { name: "Bass Boost", gains: [6, 5, 4, 2, 0, 0, 0, 0, 0, 0], custom: false },
+            { name: "Rock", gains: [4, 3, 1, -1, -2, 1, 3, 4, 4, 3], custom: false },
+            { name: "Pop", gains: [-1, 1, 3, 4, 3, 0, -1, -1, 1, 2], custom: false },
+            { name: "Classical", gains: [3, 2, 0, 0, -1, -1, 0, 2, 3, 4], custom: false }
+        ]
+        readonly property var customPresets: app.settings.eqCustomPresets || []
+        readonly property var presetNames: builtinPresets.map(p => p.name).concat(customPresets.map(p => p.name), ["Custom"])
+        readonly property var activeCustomPreset: customPresets.find(p => p.name === eqPreset.currentText) || null
+        function syncCombo() {
+            const idx = presetNames.indexOf(app.settings.eqPreset || "Flat");
+            eqPreset.currentIndex = idx >= 0 ? idx : presetNames.length - 1;
+        }
         onAboutToShow: {
-            const idx = eqPreset.model.indexOf(app.settings.eqPreset || "Flat");
-            eqPreset.currentIndex = idx >= 0 ? idx : 0;
+            gains = (app.settings.eqGains || [0,0,0,0,0,0,0,0,0,0]).slice();
+            savingPreset = false;
+            presetError = "";
+            syncCombo();
+        }
+        onPresetNamesChanged: if (opened) syncCombo()
+        Connections {
+            target: app
+            function onSettingsChanged() {
+                if (eqDialog.opened && !eqDialog.savingPreset) {
+                    eqDialog.gains = (app.settings.eqGains || [0,0,0,0,0,0,0,0,0,0]).slice();
+                    eqDialog.syncCombo();
+                }
+            }
         }
         function apply(values, presetName) {
             gains = values;
             app.applyEq(eqEnabled.checked, values, presetName || "Custom");
+            syncCombo();
         }
         ColumnLayout {
             width: parent.width
-            spacing: 18
+            spacing: 14
             RowLayout {
+                Layout.fillWidth: true
+                spacing: 8
                 AppCheck {
                     id: eqEnabled
                     text: "Enabled"
@@ -1499,15 +1664,42 @@ ApplicationWindow {
                 }
                 AppCombo {
                     id: eqPreset
-                    model: ["Flat", "Bass Boost", "Rock", "Pop", "Classical", "Custom"]
+                    objectName: "eqPresetCombo"
+                    model: eqDialog.presetNames
+                    Layout.minimumWidth: 160
                     onActivated: {
-                        const presets = [[0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [6, 5, 4, 2, 0, 0, 0, 0, 0, 0], [4, 3, 1, -1, -2, 1, 3, 4, 4, 3], [-1, 1, 3, 4, 3, 0, -1, -1, 1, 2], [3, 2, 0, 0, -1, -1, 0, 2, 3, 4]];
-                        if (currentIndex < 5)
-                            eqDialog.apply(presets[currentIndex], currentText);
+                        const chosen = currentText;
+                        const builtin = eqDialog.builtinPresets.find(p => p.name === chosen);
+                        if (builtin) { eqDialog.apply(builtin.gains.slice(), chosen); return; }
+                        const saved = eqDialog.customPresets.find(p => p.name === chosen);
+                        if (saved) eqDialog.apply((saved.gains || []).slice(), saved.name);
                     }
                 }
                 Item {
                     Layout.fillWidth: true
+                }
+                FlatButton {
+                    objectName: "saveEqPresetButton"
+                    text: eqDialog.activeCustomPreset ? "Update preset" : "Save preset"
+                    glyph: "plus"
+                    outlined: true
+                    onClicked: {
+                        eqPresetName.text = eqDialog.activeCustomPreset ? eqDialog.activeCustomPreset.name : "";
+                        eqDialog.presetError = "";
+                        eqDialog.savingPreset = true;
+                        eqPresetName.forceActiveFocus();
+                    }
+                }
+                FlatButton {
+                    objectName: "deleteEqPresetButton"
+                    visible: !!eqDialog.activeCustomPreset
+                    glyph: "trash-2"
+                    hint: "Delete saved preset"
+                    danger: true
+                    onClicked: {
+                        if (eqDialog.activeCustomPreset) app.deleteEqPreset(eqDialog.activeCustomPreset.id);
+                        eqDialog.syncCombo();
+                    }
                 }
                 FlatButton {
                     text: "Reset"
@@ -1515,6 +1707,47 @@ ApplicationWindow {
                         eqPreset.currentIndex = 0;
                         eqDialog.apply([0, 0, 0, 0, 0, 0, 0, 0, 0, 0], "Flat");
                     }
+                }
+            }
+            Rectangle {
+                Layout.fillWidth: true
+                visible: eqDialog.savingPreset
+                implicitHeight: savePresetCol.implicitHeight + 20
+                radius: 8; color: Theme.surface; border.width: 1; border.color: Theme.separator
+                ColumnLayout {
+                    id: savePresetCol
+                    anchors.fill: parent; anchors.margins: 10; spacing: 8
+                    RowLayout {
+                        Layout.fillWidth: true; spacing: 8
+                        AppField {
+                            id: eqPresetName
+                            objectName: "eqPresetNameField"
+                            Layout.fillWidth: true
+                            placeholderText: "Preset name (syncs with phone)"
+                            onAccepted: {
+                                if (text.trim().length > 0) {
+                                    const res = app.saveEqPreset(text.trim(), eqDialog.gains);
+                                    if (res.ok) { eqDialog.savingPreset = false; eqDialog.presetError = ""; eqDialog.syncCombo(); }
+                                    else eqDialog.presetError = res.error || "Could not save preset";
+                                }
+                            }
+                        }
+                        FlatButton {
+                            text: "Cancel"
+                            onClicked: { eqDialog.savingPreset = false; eqDialog.presetError = ""; }
+                        }
+                        FlatButton {
+                            objectName: "confirmSaveEqPreset"
+                            text: "Save"; glyph: "check"; primary: true
+                            enabled: eqPresetName.text.trim().length > 0
+                            onClicked: {
+                                const res = app.saveEqPreset(eqPresetName.text.trim(), eqDialog.gains);
+                                if (res.ok) { eqDialog.savingPreset = false; eqDialog.presetError = ""; eqDialog.syncCombo(); }
+                                else eqDialog.presetError = res.error || "Could not save preset";
+                            }
+                        }
+                    }
+                    Label { visible: !!eqDialog.presetError; text: eqDialog.presetError; color: Theme.danger; font.pixelSize: 12 }
                 }
             }
             RowLayout {
@@ -1536,7 +1769,7 @@ ApplicationWindow {
                             onMoved: {
                                 let g = eqDialog.gains.slice();
                                 g[index] = value;
-                                eqPreset.currentIndex = 5;
+                                eqPreset.currentIndex = eqDialog.presetNames.length - 1;
                                 eqDialog.apply(g);
                             }
                             Accessible.name: modelData + " Hz gain"
@@ -1576,7 +1809,15 @@ ApplicationWindow {
                 model: ["Original audio", "MP3"]
             }
             Label {
-                text: root.downloadDetails.provider === "direct" ? "Original file · existing audio and tags are preserved" : formatBox.currentIndex === 0 ? "Best source audio · no extra lossy encoding" : "Best source audio · high-quality MP3 conversion"
+                readonly property string streamQuality: online.streamQualityLabel(root.downloadDetails)
+                text: {
+                    if (root.downloadDetails.provider === "direct")
+                        return "Original file · existing audio and tags are preserved";
+                    const base = formatBox.currentIndex === 0
+                        ? "Best source audio · no extra lossy encoding"
+                        : "Best source audio · high-quality MP3 conversion";
+                    return streamQuality ? ("Source stream: " + streamQuality + "\n" + base) : base;
+                }
                 color: Theme.muted; font.pixelSize: 12; wrapMode: Text.Wrap; Layout.fillWidth: true
             }
             RowLayout {

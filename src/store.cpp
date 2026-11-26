@@ -182,6 +182,8 @@ Store::Store(const QString &path) {
     if(!ok||!exec("PRAGMA user_version=10")||!m_db.commit()){m_db.rollback();throw std::runtime_error(m_error.toStdString());}
   }
   if(!exec("CREATE TABLE IF NOT EXISTS sync_media_pending(track TEXT PRIMARY KEY,desired TEXT NOT NULL,actual TEXT NOT NULL)"))throw std::runtime_error("Cannot initialize pending media state");
+  // cache public discord rpc cover urls for local songs so we dont spam metadata apis
+  if(!exec("CREATE TABLE IF NOT EXISTS rpc_covers(track TEXT PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE,url TEXT NOT NULL,provider TEXT NOT NULL DEFAULT '',checkedAt INTEGER NOT NULL)"))throw std::runtime_error("Cannot initialize rpc cover cache");
   // order is a collection-wide revision, independent from membership edits
   if(version<11) {
     if(version) {

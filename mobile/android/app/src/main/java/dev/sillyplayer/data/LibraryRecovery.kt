@@ -34,10 +34,17 @@ internal data class PortableSettings(
     val eqEnabled: Boolean = false,
     val eq: List<Float> = List(10) { 0f },
     val eqPreset: String = "Flat",
+    val eqPresets: List<EqPreset> = emptyList(),
+    val eqStateUpdatedAt: Long = 0L,
     val pauseFade: Boolean = false,
     val fadeMs: Int = 300,
     val crossfadeMs: Int = 0,
+    val smartShuffle: Boolean = false,
     val duckAudio: Boolean = true,
+    val allowPlaylistDuplicates: Boolean = false,
+    val updateNotifications: Boolean = true,
+    val pinnedPlaylists: List<String> = emptyList(),
+    val pinnedArtists: List<String> = emptyList(),
 ) {
     fun applyTo(prefs: Preferences): Preferences =
         prefs.copy(
@@ -51,10 +58,17 @@ internal data class PortableSettings(
                 if (eq.size == 10 && eq.all { it.isFinite() }) eq.map { it.coerceIn(-12f, 12f) }
                 else prefs.eq,
             eqPreset = eqPreset.ifBlank { prefs.eqPreset },
+            eqPresets = mergeEqPresets(prefs.eqPresets, eqPresets),
+            eqStateUpdatedAt = maxOf(prefs.eqStateUpdatedAt, eqStateUpdatedAt),
             pauseFade = pauseFade,
             fadeMs = fadeMs.coerceIn(50, 5000),
             crossfadeMs = crossfadeMs.coerceIn(0, 8000),
+            smartShuffle = smartShuffle,
             duckAudio = duckAudio,
+            allowPlaylistDuplicates = allowPlaylistDuplicates,
+            updateNotifications = updateNotifications,
+            pinnedPlaylists = pinnedPlaylists.distinct(),
+            pinnedArtists = pinnedArtists.distinct(),
         )
 
     companion object {
@@ -68,10 +82,17 @@ internal data class PortableSettings(
                 eqEnabled = prefs.eqEnabled,
                 eq = prefs.eq,
                 eqPreset = prefs.eqPreset,
+                eqPresets = prefs.eqPresets,
+                eqStateUpdatedAt = prefs.eqStateUpdatedAt,
                 pauseFade = prefs.pauseFade,
                 fadeMs = prefs.fadeMs,
                 crossfadeMs = prefs.crossfadeMs,
+                smartShuffle = prefs.smartShuffle,
                 duckAudio = prefs.duckAudio,
+                allowPlaylistDuplicates = prefs.allowPlaylistDuplicates,
+                updateNotifications = prefs.updateNotifications,
+                pinnedPlaylists = prefs.pinnedPlaylists,
+                pinnedArtists = prefs.pinnedArtists,
             )
     }
 }

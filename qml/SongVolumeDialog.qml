@@ -100,13 +100,13 @@ AppDialog {
         }
         Label {
             objectName: "songVolumeOutput"
-            text: "Main " + Math.round(music.volume) + "% · Output " + Math.round(Math.min(100, music.volume * level.value / 100)) + "%"
+            text: "Main " + Math.round(music.volume) + "% · Output " + Math.round(Math.min(300, music.volume * level.value / 100)) + "%"
             color: Theme.text
             wrapMode: Text.WordWrap
             Layout.fillWidth: true
         }
         Label {
-            text: "Saved for this song. 100% is unchanged. Output caps at 100%; your song and main volume settings are preserved."
+            text: "Saved for this song. 100% is unchanged. Scales from your main volume slider up to 300%; boost can distort peaks."
             color: Theme.muted
             font.pixelSize: 12
             wrapMode: Text.WordWrap

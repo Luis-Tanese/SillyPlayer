@@ -18,7 +18,9 @@ QString YouTubePlaylist::canonicalUrl(const QString &input) {
   if(!QRegularExpression("^[A-Za-z0-9_-]{2,200}$").match(list).hasMatch()) return {};
   QString video=url.host().toLower()=="youtu.be" ? url.path().section('/',1,1) : query.queryItemValue("v");
   const bool seed=QRegularExpression("^[A-Za-z0-9_-]{11}$").match(video).hasMatch();
-  if(!QStringList{"/watch","/playlist"}.contains(url.path()) && url.host().toLower()!="youtu.be") return {};
+  QString path=url.path();
+  while(path.size()>1 && path.endsWith('/')) path.chop(1);
+  if(!QStringList{"/watch","/playlist"}.contains(path) && url.host().toLower()!="youtu.be") return {};
   QUrl canonical(seed && list.startsWith("RD")?"https://www.youtube.com/watch":"https://www.youtube.com/playlist");
   QUrlQuery out; if(seed && list.startsWith("RD")) out.addQueryItem("v",video); out.addQueryItem("list",list); canonical.setQuery(out);
   return canonical.toString(QUrl::FullyEncoded);

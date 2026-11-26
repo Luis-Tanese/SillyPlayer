@@ -792,6 +792,7 @@ class SyncClient(private val g: Graph) {
             require(failures.get() == 0) {
                 "${failures.get()} media transfers need retry. ${failureSamples.joinToString("; ")}"
             }
+            syncEqPresets(peer, http)
             exchange(peer, http, "POST", "/ack", buildJsonObject { put("cursor", cursor) })
             g.dao.putPeer(
                 (g.dao.peers().firstOrNull { it.id == peer.id } ?: peer).copy(cursor = cursor)
@@ -1034,7 +1035,71 @@ class SyncClient(private val g: Graph) {
                     for (m in g.dao.members(remote)) g.dao.putMember(m.copy(collection = canonical))
                     g.dao.deleteCollection(remote)
                 }
+                // keep pinned playlists pointing at the remapped collection id so sync doesnt unpin them
+                g.prefs.update { prefs ->
+                    if (remote in prefs.pinnedPlaylists) {
+                        prefs.copy(
+                            pinnedPlaylists = prefs.pinnedPlaylists.map { if (it == remote) canonical else it }.distinct()
+                        )
+                    } else prefs
+                }
             }
+        }
+    }
+
+    private suspend fun syncEqPresets(peer: Peer, http: OkHttpClient) {
+        val snap = g.prefs.state.value
+        val localState =
+            EqStateSync(
+                enabled = snap.eqEnabled,
+                preset = snap.eqPreset,
+                gains = normalizeEqGains(snap.eq),
+                updatedAt = snap.eqStateUpdatedAt,
+            )
+        val response =
+            try {
+                exchange(
+                    peer,
+                    http,
+                    "POST",
+                    "/presets",
+                    buildJsonObject {
+                        put("eqPresets", JsonCodec.encodeToJsonElement(snap.eqPresets))
+                        put("eqState", JsonCodec.encodeToJsonElement(localState))
+                    },
+                )
+            } catch (error: SyncHttpException) {
+                if (error.status == 404 || error.status == 405) return
+                throw error
+            }
+        val remote =
+            runCatching {
+                    val arr = response["eqPresets"]?.jsonArray ?: return@runCatching emptyList<EqPreset>()
+                    JsonCodec.decodeFromJsonElement<List<EqPreset>>(arr)
+                }
+                .getOrDefault(emptyList())
+        val remoteState =
+            response["eqState"]?.let { elem ->
+                runCatching { JsonCodec.decodeFromJsonElement<EqStateSync>(elem) }.getOrNull()
+            }
+        g.prefs.update { prefs ->
+            val merged = mergeEqPresets(prefs.eqPresets, remote)
+            val currentState =
+                EqStateSync(
+                    enabled = prefs.eqEnabled,
+                    preset = prefs.eqPreset,
+                    gains = normalizeEqGains(prefs.eq),
+                    updatedAt = prefs.eqStateUpdatedAt,
+                )
+            val mergedState = mergeEqState(currentState, remoteState, merged)
+            if (merged == prefs.eqPresets && mergedState == currentState) prefs
+            else prefs.copy(
+                eqPresets = merged,
+                eqEnabled = mergedState.enabled,
+                eqPreset = mergedState.preset,
+                eq = mergedState.gains,
+                eqStateUpdatedAt = mergedState.updatedAt,
+            )
         }
     }
 

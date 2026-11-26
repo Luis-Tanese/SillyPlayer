@@ -1,6 +1,6 @@
 package dev.sillyplayer.data
 
-import java.net.URLDecoder
+import java.io.ByteArrayOutputStream
 import java.util.Locale
 
 data class FolderCrumb(val name: String, val path: String)
@@ -23,8 +23,27 @@ data class FolderViewData(
     val allTracks: List<Track> = emptyList(),
 )
 
-private fun decodeSegment(raw: String): String =
-    runCatching { URLDecoder.decode(raw, "UTF-8") }.getOrDefault(raw)
+// percent-decode without turning literal + into spaces like URLDecoder does
+private fun decodeSegment(raw: String): String {
+    if ('%' !in raw) return raw
+    val out = ByteArrayOutputStream(raw.length)
+    var i = 0
+    while (i < raw.length) {
+        val c = raw[i]
+        if (c == '%' && i + 2 < raw.length) {
+            val hi = raw[i + 1].digitToIntOrNull(16)
+            val lo = raw[i + 2].digitToIntOrNull(16)
+            if (hi != null && lo != null) {
+                out.write((hi shl 4) or lo)
+                i += 3
+                continue
+            }
+        }
+        out.write(c.toString().toByteArray(Charsets.UTF_8))
+        i++
+    }
+    return out.toString(Charsets.UTF_8.name())
+}
 
 // derives logical root and subfolder segments from SAF content uris or local file paths
 internal fun extractTrackFolderSegments(

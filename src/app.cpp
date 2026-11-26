@@ -35,13 +35,16 @@ static QString uuid() {
 }
 App::App(Store *store, const QString &cacheDir, QObject *parent)
     : QObject(parent), library(store, cacheDir + "/art", this),
-      music(false, this), youtube(false, this), online(store, this), listening(store,&music,this), sleepTimer(this), backup(store,&library,this), libraryTools(store,&library,&music,this), sync(store,this), discord(this), s(store),
+      music(false, this), youtube(false, this), online(store, this), listening(store,&music,this), sleepTimer(this), backup(store,&library,this), recovery(store,this), libraryTools(store,&library,&music,this), sync(store,this), discord(store,this), s(store),
       cache(cacheDir) {
   // restore and sync can reuse prepared SQL statements outside Store::exec
   // their structural notifications must also invalidate cached snapshots otherwise it gets messed up
   connect(this,&App::collectionsChanged,this,[this]{collectionSerial=quint64(-1);});
   sync.setMaintenanceGuard([this] { return library.inMaintenance(); });
+  recovery.setFolderProvider([this] { return settings().value("musicDir").toString(); });
+  recovery.setBusyGuard([this] { return library.scanning() || library.trashing() || library.inMaintenance() || sync.busy() || backup.busy(); });
   connect(&library,&Library::changed,&sync,&SyncManager::markDirty);
+  connect(&library,&Library::changed,&recovery,&DesktopRecovery::requestSave);
   connect(&library,&Library::tracksUpdated,this,[this](const QVariantMap &patches){
     const auto id=index>=0&&index<entries.size()?entries[index].toMap().value("trackId").toString():QString();
     if(patches.contains(id)){
@@ -51,10 +54,31 @@ App::App(Store *store, const QString &cacheDir, QObject *parent)
       else emit currentChanged();
     }
     sync.markDirty();
+    recovery.requestSave();
   });
   connect(this,&App::currentChanged,this,&App::currentLikeChanged);
   connect(this,&App::collectionsChanged,&sync,&SyncManager::markDirty);
+  connect(this,&App::collectionsChanged,&recovery,&DesktopRecovery::requestSave);
   connect(&sync,&SyncManager::aboutToApply,&listening,&Listening::flush);
+  connect(&sync,&SyncManager::presetsChanged,this,[this]{
+    // push synced eq state right into mpv instead of waiting for the user to reopen the eq popup
+    settingsSerial=quint64(-1);
+    const auto opts=settings();
+    music.setEq(opts["eqEnabled"].toBool(),opts["eqGains"].toList());
+    emit settingsChanged();
+    recovery.requestSave();
+  });
+  connect(&recovery,&DesktopRecovery::recovered,this,[this]{
+    currentSerial=collectionSerial=queueSerial=settingsSerial=quint64(-1);
+    listening.reload();
+    const auto opts=settings();
+    music.setEq(opts["eqEnabled"].toBool(),opts["eqGains"].toList());
+    music.setPauseFade(opts["pauseFadeEnabled"].toBool(),opts["pauseFadeMs"].toInt());
+    music.setCrossfadeMs(opts["crossfadeMs"].toInt());
+    emit library.changed();
+    emit collectionsChanged();
+    emit settingsChanged();
+  });
   connect(&sync,&SyncManager::fileReceived,&library,&Library::importFile);
   connect(&sync,&SyncManager::error,this,&App::error);
   connect(&sync,&SyncManager::applied,this,[this]{
@@ -151,7 +175,12 @@ App::App(Store *store, const QString &cacheDir, QObject *parent)
   music.setPauseFade(opts["pauseFadeEnabled"].toBool(), opts["pauseFadeMs"].toInt());
   music.setCrossfadeMs(opts["crossfadeMs"].toInt());
   youtube.setPauseFade(opts["pauseFadeEnabled"].toBool(), opts["pauseFadeMs"].toInt());
+  discord.setLookupCovers(opts["discordRpcLookupCovers"].toBool());
+  discord.setUploadCovers(opts["discordRpcUploadCovers"].toBool());
   discord.setEnabled(opts["discordRpcEnabled"].toBool());
+  // save resolved discord cover urls into the folder mirror too
+  connect(&discord, &DiscordRpc::coverResolved, &recovery, &DesktopRecovery::requestSave);
+  recovery.inspectFolder(opts["musicDir"].toString());
   connect(this, &App::currentChanged, this, [this] { syncDiscordPresence(true); });
   connect(&music, &Player::changed, this, [this] { syncDiscordPresence(false); });
   syncDiscordPresence(true);
@@ -187,6 +216,10 @@ QVariantMap App::settings() const {
       {"eqEnabled", false},
       {"eqGains", QVariantList{0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
       {"eqPreset", "Flat"},
+      {"eqCustomPresets", QVariantList{}},
+      {"eqStateUpdatedAt", 0},
+      {"developerMode", false},
+      {"allowPlaylistDuplicates", false},
       {"pinnedPlaylists", QStringList{}},
       {"pinnedArtists", QStringList{}},
       {"windowWidth", 1160},
@@ -196,6 +229,8 @@ QVariantMap App::settings() const {
       {"windowMaximized", false},
       {"lastPage", "Music"},
       {"discordRpcEnabled", true},
+      {"discordRpcLookupCovers", true},
+      {"discordRpcUploadCovers", false},
       {"updateNotifications", true},
       {"lastNotifiedUpdate", ""},
       {"musicDir",
@@ -203,6 +238,16 @@ QVariantMap App::settings() const {
            "/SillyPlayer"}};
   for (auto it = defaults.begin(); it != defaults.end(); ++it)
     it.value() = s->setting(it.key(), it.value());
+  QVariantList activePresets;
+  for (const auto &v : defaults.value("eqCustomPresets").toList()) {
+    const auto p = v.toMap();
+    if (!p.value("deleted").toBool() && !p.value("name").toString().trimmed().isEmpty())
+      activePresets << p;
+  }
+  std::sort(activePresets.begin(), activePresets.end(), [](const QVariant &a, const QVariant &b) {
+    return a.toMap().value("name").toString().compare(b.toMap().value("name").toString(), Qt::CaseInsensitive) < 0;
+  });
+  defaults["eqCustomPresets"] = activePresets;
   const auto track = current();
   defaults["speed"] = track.value("speed", 1.0);
   defaults["nightcore"] = track.value("nightcore", false);
@@ -238,6 +283,19 @@ void App::setSetting(const QString &key, const QVariant &value) {
   if (key == "discordRpcEnabled") {
     discord.setEnabled(value.toBool());
     syncDiscordPresence(true);
+  }
+  if (key == "discordRpcLookupCovers") {
+    discord.setLookupCovers(value.toBool());
+  }
+  if (key == "discordRpcUploadCovers") {
+    discord.setUploadCovers(value.toBool());
+  }
+  if (key == "musicDir") {
+    // if the library is still empty and this folder already has a saved mirror, pull it back automatically
+    recovery.recoverFromFolder(value.toString());
+  }
+  if (!QStringList{"windowWidth", "windowHeight", "windowX", "windowY", "windowMaximized", "lastPage", "lastNotifiedUpdate"}.contains(key)) {
+    recovery.requestSave();
   }
   emit settingsChanged();
 }
@@ -580,8 +638,11 @@ QVariantMap App::queueTracks(const QStringList &tracks, bool next) {
 QVariantMap App::addTracksToCollection(const QString &collection, const QStringList &tracks, const QString &policy) {
   const bool liked=collection=="liked";
   const auto target=s->rows("SELECT kind FROM collections WHERE id=?",{collection});
-  if ((!liked && (target.isEmpty() || !QStringList{"playlist","custom"}.contains(target.first().toMap()["kind"].toString()))) || !QStringList{"ask","skip","duplicates"}.contains(policy))
+  if ((!liked && (target.isEmpty() || !QStringList{"playlist","custom"}.contains(target.first().toMap()["kind"].toString()))) || !QStringList{"ask","skip","duplicates","auto"}.contains(policy))
     return {{"status","error"},{"message","This collection cannot be edited"}};
+  const QString effectivePolicy = (policy == "auto")
+    ? (s->setting("allowPlaylistDuplicates", false).toBool() ? QStringLiteral("duplicates") : QStringLiteral("skip"))
+    : policy;
   QStringList valid;
   QSet<QString> seen, videos;
   int duplicates=0, skipped=0;
@@ -593,11 +654,11 @@ QVariantMap App::addTracksToCollection(const QString &collection, const QStringL
     seen.insert(id); if (!video.isEmpty()) videos.insert(video);
     if (duplicate) {
       ++duplicates;
-      if (liked || policy!="duplicates") {++skipped; continue;}
+      if (liked || effectivePolicy!="duplicates") {++skipped; continue;}
     }
     valid << id;
   }
-  if (!liked && policy=="ask" && duplicates)
+  if (!liked && effectivePolicy=="ask" && duplicates)
     return {{"status","duplicate"},{"duplicates",duplicates}};
   if (!s->db().transaction()) return {{"status","error"},{"message","Could not begin playlist update"}};
   const auto max=s->rows("SELECT COALESCE(MAX(position),-1) AS position FROM members WHERE collection=?",{collection});
@@ -610,6 +671,51 @@ QVariantMap App::addTracksToCollection(const QString &collection, const QStringL
   if (!ok || !s->db().commit()) {s->db().rollback(); return {{"status","error"},{"message","Could not save playlist changes"}};}
   if (!valid.isEmpty()) {if (liked) {QVariantMap patches;for(const auto &id:valid)patches[id]=QVariantMap{{"liked",true}};library.patchTracks(patches);} else emit collectionsChanged();}
   return {{"status","done"},{"added",valid.size()},{"skipped",skipped}};
+}
+int App::countPlaylistDuplicates(const QString &collection) const {
+  // skip soft-deleted tracks so invisible rows dont mess up the duplicate count
+  const auto rows = s->rows("SELECT m.track FROM members m JOIN tracks t ON t.id=m.track WHERE m.collection=? AND t.deleted=0 ORDER BY m.position,m.rowid", {collection});
+  QSet<QString> seen;
+  int duplicates = 0;
+  for (const auto &v : rows) {
+    const QString track = v.toMap().value("track").toString();
+    if (!seen.contains(track)) seen.insert(track);
+    else ++duplicates;
+  }
+  return duplicates;
+}
+QVariantMap App::removePlaylistDuplicates(const QString &collection) {
+  const auto target = s->rows("SELECT kind FROM collections WHERE id=?", {collection});
+  if (target.isEmpty() || !QStringList{"playlist", "custom"}.contains(target.first().toMap()["kind"].toString()))
+    return {{"status", "error"}, {"message", "This collection cannot be edited"}};
+  // only dedupe live non-deleted tracks so deleted rows dont steal the first slot
+  const auto rows = s->rows("SELECT m.id,m.track FROM members m JOIN tracks t ON t.id=m.track WHERE m.collection=? AND t.deleted=0 ORDER BY m.position,m.rowid", {collection});
+  QSet<QString> seen;
+  QStringList keepIds, duplicateIds;
+  for (const auto &v : rows) {
+    const auto row = v.toMap();
+    const QString id = row["id"].toString();
+    const QString track = row["track"].toString();
+    if (!seen.contains(track)) {
+      seen.insert(track);
+      keepIds << id;
+    } else {
+      duplicateIds << id;
+    }
+  }
+  if (duplicateIds.isEmpty()) return {{"status", "done"}, {"removed", 0}};
+  if (!s->db().transaction()) return {{"status", "error"}, {"message", "Could not begin playlist cleanup"}};
+  bool ok = true;
+  for (const auto &id : duplicateIds)
+    ok = s->exec("DELETE FROM members WHERE id=? AND collection=?", {id, collection}) && ok;
+  for (int i = 0; i < keepIds.size(); ++i)
+    ok = s->exec("UPDATE members SET position=? WHERE id=? AND collection=?", {i, keepIds[i], collection}) && ok;
+  if (!ok || !s->db().commit()) {
+    s->db().rollback();
+    return {{"status", "error"}, {"message", "Could not remove duplicate songs"}};
+  }
+  emit collectionsChanged();
+  return {{"status", "done"}, {"removed", duplicateIds.size()}};
 }
 QVariantMap App::removeMembers(const QString &collection, const QStringList &members) {
   const auto target=s->rows("SELECT kind FROM collections WHERE id=?",{collection});
@@ -974,7 +1080,8 @@ void App::coverCollection(const QString &id) {
 bool App::collectionContains(const QString &collection, const QString &track) const {
   if (collection == "liked") return library.track(track).value("liked").toBool();
   const auto item = library.track(track);
-  return !s->rows("SELECT m.id FROM members m JOIN tracks t ON t.id=m.track WHERE m.collection=? AND (m.track=? OR (?<>'' AND t.videoId=?)) LIMIT 1",
+  // ignore deleted tracks here so old removed entries dont trigger false already-added labels
+  return !s->rows("SELECT m.id FROM members m JOIN tracks t ON t.id=m.track WHERE m.collection=? AND t.deleted=0 AND (m.track=? OR (?<>'' AND t.videoId=?)) LIMIT 1",
     {collection, track, item.value("videoId", ""), item.value("videoId", "")}).isEmpty();
 }
 QString App::addToCollection(const QString &collection, const QString &track, bool allowDuplicate) {
@@ -1156,6 +1263,123 @@ QVariantMap App::clearMusicFolder(const QString &folderPath) {
           {"trashed", trashedPaths.size()},
           {"failed", failedFiles.size()},
           {"message", msg}};
+}
+QVariantMap App::reinstateFolder(const QString &folderPath) {
+  if (library.scanning() || library.trashing() || library.inMaintenance() ||
+      sync.busy() || backup.busy()) {
+    const QString msg = "Wait for current library, sync, or backup work to finish first";
+    emit error(msg);
+    return {{"ok", false}, {"message", msg}};
+  }
+  const QString target =
+      folderPath.trimmed().isEmpty() ? settings().value("musicDir").toString() : folderPath.trimmed();
+  auto res = library.reinstateFolder(target);
+  if (res.value("ok").toBool()) {
+    // persist reinstated songs, restored links, and covers into the portable folder db right away
+    const auto saved = recovery.saveNow(false);
+    if (saved.value("ok").toBool()) {
+      res["dbSaved"] = true;
+      res["message"] = res.value("message").toString() + QStringLiteral(" · Database saved");
+    }
+    syncDiscordPresence(true);
+  }
+  return res;
+}
+QVariantMap App::repairDownloadedSongs() {
+  if (library.scanning() || library.trashing() || library.inMaintenance() ||
+      sync.busy() || backup.busy()) {
+    const QString msg = "Wait for current library, sync, or backup work to finish first";
+    emit error(msg);
+    return {{"ok", false}, {"message", msg}};
+  }
+  return online.repairDownloadedSongs();
+}
+QVariantMap App::resetDesktopLibrary(bool removeCachedMedia) {
+  if (!settings().value("developerMode").toBool()) {
+    const QString msg = "Enable Developer mode first";
+    emit error(msg);
+    return {{"ok", false}, {"message", msg}};
+  }
+  if (library.scanning() || library.trashing() || library.inMaintenance() ||
+      sync.busy() || backup.busy()) {
+    const QString msg = "Finish or cancel scanning, sync, and backup before resetting";
+    emit error(msg);
+    return {{"ok", false}, {"message", msg}};
+  }
+  music.stop();
+  youtube.stop();
+  sleepTimer.cancel();
+  online.resetJobs();
+  entries.clear();
+  normalQueueOrder.clear();
+  index = -1;
+  m_context = "Songs";
+  m_source = {{"kind", "songs"}, {"id", ""}, {"name", "Songs"}};
+
+  if (!s->db().transaction()) {
+    const QString msg = "Could not start library reset";
+    emit error(msg);
+    return {{"ok", false}, {"message", msg}};
+  }
+  // flip applying=1 so resetting locally never emits deletion tombstones to paired phones
+  bool ok = s->exec("UPDATE sync_control SET applying=1 WHERE id=1");
+  const QStringList statements = {
+      "DELETE FROM playlist_download_items",
+      "DELETE FROM jobs",
+      "DELETE FROM members",
+      "DELETE FROM likes",
+      "DELETE FROM collections",
+      "DELETE FROM track_roots",
+      "DELETE FROM track_hashes",
+      "DELETE FROM listening_plays",
+      "DELETE FROM track_listens",
+      "DELETE FROM sync_counters",
+      "DELETE FROM rpc_covers",
+      "DELETE FROM tracks",
+      "DELETE FROM roots",
+      "DELETE FROM restore_ids",
+      "DELETE FROM searches",
+      "DELETE FROM sync_dirty",
+      "DELETE FROM sync_entities",
+      "DELETE FROM sync_changes",
+      "DELETE FROM sync_operations",
+      "DELETE FROM sync_conflicts",
+      "DELETE FROM sync_aliases",
+      "DELETE FROM sync_blobs",
+      "DELETE FROM sync_media_pending",
+      "UPDATE sync_peers SET ack=0",
+      "UPDATE listening_totals SET milliseconds=0,started=CAST(strftime('%s','now') AS INTEGER)*1000 WHERE id=1",
+      "DELETE FROM settings WHERE key IN ('queue','queueOrder','queueIndex','queueContext','queueSource','position','listeningSession','pinnedPlaylists','pinnedArtists')",
+  };
+  for (const auto &sql : statements) {
+    if (ok) ok = s->exec(sql);
+  }
+  if (ok) ok = s->exec("UPDATE sync_control SET applying=0 WHERE id=1");
+  if (!ok || !s->db().commit()) {
+    s->db().rollback();
+    s->exec("UPDATE sync_control SET applying=0 WHERE id=1");
+    const QString msg = "Could not reset desktop library: " + s->error();
+    emit error(msg);
+    return {{"ok", false}, {"message", msg}};
+  }
+  if (removeCachedMedia) {
+    for (const auto &sub : {"art", "covers", "youtube-art", "sync"}) {
+      QDir(cache + "/" + sub).removeRecursively();
+    }
+  }
+  currentSerial = collectionSerial = queueSerial = settingsSerial = quint64(-1);
+  savedPlayback.clear();
+  listening.resetState();
+  sync.resetLocalState();
+  emit library.changed();
+  emit library.likesChanged();
+  emit collectionsChanged();
+  emit currentChanged();
+  emit queueChanged();
+  emit recentChanged();
+  emit settingsChanged();
+  return {{"ok", true},
+          {"message", "Desktop library reset. Original audio files and paired phones were kept."}};
 }
 void App::removeLibraryTrack(const QString &id) {
   removeLibraryTracks({id});
@@ -1353,10 +1577,82 @@ void App::openTrash() {
 }
 void App::applyEq(bool enabled, const QVariantList &gains, const QString &preset) {
   music.setEq(enabled, gains);
+  const qint64 now = QDateTime::currentMSecsSinceEpoch();
+  const qint64 stamp = qMax(now, s->setting("eqStateUpdatedAt", 0).toLongLong() + 1);
   s->setSetting("eqEnabled", enabled);
   s->setSetting("eqGains", gains);
   if (!preset.isEmpty()) s->setSetting("eqPreset", preset);
+  s->setSetting("eqStateUpdatedAt", stamp);
+  recovery.requestSave();
   emit settingsChanged();
+}
+QVariantMap App::saveEqPreset(const QString &name, const QVariantList &gains) {
+  const QString trimmed = name.trimmed();
+  if (trimmed.isEmpty()) return {{"ok", false}, {"error", "Enter a preset name"}};
+  for (const auto &builtin : {"Flat", "Bass Boost", "Rock", "Pop", "Classical", "Custom"}) {
+    if (trimmed.compare(QLatin1String(builtin), Qt::CaseInsensitive) == 0)
+      return {{"ok", false}, {"error", "Choose a name different from built-in presets"}};
+  }
+  QVariantList normalized;
+  normalized.reserve(10);
+  for (int i = 0; i < 10; ++i) {
+    const double g = i < gains.size() ? gains[i].toDouble() : 0.0;
+    normalized << (std::isfinite(g) ? std::clamp(g, -12.0, 12.0) : 0.0);
+  }
+  const qint64 now = QDateTime::currentMSecsSinceEpoch();
+  QVariantList list = s->setting("eqCustomPresets", QVariantList{}).toList();
+  QString existingId;
+  qint64 prevMaxAt = 0;
+  for (const auto &v : list) {
+    const auto p = v.toMap();
+    if (p.value("name").toString().compare(trimmed, Qt::CaseInsensitive) == 0) {
+      prevMaxAt = qMax(prevMaxAt, p.value("updatedAt").toLongLong());
+      if (!p.value("deleted").toBool() && existingId.isEmpty())
+        existingId = p.value("id").toString();
+    }
+  }
+  // bump past previous timestamp so clock skew with a paired phone cant silently swallow local saves
+  const qint64 stamp = qMax(now, prevMaxAt + 1);
+  const QString id = existingId.isEmpty() ? uuid() : existingId;
+  QVariantMap entry{{"id", id}, {"name", trimmed}, {"gains", normalized}, {"updatedAt", stamp}, {"deleted", false}};
+  const auto merged = SyncManager::mergeEqPresets(list, QVariantList{entry});
+  s->setSetting("eqCustomPresets", merged);
+  const bool enabled = s->setting("eqEnabled", false).toBool();
+  music.setEq(enabled, normalized);
+  s->setSetting("eqGains", normalized);
+  s->setSetting("eqPreset", trimmed);
+  s->setSetting("eqStateUpdatedAt", qMax(stamp, s->setting("eqStateUpdatedAt", 0).toLongLong() + 1));
+  recovery.requestSave();
+  emit settingsChanged();
+  return {{"ok", true}, {"preset", entry}};
+}
+QVariantMap App::deleteEqPreset(const QString &id) {
+  const qint64 now = QDateTime::currentMSecsSinceEpoch();
+  QVariantList list = s->setting("eqCustomPresets", QVariantList{}).toList();
+  QString deletedName;
+  QString targetId;
+  qint64 prevMaxAt = 0;
+  for (const auto &v : list) {
+    const auto p = v.toMap();
+    if (!p.value("deleted").toBool() && (p.value("id").toString() == id || p.value("name").toString().compare(id, Qt::CaseInsensitive) == 0)) {
+      targetId = p.value("id").toString();
+      deletedName = p.value("name").toString();
+      prevMaxAt = qMax(prevMaxAt, p.value("updatedAt").toLongLong());
+      break;
+    }
+  }
+  if (targetId.isEmpty()) return {{"ok", false}, {"error", "Preset not found"}};
+  // keep timestamp strictly newer than the preset so local deletes always stick even with clock drift
+  const qint64 stamp = qMax(now, prevMaxAt + 1);
+  QVariantMap tombstone{{"id", targetId}, {"name", deletedName}, {"gains", QVariantList{}}, {"updatedAt", stamp}, {"deleted", true}};
+  s->setSetting("eqCustomPresets", SyncManager::mergeEqPresets(list, QVariantList{tombstone}));
+  if (s->setting("eqPreset").toString().compare(deletedName, Qt::CaseInsensitive) == 0) {
+    s->setSetting("eqPreset", "Custom");
+    s->setSetting("eqStateUpdatedAt", qMax(stamp, s->setting("eqStateUpdatedAt", 0).toLongLong() + 1));
+  }
+  recovery.requestSave();
+  emit settingsChanged();
+  return {{"ok", true}};
 }
 QString App::time(double value) const {
   if (value < 0 || !std::isfinite(value))
@@ -1389,6 +1685,7 @@ void App::shutdown() {
   sleepTimer.cancel();
   libraryTools.shutdown();
   backup.shutdown();
+  recovery.shutdown();
   library.finishTrash();
   listening.shutdown();
   save();

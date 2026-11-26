@@ -29,6 +29,7 @@
 #include <QThread>
 #include <QThreadPool>
 #include <QtConcurrent>
+#include <algorithm>
 #include <climits>
 #include <cmath>
 #include <cstring>
@@ -1739,6 +1740,47 @@ void SyncManager::route(QSslSocket *socket, const QString &method,
     if (result["status"] == "resolved") emit applied();
     emit changed(); reply(socket, 200, result); return;
   }
+  if (path == "/sync/v1/presets") {
+    auto currentEqState = [&]() -> QVariantMap {
+      return {
+          {"enabled", s->setting("eqEnabled", false).toBool()},
+          {"preset", s->setting("eqPreset", "Flat").toString()},
+          {"gains", s->setting("eqGains", QVariantList{0, 0, 0, 0, 0, 0, 0, 0, 0, 0}).toList()},
+          {"updatedAt", s->setting("eqStateUpdatedAt", 0).toLongLong()},
+      };
+    };
+    if (method == "GET") {
+      reply(socket, 200, {
+          {"eqPresets", s->setting("eqCustomPresets", QVariantList{}).toList()},
+          {"eqState", currentEqState()},
+      });
+      return;
+    }
+    if (method == "POST") {
+      const auto req = decode(body).toMap();
+      const auto incoming = req.value("eqPresets").toList();
+      const auto local = s->setting("eqCustomPresets", QVariantList{}).toList();
+      const auto merged = mergeEqPresets(local, incoming);
+      const auto localState = currentEqState();
+      const auto incomingState = req.value("eqState").toMap();
+      const auto mergedState = mergeEqState(localState, incomingState, merged);
+      bool changedAny = false;
+      if (merged != local) {
+        s->setSetting("eqCustomPresets", merged);
+        changedAny = true;
+      }
+      if (mergedState != localState) {
+        s->setSetting("eqEnabled", mergedState.value("enabled").toBool());
+        s->setSetting("eqPreset", mergedState.value("preset").toString());
+        s->setSetting("eqGains", mergedState.value("gains").toList());
+        s->setSetting("eqStateUpdatedAt", mergedState.value("updatedAt").toLongLong());
+        changedAny = true;
+      }
+      if (changedAny) emit presetsChanged();
+      reply(socket, 200, {{"eqPresets", merged}, {"eqState", mergedState}});
+      return;
+    }
+  }
   if (path == "/sync/v1/blobs/check" && method == "POST") {
     const auto r = decode(body).toMap();
     const auto hashes = r["hashes"].toList();
@@ -1988,6 +2030,119 @@ void SyncManager::finishUpload(QSslSocket *socket, const QString &hash,
       return QVariantMap{{"error", QString::fromUtf8(e.what())}};
     }
   }));
+}
+QVariantList SyncManager::mergeEqPresets(const QVariantList &local, const QVariantList &remote) {
+  QMap<QString, QVariantMap> byId;
+  QStringList idOrder;
+  auto ingest = [&](const QVariantList &source) {
+    for (const auto &v : source) {
+      const auto raw = v.toMap();
+      const QString id = raw.value("id").toString().trimmed();
+      if (id.isEmpty()) continue;
+      const QString name = raw.value("name").toString().trimmed();
+      const bool deleted = raw.value("deleted").toBool();
+      if (!deleted && name.isEmpty()) continue;
+      const qint64 updatedAt = raw.value("updatedAt").toLongLong();
+      const auto rawGains = raw.value("gains").toList();
+      QVariantList gains;
+      gains.reserve(10);
+      for (int i = 0; i < 10; ++i) {
+        const double g = i < rawGains.size() ? rawGains[i].toDouble() : 0.0;
+        gains << (std::isfinite(g) ? std::clamp(g, -12.0, 12.0) : 0.0);
+      }
+      QVariantMap item{{"id", id}, {"name", name}, {"gains", gains}, {"updatedAt", updatedAt}, {"deleted", deleted}};
+      if (!byId.contains(id)) idOrder << id;
+      const auto prev = byId.value(id);
+      const qint64 prevAt = prev.value("updatedAt").toLongLong();
+      if (!byId.contains(id) || updatedAt > prevAt || (updatedAt == prevAt && prev.value("deleted").toBool() && !deleted)) {
+        byId.insert(id, item);
+      }
+    }
+  };
+  ingest(local);
+  ingest(remote);
+  QMap<QString, QVariantMap> activeByName;
+  QVariantList tombstones;
+  for (const auto &id : idOrder) {
+    const auto item = byId.value(id);
+    if (item.value("deleted").toBool()) {
+      tombstones << item;
+      continue;
+    }
+    const QString key = item.value("name").toString().toLower();
+    if (!activeByName.contains(key) || item.value("updatedAt").toLongLong() > activeByName.value(key).value("updatedAt").toLongLong()) {
+      activeByName.insert(key, item);
+    }
+  }
+  QVariantList active;
+  active.reserve(activeByName.size());
+  for (auto it = activeByName.cbegin(); it != activeByName.cend(); ++it) active << it.value();
+  std::sort(active.begin(), active.end(), [](const QVariant &a, const QVariant &b) {
+    return a.toMap().value("name").toString().compare(b.toMap().value("name").toString(), Qt::CaseInsensitive) < 0;
+  });
+  QVariantList merged = tombstones;
+  merged.append(active);
+  return merged;
+}
+QVariantMap SyncManager::mergeEqState(const QVariantMap &local, const QVariantMap &remote,
+                                      const QVariantList &mergedPresets) {
+  auto normalize = [](const QVariantMap &raw) -> QVariantMap {
+    const auto rawGains = raw.value("gains").toList();
+    QVariantList gains;
+    gains.reserve(10);
+    for (int i = 0; i < 10; ++i) {
+      const double g = i < rawGains.size() ? rawGains[i].toDouble() : 0.0;
+      gains << (std::isfinite(g) ? std::clamp(g, -12.0, 12.0) : 0.0);
+    }
+    const QString preset = raw.value("preset").toString().trimmed();
+    return {
+        {"enabled", raw.value("enabled").toBool()},
+        {"preset", preset.isEmpty() ? QStringLiteral("Flat") : preset},
+        {"gains", gains},
+        {"updatedAt", qMax<qint64>(0, raw.value("updatedAt").toLongLong())},
+    };
+  };
+  const auto l = normalize(local);
+  QVariantMap win = l;
+  if (!remote.isEmpty()) {
+    const auto r = normalize(remote);
+    if (r.value("updatedAt").toLongLong() > l.value("updatedAt").toLongLong()) win = r;
+  }
+  // if the selected custom preset got updated or deleted remotely keep the live eq config in sync with it
+  const QString activeName = win.value("preset").toString();
+  static const QStringList builtins{"Flat", "Bass Boost", "Rock", "Pop", "Classical", "Custom"};
+  bool isBuiltin = false;
+  for (const auto &b : builtins) {
+    if (activeName.compare(b, Qt::CaseInsensitive) == 0) {
+      isBuiltin = true;
+      break;
+    }
+  }
+  if (!isBuiltin) {
+    bool foundActive = false;
+    qint64 deletedAt = -1;
+    for (const auto &v : mergedPresets) {
+      const auto p = v.toMap();
+      if (p.value("name").toString().compare(activeName, Qt::CaseInsensitive) != 0) continue;
+      if (!p.value("deleted").toBool()) {
+        foundActive = true;
+        if (p.value("updatedAt").toLongLong() > win.value("updatedAt").toLongLong()) {
+          win["gains"] = p.value("gains").toList();
+          win["preset"] = p.value("name").toString();
+        }
+        break;
+      } else {
+        deletedAt = qMax(deletedAt, p.value("updatedAt").toLongLong());
+      }
+    }
+    if (!foundActive && deletedAt >= 0) win["preset"] = QStringLiteral("Custom");
+  }
+  return win;
+}
+void SyncManager::resetLocalState() {
+  resolutionResult.clear();
+  emit resolutionProgressChanged();
+  emit changed();
 }
 QByteArray SyncManager::discoveryReplyPayload(const QString &deviceId, const QString &name,
                                               quint16 port, const QString &fp) {

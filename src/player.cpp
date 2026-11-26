@@ -14,7 +14,8 @@ Player::Player(bool video, QObject *parent) : QObject(parent) {
         qMakePair("input-default-bindings", "no"),
         qMakePair("input-vo-keyboard", "no"), qMakePair("ytdl", "no"),
         qMakePair("idle", "yes"), qMakePair("keep-open", "no"),
-        qMakePair("audio-display", "no"), qMakePair("replaygain", "no")})
+        qMakePair("audio-display", "no"), qMakePair("replaygain", "no"),
+        qMakePair("volume-max", "300")})
     mpv_set_option_string(m, pair.first, pair.second);
   mpv_set_option_string(m, "vo", video ? "libmpv" : "null");
   mpv_set_option_string(m, "vid", video ? "auto" : "no");
@@ -141,9 +142,11 @@ void Player::load(const QString &path, const QString &audio,
   pause = true;
   emit changed();
   command({"set", "pause", "yes"});
-  // a new file must never overtake the debounced slider preview. Submit the desired effect now so FILE_LOADED stays paused until it is acknowledged
+  // a new file must never overtake debounced speed or volume writes; flush both before loadfile so the first frames match the new track
   speedTimer.stop();
   flushSpeed();
+  volumeTimer.stop();
+  flushVolume();
   QList<QByteArray> h;
   for (auto i = headers.begin(); i != headers.end(); ++i)
     h << (i.key() + ": " + i.value().toString()).toUtf8();
@@ -312,7 +315,8 @@ void Player::setVolume(double volume) {
   emit effectiveVolumeChanged();
 }
 double Player::effectiveVolume() const {
-  return std::clamp(vol * songVolume / 100.0,0.0,100.0);
+  // let per-song volume boost past 100 using the 0-100 main slider as the baseline like mobile does
+  return std::clamp(vol * songVolume / 100.0, 0.0, 300.0);
 }
 void Player::setTrackVolume(double percent) {
   if(!std::isfinite(percent)) return;
@@ -476,10 +480,12 @@ void Player::poll() {
       canSeek = seekable;
       if (resumeAt > 0)
         command({"seek", QString::number(resumeAt), "absolute+exact"});
-      if(speedInFlight || filtersInFlight || speedTimer.isActive() || sentPitch!=pitchFollows || std::abs(sentSpeed-playbackSpeed)>=0.0001) {
+      if(speedInFlight || filtersInFlight || volumeInFlight || speedTimer.isActive() || volumeTimer.isActive() || sentPitch!=pitchFollows || std::abs(sentSpeed-playbackSpeed)>=0.0001) {
         startAfterSpeed=true;
         speedTimer.stop();
         flushSpeed();
+        volumeTimer.stop();
+        flushVolume();
       } else {
         command({"set", "pause", resumePaused ? "yes" : "no"});
         if (!resumePaused && pendingFadeIn) startTransitionFadeIn();
@@ -504,7 +510,7 @@ void Player::poll() {
         emit ended();
     }
   }
-  if(hasFile && startAfterSpeed && !speedInFlight && !filtersInFlight && !speedTimer.isActive() && sentPitch==pitchFollows && std::abs(sentSpeed-playbackSpeed)<0.0001) {
+  if(hasFile && startAfterSpeed && !speedInFlight && !filtersInFlight && !volumeInFlight && !speedTimer.isActive() && !volumeTimer.isActive() && sentPitch==pitchFollows && std::abs(sentSpeed-playbackSpeed)<0.0001) {
     startAfterSpeed=false;
     command({"set","pause",resumePaused?"yes":"no"});
     if (!resumePaused && pendingFadeIn) startTransitionFadeIn();

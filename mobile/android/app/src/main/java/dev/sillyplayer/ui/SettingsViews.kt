@@ -5,10 +5,12 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.*
 import androidx.compose.foundation.relocation.BringIntoViewRequester
 import androidx.compose.foundation.relocation.bringIntoViewRequester
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.*
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -111,11 +113,16 @@ fun SettingsScreen(g: Graph, pickers: Pickers) {
     val playbackError by g.playbackError.collectAsStateWithLifecycle()
     var showPlaybackError by remember { mutableStateOf(false) }
     var clearFolder by remember { mutableStateOf(false) }
+    var clearWatchedRoot by remember { mutableStateOf<Root?>(null) }
     if (showPlaybackError)
-        AlertDialog(
+        AppModalDialog(
             onDismissRequest = { showPlaybackError = false },
-            title = { Text("Playback error details") },
-            text = {
+            title = "Playback error details",
+            icon = "info",
+            danger = true,
+            actions = { ModalPrimaryButton("Close") { showPlaybackError = false } },
+        ) {
+            ModalSectionCard {
                 androidx.compose.foundation.text.selection.SelectionContainer {
                     Text(
                         playbackError,
@@ -123,11 +130,8 @@ fun SettingsScreen(g: Graph, pickers: Pickers) {
                         fontSize = 12.sp,
                     )
                 }
-            },
-            confirmButton = {
-                TextButton(onClick = { showPlaybackError = false }) { Text("Close") }
-            },
-        )
+            }
+        }
     var sleep by remember { mutableStateOf(false) }
     var eq by remember { mutableStateOf(false) }
     var missing by remember { mutableStateOf<List<Track>?>(null) }
@@ -211,7 +215,7 @@ fun SettingsScreen(g: Graph, pickers: Pickers) {
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(10.dp),
                 ) {
-                    PickMenu(prefs.palette, Palettes.keys.toList()) { p ->
+                    PickMenu(canonicalPalette(prefs.palette), Palettes.keys.toList()) { p ->
                         g.task { g.prefs.update { it.copy(palette = p) } }
                     }
                     PickMenu(if (prefs.light) "Light" else "Dark", listOf("Dark", "Light")) { mode ->
@@ -302,6 +306,11 @@ fun SettingsScreen(g: Graph, pickers: Pickers) {
                             overflow = TextOverflow.Ellipsis,
                         )
                         IconAction("folder", "Locate moved folder") { pickers.folder("replace:" + root.id) }
+                        IconAction(
+                            "trash-2",
+                            "Move all songs in this folder to Trash",
+                            enabled = root.available && !sync.busy && !backup.busy && !resetting,
+                        ) { clearWatchedRoot = root }
                         IconAction("x", "Remove watched folder") { g.task { g.library.removeRoot(root.id) } }
                     }
                 }
@@ -386,10 +395,11 @@ fun SettingsScreen(g: Graph, pickers: Pickers) {
                         g.task {
                             try {
                                 val trashIds = g.dao.trash().mapTo(HashSet()) { it.track }
+                                // only inspect live tracks so permanently deleted or sync-deleted songs dont haunt missing files
                                 missing =
                                     g.dao
-                                        .allTracks()
-                                        .filter { !it.deleted || it.id !in trashIds }
+                                        .tracks()
+                                        .filter { it.id !in trashIds }
                                         .filter {
                                             !it.available ||
                                                 runCatching {
@@ -416,8 +426,17 @@ fun SettingsScreen(g: Graph, pickers: Pickers) {
                         checking = true
                         g.task { try { g.online.repairDownloadedSongs() } finally { checking = false } }
                     }
+                    SettingsAction("Reinstate folder", "folder", !checking && !resetting) {
+                        pickers.folder("reinstate")
+                    }
                 }
                 if (checking) Progress("Checking library")
+            }
+            SettingsCard("Playlists") {
+                Choice("Allow duplicate songs in playlists", prefs.allowPlaylistDuplicates) { on ->
+                    g.task { g.prefs.update { it.copy(allowPlaylistDuplicates = on) } }
+                }
+                Hint("Off by default. When off, adding songs skips entries already in the playlist while keeping existing duplicates intact.")
             }
             SettingsCard("Trash", "${trash.size} files · kept until you empty Trash") {
                 for (entry in trash.take(30)) Row(
@@ -506,6 +525,24 @@ fun SettingsScreen(g: Graph, pickers: Pickers) {
             g.task { g.library.clearMusicFolder() }
         }
     }
+    clearWatchedRoot?.let { root ->
+        Confirmation(
+            "Move folder songs to Trash?",
+            "All songs from \"${root.name}\" will be moved to SillyPlayer Trash so you can restore them later or empty Trash.",
+            "Move to Trash",
+            { clearWatchedRoot = null },
+        ) {
+            g.task {
+                val (trashed, failed) = g.library.clearWatchedFolderToTrash(root.id)
+                g.message.value =
+                    when {
+                        trashed == 0 && failed == 0 -> "No songs found in ${root.name}"
+                        failed > 0 -> "Moved $trashed songs to Trash · $failed failed"
+                        else -> "Moved $trashed ${if (trashed == 1) "song" else "songs"} to Trash"
+                    }
+            }
+        }
+    }
     if (emptyTrash)
         Confirmation(
             "Empty Trash?",
@@ -547,20 +584,25 @@ fun SettingsScreen(g: Graph, pickers: Pickers) {
         }
     }
     missing?.let { rows ->
-        AlertDialog(
+        AppModalDialog(
             onDismissRequest = { missing = null },
-            title = { Text("Missing files") },
-            text = {
-                Column(Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState())) {
-                    if (rows.isEmpty()) Hint("No missing files found")
-                    for (track in rows) Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(track.title, Modifier.weight(1f), fontSize = 13.sp, maxLines = 2)
-                        Action("Locate", "folder") { pickers.locate(track.id) }
-                    }
+            title = "Missing files",
+            subtitle = "${rows.size} ${if (rows.size == 1) "song" else "songs"}",
+            icon = "folder",
+            actions = { ModalPrimaryButton("Close") { missing = null } },
+        ) {
+            Column(Modifier.heightIn(max = 400.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (rows.isEmpty()) Hint("No missing files found")
+                for (track in rows) ModalOptionRow(
+                    title = track.title,
+                    subtitle = "Tap to locate audio file",
+                    icon = "folder",
+                    trailingIcon = "chevron-right",
+                ) {
+                    pickers.locate(track.id)
                 }
-            },
-            confirmButton = { Action("Close") { missing = null } },
-        )
+            }
+        }
     }
     duplicates?.let { groups -> DuplicateDialog(g, groups) { duplicates = null } }
 }
@@ -581,45 +623,37 @@ private fun DuplicateDialog(g: Graph, groups: List<List<Track>>, onDismiss: () -
             )
         }
     var confirming by remember { mutableStateOf(false) }
-    AlertDialog(
+    AppModalDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Exact duplicates") },
-        text = {
-            Column(Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState())) {
-                if (group == null) Hint("No remaining duplicate groups")
-                else {
-                    Hint(
-                        "Group ${index+1}/${groups.size}. Choose the copy to keep. Playlist occurrences and likes follow it."
-                    )
-                    for (track in group) Row(
-                        Modifier.fillMaxWidth().clickable(
-                            enabled = current == null || group.none { it.id == current }
-                        ) {
-                            keep = track.id
-                        },
-                        verticalAlignment = Alignment.CenterVertically,
+        title = "Exact duplicates",
+        subtitle = if (group != null) "Group ${index+1}/${groups.size}" else "Complete",
+        icon = "list-checks",
+        actions = {
+            if (group != null) {
+                ModalTonalButton("Skip") { index++ }
+                ModalPrimaryButton("Consolidate & Trash", icon = "trash-2", danger = true) { confirming = true }
+            } else {
+                ModalPrimaryButton("Close") { onDismiss() }
+            }
+        },
+    ) {
+        Column(Modifier.heightIn(max = 400.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            if (group == null) Hint("No remaining duplicate groups")
+            else {
+                Hint("Choose the copy to keep. Playlist occurrences and likes follow it.")
+                for (track in group) {
+                    ModalOptionRow(
+                        title = track.title,
+                        subtitle = track.uri,
+                        icon = "music-2",
+                        selected = keep == track.id,
                     ) {
-                        RadioButton(
-                            keep == track.id,
-                            {
-                                if (current == null || group.none { it.id == current })
-                                    keep = track.id
-                            },
-                        )
-                        Column {
-                            Text(track.title, fontSize = 13.sp)
-                            Hint(track.uri)
-                        }
+                        if (current == null || group.none { it.id == current }) keep = track.id
                     }
                 }
             }
-        },
-        confirmButton = {
-            if (group != null) Action("Consolidate and Trash extras") { confirming = true }
-            else Action("Close") { onDismiss() }
-        },
-        dismissButton = { if (group != null) Action("Skip") { index++ } },
-    )
+        }
+    }
     if (confirming && group != null)
         Confirmation(
             "Consolidate duplicates?",
@@ -803,52 +837,14 @@ private fun SyncScopeDialog(g: Graph, peer: Peer, pickers: Pickers, onDismiss: (
         )
     }
     var query by remember { mutableStateOf("") }
-    AlertDialog(
+    AppModalDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Music to synchronize") },
-        text = {
-            Column {
-                Choice("Entire library", all) { all = it }
-                Hint(
-                    "Library information and edits sync both ways. Audio is copied for the selection below."
-                )
-                Input(
-                    query,
-                    { query = it },
-                    "Find songs or playlists",
-                    "".let { Modifier },
-                    "search",
-                )
-                LazyColumn(Modifier.heightIn(max = 380.dp)) {
-                    if (!all) {
-                        items(
-                            collections.filter { query.isBlank() || it.name.contains(query, true) },
-                            key = { "collection:" + it.id },
-                        ) { c ->
-                            val key = "collection:" + c.id
-                            Choice(c.name, key in selected) {
-                                selected = if (it) selected + key else selected - key
-                            }
-                        }
-                        items(
-                            tracks.filter {
-                                query.isBlank() ||
-                                    it.title.contains(query, true) ||
-                                    it.artist.contains(query, true)
-                            },
-                            key = { "track:" + it.id },
-                        ) { t ->
-                            val key = "track:" + t.id
-                            Choice(t.title + " · " + t.artist, key in selected) {
-                                selected = if (it) selected + key else selected - key
-                            }
-                        }
-                    }
-                }
-            }
-        },
-        confirmButton = {
-            Action("Save and sync", enabled = all || selected.isNotEmpty()) {
+        title = "Music to synchronize",
+        subtitle = "Choose audio copied to this phone",
+        icon = "rotate-ccw",
+        actions = {
+            ModalTonalButton("Cancel", onClick = onDismiss)
+            ModalPrimaryButton("Save & sync", icon = "check", enabled = all || selected.isNotEmpty()) {
                 g.task {
                     g.sync.scope(peer, all, selected)
                     withContext(kotlinx.coroutines.Dispatchers.Main) {
@@ -860,8 +856,39 @@ private fun SyncScopeDialog(g: Graph, peer: Peer, pickers: Pickers, onDismiss: (
                 }
             }
         },
-        dismissButton = { Action("Cancel") { onDismiss() } },
-    )
+    ) {
+        ModalSectionCard {
+            Choice("Entire library", all) { all = it }
+            Hint("Library information and edits sync both ways. Audio is copied for the selection below.")
+        }
+        if (!all) {
+            SearchBarField(query, { query = it }, "Find songs or playlists")
+            LazyColumn(Modifier.heightIn(max = 320.dp)) {
+                items(
+                    collections.filter { query.isBlank() || it.name.contains(query, true) },
+                    key = { "collection:" + it.id },
+                ) { c ->
+                    val key = "collection:" + c.id
+                    Choice(c.name, key in selected) {
+                        selected = if (it) selected + key else selected - key
+                    }
+                }
+                items(
+                    tracks.filter {
+                        query.isBlank() ||
+                            it.title.contains(query, true) ||
+                            it.artist.contains(query, true)
+                    },
+                    key = { "track:" + it.id },
+                ) { t ->
+                    val key = "track:" + t.id
+                    Choice(t.title + " · " + t.artist, key in selected) {
+                        selected = if (it) selected + key else selected - key
+                    }
+                }
+            }
+        }
+    }
 }
 
 @Composable
@@ -872,29 +899,28 @@ fun SyncReviewPrompt(g: Graph) {
     val songGroups = remember(conflicts) { conflicts.filter { it.entity == "tracks" }.groupBy { it.peer } }
     val conflict = conflicts.firstOrNull { it.id !in deferred }
     if (sync.busy && sync.stage.startsWith("Applying song choices")) {
-        AlertDialog(
+        AppModalDialog(
             onDismissRequest = {},
-            title = { Text("Applying library choices") },
-            text = { Progress(sync.stage, sync.progress) },
-            confirmButton = { Action("Cancel", "x") { g.sync.cancel() } },
-        )
+            title = "Applying library choices",
+            icon = "rotate-ccw",
+            dismissible = false,
+            actions = { ModalTonalButton("Cancel", "x") { g.sync.cancel() } },
+        ) {
+            ModalSectionCard { Progress(sync.stage, sync.progress) }
+        }
     }
-    if (conflict != null && !sync.busy) AlertDialog(
+    if (conflict != null && !sync.busy) AppModalDialog(
         onDismissRequest = { deferred.add(conflict.id) },
-        title = {
-            Text(
-                if (conflicts.size > 1) "Choose a library version (${conflicts.size} remaining)"
-                else "Choose a library version"
-            )
-        },
-        text = {
-            Column(Modifier.verticalScroll(rememberScrollState())) {
-                Hint("This choice is shared with the connected desktop. Review later keeps the song unchanged until you choose in Settings → Phone sync.")
-                ConflictView(g, conflict, songGroups[conflict.peer].orEmpty())
-            }
-        },
-        confirmButton = { TextButton(onClick = { deferred.add(conflict.id) }) { Text("Review later") } },
-    )
+        title = "Choose a library version",
+        subtitle = if (conflicts.size > 1) "${conflicts.size} remaining" else "Conflict review",
+        icon = "rotate-ccw",
+        actions = { ModalTonalButton("Review later") { deferred.add(conflict.id) } },
+    ) {
+        Column(Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Hint("This choice is shared with the connected desktop. Review later keeps the song unchanged until you choose in Settings → Phone sync.")
+            ConflictView(g, conflict, songGroups[conflict.peer].orEmpty())
+        }
+    }
 }
 
 @OptIn(ExperimentalLayoutApi::class)
@@ -1048,11 +1074,12 @@ fun StatisticsScreen(g: Graph, onPlay: (Track, List<Track>) -> Unit) {
                     set(java.util.Calendar.SECOND, 0)
                     set(java.util.Calendar.MILLISECOND, 0)
                 }
+                // use calendar days instead of raw 86400s math so DST switches match insights buckets
                 val cutoff =
                     when (period) {
                         "day" -> cal.timeInMillis
-                        "week" -> cal.timeInMillis - 6L * 86400000L
-                        else -> cal.timeInMillis - 29L * 86400000L
+                        "week" -> (cal.clone() as java.util.Calendar).apply { add(java.util.Calendar.DAY_OF_YEAR, -6) }.timeInMillis
+                        else -> (cal.clone() as java.util.Calendar).apply { add(java.util.Calendar.DAY_OF_YEAR, -29) }.timeInMillis
                     }
                 plays
                     .filter { it.playedAt >= cutoff }
@@ -1284,11 +1311,16 @@ fun StatisticsScreen(g: Graph, onPlay: (Track, List<Track>) -> Unit) {
             item { Hint("Play counts and listening time appear as you listen.") }
     }
     if (exact)
-        AlertDialog(
+        AppModalDialog(
             onDismissRequest = { exact = false },
-            text = { Text("${minutes/60}h${minutes%60}m") },
-            confirmButton = { Action("Close") { exact = false } },
-        )
+            title = "Exact listening time",
+            icon = "clock",
+            actions = { ModalPrimaryButton("Close") { exact = false } },
+        ) {
+            ModalSectionCard {
+                Text("${minutes/60}h${minutes%60}m", fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
+            }
+        }
 }
 
 @Composable
@@ -1335,19 +1367,19 @@ private fun LicensesDialog(g: Graph, onDismiss: () -> Unit) {
                     }
                 }
         }
-    AlertDialog(
+    AppModalDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Third-party software") },
-        text = {
-            Column {
-                PickMenu(selected, names) { selected = it }
-                Column(Modifier.heightIn(max = 400.dp).verticalScroll(rememberScrollState())) {
-                    Text(text, fontSize = 12.sp)
-                }
+        title = "Third-party software",
+        icon = "info",
+        actions = { ModalPrimaryButton("Close") { onDismiss() } },
+    ) {
+        PickMenu(selected, names) { selected = it }
+        ModalSectionCard {
+            Column(Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState())) {
+                Text(text, fontSize = 12.sp)
             }
-        },
-        confirmButton = { Action("Close") { onDismiss() } },
-    )
+        }
+    }
 }
 
 @Composable
@@ -1366,33 +1398,37 @@ private fun DeveloperSettings(g: Graph) {
         confirming = true
     }
     if (confirming)
-        AlertDialog(
+        AppModalDialog(
             onDismissRequest = { confirming = false },
-            title = { Text("Reset phone library?") },
-            text = {
-                Column {
-                    Text(
-                        "Removes songs, playlists, likes, listening and download history, watched folders and the playback queue from this phone. Original files in user folders and recoverable Trash are kept. Desktop music is unchanged. Pairing is kept with its sync cursor reset, so Sync can import the library again."
-                    )
-                    Choice("Also delete app-private synced audio and artwork", removeFiles) {
-                        removeFiles = it
-                    }
-                    Input(text, { text = it }, "Type RESET")
-                }
-            },
-            confirmButton = {
-                Action("Reset phone library", "trash-2", text == "RESET") {
+            title = "Reset phone library?",
+            icon = "trash-2",
+            danger = true,
+            actions = {
+                ModalTonalButton("Cancel") { confirming = false }
+                ModalPrimaryButton("Reset phone library", "trash-2", text == "RESET", danger = true) {
                     confirming = false
                     g.task { g.developer.reset(removeFiles) }
                 }
             },
-            dismissButton = { Action("Cancel") { confirming = false } },
-        )
+        ) {
+            Text(
+                "Removes songs, playlists, likes, listening and download history, watched folders and the playback queue from this phone. Original files in user folders and recoverable Trash are kept. Desktop music is unchanged. Pairing is kept with its sync cursor reset, so Sync can import the library again.",
+                fontSize = 13.sp,
+                lineHeight = 19.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Choice("Also delete app-private synced audio and artwork", removeFiles) {
+                removeFiles = it
+            }
+            Input(text, { text = it }, "Type RESET")
+        }
     if (resetting)
-        AlertDialog(
+        AppModalDialog(
             onDismissRequest = {},
-            title = { Text("Resetting phone library") },
-            text = { Progress("Clearing local records") },
-            confirmButton = {},
-        )
+            title = "Resetting phone library",
+            icon = "rotate-ccw",
+            dismissible = false,
+        ) {
+            ModalSectionCard { Progress("Clearing local records") }
+        }
 }

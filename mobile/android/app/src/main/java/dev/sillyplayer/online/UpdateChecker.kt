@@ -111,7 +111,10 @@ class UpdateChecker(private val g: Graph) {
             if (obj["draft"]?.jsonPrimitive?.booleanOrNull == true ||
                 obj["prerelease"]?.jsonPrimitive?.booleanOrNull == true
             ) {
-                state.value = UpdateState(status = "Up to date (v${BuildConfig.VERSION_NAME})")
+                // dont show an up-to-date banner on silent background checks
+                state.value = UpdateState(
+                    status = if (manual) "You're on the latest version (v${BuildConfig.VERSION_NAME})" else "",
+                )
                 return
             }
             val tag = obj["tag_name"]?.jsonPrimitive?.contentOrNull.orEmpty()

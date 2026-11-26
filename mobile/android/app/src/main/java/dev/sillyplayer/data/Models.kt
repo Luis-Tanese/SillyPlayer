@@ -212,6 +212,15 @@ data class QueueState(
 )
 
 @Serializable
+data class EqPreset(
+    val id: String = uuid(),
+    val name: String,
+    val gains: List<Float>,
+    val updatedAt: Long = System.currentTimeMillis(),
+    val deleted: Boolean = false,
+)
+
+@Serializable
 data class Preferences(
     val developerMode: Boolean = false,
     val palette: String = "Catppuccin",
@@ -222,11 +231,14 @@ data class Preferences(
     val eqEnabled: Boolean = false,
     val eq: List<Float> = List(10) { 0f },
     val eqPreset: String = "Flat",
+    val eqPresets: List<EqPreset> = emptyList(),
+    val eqStateUpdatedAt: Long = 0L,
     val pauseFade: Boolean = false,
     val fadeMs: Int = 300,
     val crossfadeMs: Int = 0,
     val smartShuffle: Boolean = false,
     val duckAudio: Boolean = true,
+    val allowPlaylistDuplicates: Boolean = false,
     val musicDir: String = "",
     val queue: QueueState = QueueState(),
     val sleepEnd: Long = 0,

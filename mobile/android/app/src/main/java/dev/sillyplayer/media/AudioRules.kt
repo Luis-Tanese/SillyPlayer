@@ -9,4 +9,10 @@ fun effectiveVolume(master: Float, song: Float): Float {
 
 fun songOutputGain(master: Float, song: Float): Float = effectiveVolume(master, song) / 100f
 
+// exoplayer player.volume is linear amplitude while human hearing is logarithmic, so square the ramp so fades dont snap loud right away
+fun perceptualFadeGain(progress: Float): Float {
+    val p = progress.takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: 1f
+    return p * p
+}
+
 fun pitchEffectLabel(speed: Float): String = if (speed < 1f) "Daycore" else "Nightcore"

@@ -8,11 +8,9 @@ Item {
     required property var pane
     required property var shell
     property var pendingRows: []
-    property string destination: ""
-    property int duplicateCount: 0
     property string failureText: ""
     property var cleanPreview: []
-    property bool modalActive: picker.opened || duplicates.opened || trashConfirm.opened || failures.opened || createPlaylist.opened || batchTagsDialog.opened || cleanTitlesDialog.opened
+    property bool modalActive: picker.opened || trashConfirm.opened || failures.opened || batchTagsDialog.opened || cleanTitlesDialog.opened
     function ids() { return pendingRows.map(t => t.id); }
     function report(result, verb) {
         if (result.status === "error") {
@@ -62,12 +60,8 @@ Item {
         } else if (action === "trash") trashConfirm.open();
     }
     function addTo(collection, policy) {
-        destination = collection;
-        const result = app.addTracksToCollection(collection, ids(), policy);
-        if (result.status === "duplicate") {
-            duplicateCount = result.duplicates;
-            duplicates.open();
-        } else if (report(result, "added")) picker.close();
+        const result = app.addTracksToCollection(collection, ids(), policy || "auto");
+        if (report(result, "added")) picker.close();
     }
     Connections {
         target: app
@@ -98,52 +92,106 @@ Item {
         width: Math.min(actions.shell.width - 40, 460)
         title: "Add to Playlist"
         standardButtons: Dialog.Close
+        property string pendingCreateName: ""
+        property bool enteringCustomName: false
+        onOpened: { search.text = ""; pendingCreateName = ""; enteringCustomName = false; customPlaylistName.text = ""; }
         ColumnLayout {
             width: parent.width; spacing: 10
-            Label { text: actions.pendingRows.length + " selected songs"; color: Theme.muted }
-            AppField { id: search; search: true; placeholderText: "Find a playlist"; Layout.fillWidth: true }
-            CollectionRow { Layout.fillWidth: true; title: "New Playlist"; glyph: "plus"; onClicked: { playlistName.text = ""; createPlaylist.open(); } }
+            Label { text: actions.pendingRows.length + (actions.pendingRows.length === 1 ? " selected song" : " selected songs"); color: Theme.muted }
+            AppField {
+                id: search; search: true; placeholderText: "Find or name a playlist"; Layout.fillWidth: true
+                onTextChanged: if (picker.pendingCreateName) picker.pendingCreateName = ""
+            }
+            CollectionRow {
+                Layout.fillWidth: true
+                visible: !picker.pendingCreateName && !picker.enteringCustomName
+                title: search.text.trim() ? 'Create playlist "' + search.text.trim() + '"' : "Create playlist"
+                subtitle: search.text.trim() ? "Use this name & add selected songs" : "Type a name above or tap to enter"
+                glyph: "plus"
+                onClicked: {
+                    const typed = search.text.trim();
+                    if (typed.length > 0) picker.pendingCreateName = typed;
+                    else { customPlaylistName.text = ""; picker.enteringCustomName = true; customPlaylistName.forceActiveFocus(); }
+                }
+            }
+            Rectangle {
+                Layout.fillWidth: true
+                visible: !!picker.pendingCreateName
+                implicitHeight: confirmCreateCol.implicitHeight + 24
+                radius: 10; color: Qt.alpha(Theme.accent, 0.08); border.width: 1; border.color: Qt.alpha(Theme.accent, 0.35)
+                ColumnLayout {
+                    id: confirmCreateCol
+                    anchors.fill: parent; anchors.margins: 12; spacing: 10
+                    Label {
+                        text: 'Create playlist "' + picker.pendingCreateName + '" and add ' + actions.pendingRows.length + (actions.pendingRows.length === 1 ? " song?" : " songs?")
+                        color: Theme.text; wrapMode: Text.WordWrap; Layout.fillWidth: true; font.weight: Font.Medium
+                    }
+                    RowLayout {
+                        Layout.alignment: Qt.AlignRight; spacing: 8
+                        FlatButton { text: "Edit name"; onClicked: { customPlaylistName.text = picker.pendingCreateName; picker.pendingCreateName = ""; picker.enteringCustomName = true; customPlaylistName.forceActiveFocus(); } }
+                        FlatButton { text: "Cancel"; onClicked: picker.pendingCreateName = "" }
+                        FlatButton {
+                            text: "Create & add"; glyph: "check"; primary: true
+                            onClicked: {
+                                const id = app.createCollection(picker.pendingCreateName, "playlist");
+                                picker.pendingCreateName = "";
+                                if (id) actions.addTo(id, "auto");
+                            }
+                        }
+                    }
+                }
+            }
+            Rectangle {
+                Layout.fillWidth: true
+                visible: picker.enteringCustomName
+                implicitHeight: customCreateCol.implicitHeight + 24
+                radius: 10; color: Theme.surface; border.width: 1; border.color: Theme.separator
+                ColumnLayout {
+                    id: customCreateCol
+                    anchors.fill: parent; anchors.margins: 12; spacing: 10
+                    AppField {
+                        id: customPlaylistName; placeholderText: "New playlist name"; Layout.fillWidth: true
+                        onAccepted: if (text.trim().length > 0) {
+                            const id = app.createCollection(text.trim(), "playlist");
+                            picker.enteringCustomName = false;
+                            if (id) actions.addTo(id, "auto");
+                        }
+                    }
+                    RowLayout {
+                        Layout.alignment: Qt.AlignRight; spacing: 8
+                        FlatButton { text: "Cancel"; onClicked: picker.enteringCustomName = false }
+                        FlatButton {
+                            text: "Create & add"; glyph: "check"; primary: true
+                            enabled: customPlaylistName.text.trim().length > 0
+                            onClicked: {
+                                const id = app.createCollection(customPlaylistName.text.trim(), "playlist");
+                                picker.enteringCustomName = false;
+                                if (id) actions.addTo(id, "auto");
+                            }
+                        }
+                    }
+                }
+            }
             ListView {
-                Layout.fillWidth: true; Layout.preferredHeight: Math.max(80, Math.min(300, actions.shell.height - 340)); clip: true
-                model: [{id:"liked",name:"Liked Songs",kind:"liked",count:library.likedCount}].concat(app.collections.filter(c => c.kind === "playlist" || c.kind === "custom")).filter(c => c.name.toLowerCase().includes(search.text.toLowerCase()))
+                Layout.fillWidth: true; Layout.preferredHeight: Math.max(80, Math.min(300, actions.shell.height - 360)); clip: true
+                model: {
+                    if (!picker.visible) return [];
+                    const editable = app.collections.filter(c => c.kind === "playlist" || c.kind === "custom");
+                    const pinned = editable.filter(c => !!c.pinned);
+                    const rest = editable.filter(c => !c.pinned);
+                    return pinned.concat([{id:"liked",name:"Liked Songs",kind:"liked",count:library.likedCount}], rest)
+                        .filter(c => c.name.toLowerCase().includes(search.text.toLowerCase()));
+                }
                 ScrollBar.vertical: ScrollBar {}
                 delegate: CollectionRow {
                     required property var modelData
                     width: ListView.view.width
                     title: modelData.name; cover: modelData.cover || ""; glyph: modelData.kind === "liked" ? "heart" : ""
+                    pinned: !!modelData.pinned
                     subtitle: (modelData.count || 0) + " songs"
-                    onClicked: actions.addTo(modelData.id, "ask")
+                    onClicked: actions.addTo(modelData.id, "auto")
                 }
                 Label { anchors.centerIn: parent; text: "No matching playlists"; visible: parent.count === 0; color: Theme.muted }
-            }
-        }
-    }
-    AppDialog {
-        id: createPlaylist
-        objectName: "bulkNewPlaylistDialog"
-        parent: Overlay.overlay; anchors.centerIn: parent
-        width: Math.min(actions.shell.width - 40, 380)
-        title: "New playlist"; standardButtons: Dialog.Save | Dialog.Cancel
-        AppField { id: playlistName; width: parent.width; placeholderText: "Name" }
-        onOpened: { playlistName.forceActiveFocus(); standardButton(Dialog.Save).enabled = Qt.binding(() => playlistName.text.trim().length > 0); }
-        onAccepted: {
-            const id = app.createCollection(playlistName.text, "playlist");
-            if (id) actions.addTo(id, "ask");
-        }
-    }
-    AppDialog {
-        id: duplicates
-        objectName: "bulkDuplicateDialog"
-        parent: Overlay.overlay; anchors.centerIn: parent
-        width: Math.min(actions.shell.width - 40, 460)
-        title: "Songs already included"; standardButtons: Dialog.Cancel
-        ColumnLayout {
-            width: parent.width; spacing: 14
-            Label { text: actions.duplicateCount + " selected entries duplicate songs in this selection or playlist."; wrapMode: Text.Wrap; color: Theme.text; Layout.fillWidth: true }
-            RowLayout {
-                Layout.alignment: Qt.AlignRight
-                FlatButton { objectName: "bulkSkipDuplicates"; text: "Skip existing"; onClicked: { duplicates.close(); actions.addTo(actions.destination, "skip"); } }
-                FlatButton { objectName: "bulkAllowDuplicates"; text: "Add duplicates"; glyph: "plus"; onClicked: { duplicates.close(); actions.addTo(actions.destination, "duplicates"); } }
             }
         }
     }

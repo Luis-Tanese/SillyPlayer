@@ -196,11 +196,14 @@ fun computeListeningInsights(
         set(java.util.Calendar.MILLISECOND, 0)
     }
     val todayStart = cal.timeInMillis
+    // use calendar day math instead of raw 86400s chunks so DST flips dont shift the cutoff by an hour
+    fun daysAgoMidnight(days: Int): Long =
+        (cal.clone() as java.util.Calendar).apply { add(java.util.Calendar.DAY_OF_YEAR, -days) }.timeInMillis
     val cutoff =
         when (period) {
             "day" -> todayStart
-            "week" -> todayStart - 6L * 86400000L
-            "month" -> todayStart - 29L * 86400000L
+            "week" -> daysAgoMidnight(6)
+            "month" -> daysAgoMidnight(29)
             else -> 0L
         }
 
@@ -370,4 +373,75 @@ fun computeListeningInsights(
         maxBucket = buckets.maxOfOrNull { it.count } ?: 0,
         buckets = buckets,
     )
+}
+
+fun normalizeEqGains(gains: List<Float>): List<Float> =
+    List(10) { i -> gains.getOrElse(i) { 0f }.takeIf { it.isFinite() }?.coerceIn(-12f, 12f) ?: 0f }
+
+fun mergeEqPresets(local: List<EqPreset>, remote: List<EqPreset>): List<EqPreset> {
+    val byId = LinkedHashMap<String, EqPreset>()
+    for (raw in local + remote) {
+        val id = raw.id.trim().ifBlank { continue }
+        val item = raw.copy(
+            id = id,
+            name = raw.name.trim(),
+            gains = normalizeEqGains(raw.gains),
+        )
+        if (!item.deleted && item.name.isEmpty()) continue
+        val prev = byId[id]
+        if (prev == null || item.updatedAt > prev.updatedAt || (item.updatedAt == prev.updatedAt && prev.deleted && !item.deleted)) {
+            byId[id] = item
+        }
+    }
+    // collapse active presets sharing a name so independent creation on desktop and phone doesnt leave duplicates
+    val activeByName = LinkedHashMap<String, EqPreset>()
+    val merged = mutableListOf<EqPreset>()
+    for (item in byId.values) {
+        if (item.deleted) {
+            merged += item
+        } else {
+            val key = item.name.lowercase(java.util.Locale.ROOT)
+            val prev = activeByName[key]
+            if (prev == null || item.updatedAt > prev.updatedAt) activeByName[key] = item
+        }
+    }
+    merged += activeByName.values.sortedBy { it.name.lowercase(java.util.Locale.ROOT) }
+    return merged
+}
+
+@kotlinx.serialization.Serializable
+data class EqStateSync(
+    val enabled: Boolean = false,
+    val preset: String = "Flat",
+    val gains: List<Float> = List(10) { 0f },
+    val updatedAt: Long = 0L,
+)
+
+private val BUILTIN_EQ_NAMES = setOf("Flat", "Bass Boost", "Rock", "Pop", "Classical", "Custom")
+
+fun mergeEqState(local: EqStateSync, remote: EqStateSync?, mergedPresets: List<EqPreset>): EqStateSync {
+    fun norm(s: EqStateSync) =
+        s.copy(
+            preset = s.preset.trim().ifEmpty { "Flat" },
+            gains = normalizeEqGains(s.gains),
+            updatedAt = s.updatedAt.coerceAtLeast(0L),
+        )
+    val l = norm(local)
+    var win = l
+    if (remote != null) {
+        val r = norm(remote)
+        if (r.updatedAt > l.updatedAt) win = r
+    }
+    // if the active custom preset got edited or deleted on the other device keep live gains and preset name aligned
+    if (BUILTIN_EQ_NAMES.none { it.equals(win.preset, ignoreCase = true) }) {
+        val active = mergedPresets.firstOrNull { !it.deleted && it.name.equals(win.preset, ignoreCase = true) }
+        if (active != null) {
+            if (active.updatedAt > win.updatedAt) {
+                win = win.copy(preset = active.name, gains = normalizeEqGains(active.gains))
+            }
+        } else if (mergedPresets.any { it.deleted && it.name.equals(win.preset, ignoreCase = true) }) {
+            win = win.copy(preset = "Custom")
+        }
+    }
+    return win
 }

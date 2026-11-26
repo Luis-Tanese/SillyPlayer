@@ -1,11 +1,19 @@
 #include "discordrpc.h"
+#include "sourcetags.h"
+#include "tagcleanup.h"
+#include <QBuffer>
 #include <QCoreApplication>
 #include <QDateTime>
 #include <QDir>
 #include <QFileInfo>
+#include <QHttpMultiPart>
+#include <QImage>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QNetworkRequest>
 #include <QRegularExpression>
+#include <QSet>
 #include <QUrl>
 #include <QUrlQuery>
 #include <QUuid>
@@ -18,14 +26,65 @@ constexpr quint32 kOpFrame = 1;
 constexpr quint32 kOpClose = 2;
 constexpr quint32 kOpPing = 3;
 constexpr quint32 kOpPong = 4;
+constexpr qint64 kNegativeCacheTtlMs = 7LL * 24 * 60 * 60 * 1000;
+constexpr qint64 kLitterboxTtlMs = 60LL * 60 * 60 * 1000;
 
 const QString kDefaultClientId = QStringLiteral("1574503545275678922");
-// todo: let users customize rpc text/fields/toggles in settings later
+
+QStringList tokenizeForMatch(const QString &input) {
+  QString cleaned = cleanSongTitle(input).toLower();
+  static const QRegularExpression nonWord(QStringLiteral(R"([^\p{L}\p{N}]+)"));
+  cleaned.replace(nonWord, QStringLiteral(" "));
+  const QStringList raw = cleaned.split(' ', Qt::SkipEmptyParts);
+  QStringList out;
+  for (const auto &w : raw) {
+    if (w == QLatin1String("feat") || w == QLatin1String("ft") ||
+        w == QLatin1String("featuring") || w == QLatin1String("the") ||
+        w == QLatin1String("official") || w == QLatin1String("audio") ||
+        w == QLatin1String("video"))
+      continue;
+    if (!out.contains(w)) out << w;
+  }
+  return out;
+}
+
+double tokenOverlapScore(const QString &wanted, const QString &candidate) {
+  const auto a = tokenizeForMatch(wanted);
+  const auto b = tokenizeForMatch(candidate);
+  if (a.isEmpty() || b.isEmpty()) return 0.0;
+  int hits = 0;
+  for (const auto &tok : a) {
+    if (b.contains(tok)) ++hits;
+  }
+  const double recall = double(hits) / double(a.size());
+  const double precision = double(hits) / double(b.size());
+  return recall * 0.75 + precision * 0.25;
+}
+
+double scoreCoverCandidate(const QString &wantedTitle, const QString &wantedArtist,
+                           const QString &candTitle, const QString &candArtist) {
+  const double titleScore = tokenOverlapScore(wantedTitle, candTitle);
+  if (titleScore < 0.5) return 0.0;
+  if (wantedArtist.isEmpty()) return titleScore;
+  const double artistScore = tokenOverlapScore(wantedArtist, candArtist);
+  if (artistScore < 0.35) return 0.0;
+  return titleScore * 0.6 + artistScore * 0.4;
+}
+
+QString localArtPath(const QString &art) {
+  const QString trimmed = art.trimmed();
+  if (trimmed.isEmpty()) return {};
+  const QUrl u(trimmed);
+  return u.isLocalFile() ? u.toLocalFile() : trimmed;
+}
 } // namespace
 
-DiscordRpc::DiscordRpc(QObject *parent)
-    : QObject(parent), socket(this), reconnectTimer(this),
-      m_clientId(kDefaultClientId) {
+DiscordRpc::DiscordRpc(Store *store, QObject *parent)
+    : QObject(parent), s(store), socket(this), net(this), reconnectTimer(this),
+      m_clientId(kDefaultClientId),
+      m_itunesBaseUrl(QStringLiteral("https://itunes.apple.com/search")),
+      m_deezerBaseUrl(QStringLiteral("https://api.deezer.com/search")),
+      m_uploadBaseUrl(QStringLiteral("https://litterbox.catbox.moe/resources/internals/api.php")) {
   reconnectTimer.setInterval(15000);
   connect(&reconnectTimer, &QTimer::timeout, this, &DiscordRpc::tryConnect);
   connect(&socket, &QLocalSocket::connected, this, &DiscordRpc::sendHandshake);
@@ -62,6 +121,92 @@ QByteArray DiscordRpc::encodeFrame(quint32 opcode, const QByteArray &jsonPayload
                            reinterpret_cast<uchar *>(frame.data() + 4));
   memcpy(frame.data() + 8, jsonPayload.constData(), jsonPayload.size());
   return frame;
+}
+
+QPair<QString, QString> DiscordRpc::normalizeQueryArtistTitle(const QString &rawTitle,
+                                                              const QString &rawArtist) {
+  QString title = cleanSongTitle(rawTitle);
+  QString artist = rawArtist.trimmed();
+  if (artist.compare(QLatin1String("Unknown artist"), Qt::CaseInsensitive) == 0 ||
+      artist.compare(QLatin1String("SillyPlayer"), Qt::CaseInsensitive) == 0) {
+    artist.clear();
+  }
+  // split "Artist - Song Title" filenames when artist metadata is missing
+  if (artist.isEmpty()) {
+    static const QRegularExpression dashSplit(QStringLiteral(R"(^(.+?)\s+[-–—]\s+(.+)$)"));
+    const auto m = dashSplit.match(title);
+    if (m.hasMatch()) {
+      artist = m.captured(1).trimmed();
+      title = m.captured(2).trimmed();
+    }
+  }
+  static const QRegularExpression featRe(
+      QStringLiteral(R"(\s*(?:[\(\[]?\s*(?:feat\.?|ft\.?|featuring)\b.*)$)"),
+      QRegularExpression::CaseInsensitiveOption);
+  artist.replace(featRe, QString());
+  artist = artist.trimmed();
+  title = cleanSongTitle(title);
+  return {artist, title};
+}
+
+QString DiscordRpc::parseItunesCoverUrl(const QByteArray &json, const QString &title,
+                                        const QString &artist) {
+  const auto doc = QJsonDocument::fromJson(json);
+  if (!doc.isObject()) return {};
+  const auto results = doc.object().value(QStringLiteral("results")).toArray();
+  double bestScore = 0.0;
+  QString bestUrl;
+  for (const auto &v : results) {
+    const auto obj = v.toObject();
+    const QString candTitle = obj.value(QStringLiteral("trackName")).toString();
+    const QString candArtist = obj.value(QStringLiteral("artistName")).toString();
+    QString art = obj.value(QStringLiteral("artworkUrl100")).toString().trimmed();
+    if (art.isEmpty()) art = obj.value(QStringLiteral("artworkUrl60")).toString().trimmed();
+    if (!art.startsWith(QLatin1String("https://"), Qt::CaseInsensitive)) continue;
+    const double score = scoreCoverCandidate(title, artist, candTitle, candArtist);
+    if (score > bestScore) {
+      bestScore = score;
+      bestUrl = art;
+    }
+  }
+  if (bestUrl.isEmpty()) return {};
+  static const QRegularExpression sizeRe(QStringLiteral(R"(/\d+x\d+bb\.)"));
+  bestUrl.replace(sizeRe, QStringLiteral("/600x600bb."));
+  return bestUrl;
+}
+
+QString DiscordRpc::parseDeezerCoverUrl(const QByteArray &json, const QString &title,
+                                        const QString &artist) {
+  const auto doc = QJsonDocument::fromJson(json);
+  if (!doc.isObject()) return {};
+  const auto results = doc.object().value(QStringLiteral("data")).toArray();
+  double bestScore = 0.0;
+  QString bestUrl;
+  for (const auto &v : results) {
+    const auto obj = v.toObject();
+    const QString candTitle = obj.value(QStringLiteral("title")).toString();
+    const QString candArtist = obj.value(QStringLiteral("artist")).toObject().value(QStringLiteral("name")).toString();
+    const auto album = obj.value(QStringLiteral("album")).toObject();
+    QString art = album.value(QStringLiteral("cover_big")).toString().trimmed();
+    if (art.isEmpty()) art = album.value(QStringLiteral("cover_medium")).toString().trimmed();
+    if (art.isEmpty()) art = album.value(QStringLiteral("cover")).toString().trimmed();
+    if (!art.startsWith(QLatin1String("https://"), Qt::CaseInsensitive)) continue;
+    const double score = scoreCoverCandidate(title, artist, candTitle, candArtist);
+    if (score > bestScore) {
+      bestScore = score;
+      bestUrl = art;
+    }
+  }
+  return bestUrl;
+}
+
+bool DiscordRpc::hasDirectCoverSource(const QVariantMap &track) {
+  static const QRegularExpression ytIdRe(QStringLiteral("^[A-Za-z0-9_-]{11}$"));
+  if (ytIdRe.match(track.value("videoId").toString().trimmed()).hasMatch()) return true;
+  if (!extractYouTubeVideoIdFromUrl(track.value("sourceUrl").toString()).isEmpty()) return true;
+  const QString rpcUrl = track.value("rpcCoverUrl").toString().trimmed();
+  return rpcUrl.startsWith(QLatin1String("https://"), Qt::CaseInsensitive) ||
+         rpcUrl.startsWith(QLatin1String("http://"), Qt::CaseInsensitive);
 }
 
 QVariantMap DiscordRpc::buildActivityPayload(const QVariantMap &track, bool playing,
@@ -106,27 +251,21 @@ QVariantMap DiscordRpc::buildActivityPayload(const QVariantMap &track, bool play
     if (!state.isEmpty())
       activity["state"] = fitField(state);
 
-    // use youtube cover art when available, otherwise fall back to the SillyPlayer app icon asset
+    // prefer youtube thumbnail, then cached/looked-up public cover url, then fallback cat icon
     static const QRegularExpression ytIdRe("^[A-Za-z0-9_-]{11}$");
     QString videoId = track.value("videoId").toString().trimmed();
     const QString sourceUrl = track.value("sourceUrl").toString().trimmed();
     if (!ytIdRe.match(videoId).hasMatch() && !sourceUrl.isEmpty()) {
-      const QUrl u(sourceUrl);
-      const QString host = u.host().toLower();
-      if (host.contains("youtube.com")) {
-        const QString v = QUrlQuery(u).queryItemValue("v");
-        if (ytIdRe.match(v).hasMatch())
-          videoId = v;
-      } else if (host == "youtu.be") {
-        const QString seg = u.path().mid(1).section('/', 0, 0);
-        if (ytIdRe.match(seg).hasMatch())
-          videoId = seg;
-      }
+      videoId = extractYouTubeVideoIdFromUrl(sourceUrl);
     }
-    const QString largeImage =
-        ytIdRe.match(videoId).hasMatch()
-            ? QStringLiteral("https://i.ytimg.com/vi/%1/hqdefault.jpg").arg(videoId)
-            : QStringLiteral("sillyplayer");
+    const QString rpcCoverUrl = track.value("rpcCoverUrl").toString().trimmed();
+    QString largeImage = QStringLiteral("sillyplayer");
+    if (ytIdRe.match(videoId).hasMatch()) {
+      largeImage = QStringLiteral("https://i.ytimg.com/vi/%1/hqdefault.jpg").arg(videoId);
+    } else if (rpcCoverUrl.startsWith(QLatin1String("https://"), Qt::CaseInsensitive) ||
+               rpcCoverUrl.startsWith(QLatin1String("http://"), Qt::CaseInsensitive)) {
+      largeImage = rpcCoverUrl;
+    }
 
     QVariantMap assets{
         {"large_image", largeImage},
@@ -185,6 +324,8 @@ void DiscordRpc::setEnabled(bool enabled) {
     return;
   m_enabled = enabled;
   if (!m_enabled) {
+    ++lookupGen;
+    if (activeReply) { activeReply->abort(); activeReply = nullptr; }
     reconnectTimer.stop();
     if (m_ready)
       clearPresence();
@@ -202,6 +343,20 @@ void DiscordRpc::setEnabled(bool enabled) {
     reconnectTimer.start();
 }
 
+void DiscordRpc::setLookupCovers(bool enabled) {
+  if (m_lookupCovers == enabled) return;
+  m_lookupCovers = enabled;
+  if (m_enabled && m_ready && hasActivity && !hasDirectCoverSource(lastTrack))
+    resolveCoverNow(lastTrack);
+}
+
+void DiscordRpc::setUploadCovers(bool enabled) {
+  if (m_uploadCovers == enabled) return;
+  m_uploadCovers = enabled;
+  if (m_enabled && m_ready && hasActivity && !hasDirectCoverSource(lastTrack))
+    resolveCoverNow(lastTrack);
+}
+
 void DiscordRpc::setClientId(const QString &clientId) {
   const QString trimmed = clientId.trimmed();
   const QString effective = trimmed.isEmpty() ? kDefaultClientId : trimmed;
@@ -217,19 +372,255 @@ void DiscordRpc::setClientId(const QString &clientId) {
   }
 }
 
+void DiscordRpc::setCoverEndpointsForTesting(const QString &itunesUrl, const QString &deezerUrl,
+                                             const QString &uploadUrl) {
+  if (!itunesUrl.isEmpty()) m_itunesBaseUrl = itunesUrl;
+  if (!deezerUrl.isEmpty()) m_deezerBaseUrl = deezerUrl;
+  if (!uploadUrl.isEmpty()) m_uploadBaseUrl = uploadUrl;
+}
+
+void DiscordRpc::clearCoverCache() {
+  ++lookupGen;
+  if (activeReply) { activeReply->abort(); activeReply = nullptr; }
+  if (s) s->exec("DELETE FROM rpc_covers");
+  lastTrack.remove("rpcCoverUrl");
+  if (m_enabled && m_ready && hasActivity) {
+    sendCurrentActivity();
+    if (!hasDirectCoverSource(lastTrack)) resolveCoverNow(lastTrack);
+  }
+}
+
+QString DiscordRpc::cachedCoverUrl(const QString &trackId) const {
+  if (!s || trackId.isEmpty()) return {};
+  const auto rows = s->rows("SELECT url,provider,checkedAt FROM rpc_covers WHERE track=?", {trackId});
+  if (rows.isEmpty()) return {};
+  const auto row = rows.first().toMap();
+  const QString url = row.value("url").toString().trimmed();
+  if (url.isEmpty()) return {};
+  const QString provider = row.value("provider").toString();
+  const qint64 checkedAt = row.value("checkedAt").toLongLong();
+  if (provider == QLatin1String("litterbox") &&
+      QDateTime::currentMSecsSinceEpoch() - checkedAt > kLitterboxTtlMs) {
+    return {};
+  }
+  return url;
+}
+
+void DiscordRpc::storeCachedCover(const QString &trackId, const QString &url,
+                                  const QString &provider) {
+  if (!s || trackId.isEmpty()) return;
+  const qint64 now = QDateTime::currentMSecsSinceEpoch();
+  s->exec("INSERT OR REPLACE INTO rpc_covers(track,url,provider,checkedAt) VALUES(?,?,?,?)",
+          {trackId, url, provider, now});
+}
+
+void DiscordRpc::resolveCoverNow(const QVariantMap &track) {
+  if (m_closing || (!m_lookupCovers && !m_uploadCovers)) return;
+  const QString trackId = track.value("id").toString().trimmed();
+  if (trackId.isEmpty() || hasDirectCoverSource(track)) return;
+
+  const qint64 now = QDateTime::currentMSecsSinceEpoch();
+  if (s) {
+    const auto rows = s->rows("SELECT url,provider,checkedAt FROM rpc_covers WHERE track=?", {trackId});
+    if (!rows.isEmpty()) {
+      const auto row = rows.first().toMap();
+      const QString url = row.value("url").toString().trimmed();
+      const QString provider = row.value("provider").toString();
+      const qint64 checkedAt = row.value("checkedAt").toLongLong();
+      if (!url.isEmpty()) {
+        if (provider != QLatin1String("litterbox") || (now - checkedAt) <= kLitterboxTtlMs) {
+          if (lastTrack.value("id").toString() == trackId) {
+            lastTrack["rpcCoverUrl"] = url;
+            if (m_ready) sendCurrentActivity();
+          }
+          emit coverResolved(trackId, url);
+          return;
+        }
+      } else {
+        // skip repeating recent misses unless upload fallback got turned on since the last lookup
+        const bool canTryUpload = m_uploadCovers && provider != QLatin1String("upload-miss") &&
+                                  QFileInfo::exists(localArtPath(track.value("art").toString()));
+        if (!canTryUpload && (now - checkedAt) < kNegativeCacheTtlMs) return;
+      }
+    }
+  }
+
+  ++lookupGen;
+  const quint64 gen = lookupGen;
+  if (activeReply) {
+    activeReply->abort();
+    activeReply = nullptr;
+  }
+
+  const auto [artist, title] = normalizeQueryArtistTitle(track.value("title").toString(),
+                                                         track.value("artist").toString());
+  if (m_lookupCovers && !title.isEmpty()) {
+    startItunesLookup(gen, track, artist, title);
+  } else if (m_uploadCovers) {
+    startUploadFallback(gen, track);
+  }
+}
+
+void DiscordRpc::startItunesLookup(quint64 gen, const QVariantMap &track, const QString &artist,
+                                   const QString &title) {
+  QUrl url(m_itunesBaseUrl);
+  QUrlQuery q;
+  q.addQueryItem(QStringLiteral("term"), artist.isEmpty() ? title : (artist + QStringLiteral(" ") + title));
+  q.addQueryItem(QStringLiteral("media"), QStringLiteral("music"));
+  q.addQueryItem(QStringLiteral("entity"), QStringLiteral("song"));
+  q.addQueryItem(QStringLiteral("limit"), QStringLiteral("5"));
+  url.setQuery(q);
+
+  QNetworkRequest req(url);
+  req.setHeader(QNetworkRequest::UserAgentHeader, QStringLiteral("SillyPlayer/1.2"));
+  req.setTransferTimeout(6000);
+  auto *reply = net.get(req);
+  activeReply = reply;
+  connect(reply, &QNetworkReply::finished, this, [this, reply, gen, track, artist, title] {
+    reply->deleteLater();
+    if (activeReply == reply) activeReply = nullptr;
+    if (m_closing || gen != lookupGen) return;
+    if (reply->error() == QNetworkReply::NoError) {
+      const QString cover = parseItunesCoverUrl(reply->readAll(), title, artist);
+      if (!cover.isEmpty()) {
+        finishCoverResolution(gen, track.value("id").toString(), cover, QStringLiteral("itunes"));
+        return;
+      }
+    }
+    startDeezerLookup(gen, track, artist, title);
+  });
+}
+
+void DiscordRpc::startDeezerLookup(quint64 gen, const QVariantMap &track, const QString &artist,
+                                   const QString &title) {
+  QUrl url(m_deezerBaseUrl);
+  QUrlQuery q;
+  q.addQueryItem(QStringLiteral("q"), artist.isEmpty() ? title : (artist + QStringLiteral(" ") + title));
+  q.addQueryItem(QStringLiteral("limit"), QStringLiteral("5"));
+  url.setQuery(q);
+
+  QNetworkRequest req(url);
+  req.setHeader(QNetworkRequest::UserAgentHeader, QStringLiteral("SillyPlayer/1.2"));
+  req.setTransferTimeout(6000);
+  auto *reply = net.get(req);
+  activeReply = reply;
+  connect(reply, &QNetworkReply::finished, this, [this, reply, gen, track, artist, title] {
+    reply->deleteLater();
+    if (activeReply == reply) activeReply = nullptr;
+    if (m_closing || gen != lookupGen) return;
+    if (reply->error() == QNetworkReply::NoError) {
+      const QString cover = parseDeezerCoverUrl(reply->readAll(), title, artist);
+      if (!cover.isEmpty()) {
+        finishCoverResolution(gen, track.value("id").toString(), cover, QStringLiteral("deezer"));
+        return;
+      }
+    }
+    if (m_uploadCovers) {
+      startUploadFallback(gen, track);
+    } else {
+      finishCoverResolution(gen, track.value("id").toString(), QString(), QStringLiteral("lookup-miss"));
+    }
+  });
+}
+
+void DiscordRpc::startUploadFallback(quint64 gen, const QVariantMap &track) {
+  const QString trackId = track.value("id").toString();
+  const QString path = localArtPath(track.value("art").toString());
+  if (path.isEmpty() || !QFileInfo::exists(path)) {
+    finishCoverResolution(gen, trackId, QString(), QStringLiteral("upload-miss"));
+    return;
+  }
+  QImage img(path);
+  if (img.isNull()) {
+    finishCoverResolution(gen, trackId, QString(), QStringLiteral("upload-miss"));
+    return;
+  }
+  QByteArray jpeg;
+  QBuffer buf(&jpeg);
+  buf.open(QIODevice::WriteOnly);
+  img.scaled(512, 512, Qt::KeepAspectRatio, Qt::SmoothTransformation).save(&buf, "JPG", 85);
+  if (jpeg.isEmpty()) {
+    finishCoverResolution(gen, trackId, QString(), QStringLiteral("upload-miss"));
+    return;
+  }
+
+  auto *multi = new QHttpMultiPart(QHttpMultiPart::FormDataType);
+  QHttpPart reqType;
+  reqType.setHeader(QNetworkRequest::ContentDispositionHeader, QVariant("form-data; name=\"reqtype\""));
+  reqType.setBody("fileupload");
+  multi->append(reqType);
+
+  QHttpPart expiry;
+  expiry.setHeader(QNetworkRequest::ContentDispositionHeader, QVariant("form-data; name=\"time\""));
+  expiry.setBody("72h");
+  multi->append(expiry);
+
+  QHttpPart filePart;
+  filePart.setHeader(QNetworkRequest::ContentTypeHeader, QVariant("image/jpeg"));
+  filePart.setHeader(QNetworkRequest::ContentDispositionHeader,
+                     QVariant("form-data; name=\"fileToUpload\"; filename=\"cover.jpg\""));
+  filePart.setBody(jpeg);
+  multi->append(filePart);
+
+  QNetworkRequest req{QUrl(m_uploadBaseUrl)};
+  req.setHeader(QNetworkRequest::UserAgentHeader, QStringLiteral("SillyPlayer/1.2"));
+  req.setTransferTimeout(10000);
+  auto *reply = net.post(req, multi);
+  multi->setParent(reply);
+  activeReply = reply;
+  connect(reply, &QNetworkReply::finished, this, [this, reply, gen, trackId] {
+    reply->deleteLater();
+    if (activeReply == reply) activeReply = nullptr;
+    if (m_closing || gen != lookupGen) return;
+    QString uploaded;
+    if (reply->error() == QNetworkReply::NoError) {
+      const QString body = QString::fromUtf8(reply->readAll()).trimmed();
+      if (body.startsWith(QLatin1String("https://"), Qt::CaseInsensitive) ||
+          body.startsWith(QLatin1String("http://"), Qt::CaseInsensitive)) {
+        uploaded = body;
+      }
+    }
+    finishCoverResolution(gen, trackId, uploaded,
+                          uploaded.isEmpty() ? QStringLiteral("upload-miss") : QStringLiteral("litterbox"));
+  });
+}
+
+void DiscordRpc::finishCoverResolution(quint64 gen, const QString &trackId, const QString &url,
+                                       const QString &provider) {
+  if (m_closing || gen != lookupGen || trackId.isEmpty()) return;
+  storeCachedCover(trackId, url, provider);
+  if (!url.isEmpty()) {
+    if (lastTrack.value("id").toString() == trackId) {
+      lastTrack["rpcCoverUrl"] = url;
+      if (m_ready) sendCurrentActivity();
+    }
+    emit coverResolved(trackId, url);
+  }
+}
+
 void DiscordRpc::updatePresence(const QVariantMap &track, bool playing,
                                 double positionSec, double durationSec) {
   lastTrack = track;
+  const QString trackId = lastTrack.value("id").toString().trimmed();
+  if (!hasDirectCoverSource(lastTrack) && !trackId.isEmpty()) {
+    const QString cached = cachedCoverUrl(trackId);
+    if (!cached.isEmpty()) lastTrack["rpcCoverUrl"] = cached;
+  }
   lastPlaying = playing;
   lastPosition = positionSec;
   lastDuration = durationSec;
-  hasActivity = !track.value("title").toString().trimmed().isEmpty();
+  hasActivity = !lastTrack.value("title").toString().trimmed().isEmpty();
   if (!m_enabled || !m_ready)
     return;
   sendCurrentActivity();
+  if (hasActivity && !hasDirectCoverSource(lastTrack)) {
+    resolveCoverNow(lastTrack);
+  }
 }
 
 void DiscordRpc::clearPresence() {
+  ++lookupGen;
+  if (activeReply) { activeReply->abort(); activeReply = nullptr; }
   lastTrack.clear();
   lastPlaying = false;
   lastPosition = 0.0;
@@ -247,6 +638,8 @@ void DiscordRpc::shutdown() {
   if (m_closing)
     return;
   m_closing = true;
+  ++lookupGen;
+  if (activeReply) { activeReply->abort(); activeReply = nullptr; }
   reconnectTimer.stop();
   if (m_ready) {
     clearPresence();
@@ -350,36 +743,31 @@ void DiscordRpc::onReadyRead() {
       disconnectSocket();
       return;
     }
-    if (readBuffer.size() < 8 + qsizetype(len))
+    if (quint32(readBuffer.size()) < 8 + len)
       return;
-    const QByteArray body = readBuffer.mid(8, qsizetype(len));
-    readBuffer.remove(0, 8 + qsizetype(len));
+    const QByteArray payload = readBuffer.mid(8, len);
+    readBuffer.remove(0, 8 + len);
 
     if (op == kOpPing) {
-      socket.write(encodeFrame(kOpPong, body));
+      QByteArray pong = encodeFrame(kOpPong, payload);
+      socket.write(pong);
       socket.flush();
       continue;
     }
     if (op == kOpClose) {
-      const auto msg = QJsonDocument::fromJson(body).object().value("message").toString();
       disconnectSocket();
-      setStatus(msg.isEmpty() ? QStringLiteral("Waiting for Discord")
-                              : QStringLiteral("Discord: ") + msg);
       return;
     }
     if (op == kOpFrame) {
-      const auto obj = QJsonDocument::fromJson(body).object();
-      const QString evt = obj.value("evt").toString();
-      if (evt == "READY") {
+      const auto obj = QJsonDocument::fromJson(payload).object();
+      if (obj.value("evt").toString() == "READY") {
         m_ready = true;
         reconnectTimer.stop();
-        setStatus("Connected to Discord");
-        if (hasActivity)
+        setStatus("Connected");
+        if (hasActivity) {
           sendCurrentActivity();
-      } else if (evt == "ERROR") {
-        const QString msg = obj.value("data").toObject().value("message").toString();
-        if (!msg.isEmpty())
-          setStatus("Discord: " + msg);
+          if (!hasDirectCoverSource(lastTrack)) resolveCoverNow(lastTrack);
+        }
       }
     }
   }

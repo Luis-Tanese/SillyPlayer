@@ -13,6 +13,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.*
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import org.schabi.newpipe.extractor.NewPipe
 import org.schabi.newpipe.extractor.Page
@@ -42,6 +43,35 @@ fun provider(url: String): String {
         "m.soundcloud.com",
         "on.soundcloud.com" -> "soundcloud"
         else -> "direct"
+    }
+}
+
+private val youtubeHosts = setOf("youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be")
+private val youtubeVideoIdRegex = Regex("^[A-Za-z0-9_-]{11}$")
+private val youtubeListIdRegex = Regex("^[A-Za-z0-9_-]{2,200}$")
+
+// canonicalize youtube music and share links so tracking params dont interfere with playlist extraction
+internal fun normalizeYoutubeCollectionUrl(raw: String): String {
+    val parsed = raw.trim().toHttpUrlOrNull() ?: return raw.trim()
+    val host = parsed.host.lowercase()
+    if (host !in youtubeHosts) return raw.trim()
+    val list = parsed.queryParameter("list")?.trim().orEmpty()
+    if (!youtubeListIdRegex.matches(list)) return raw.trim()
+    val path = parsed.encodedPath.trimEnd('/').ifEmpty { "/" }
+    if (host != "youtu.be" && path != "/watch" && path != "/playlist") return raw.trim()
+    val video = if (host == "youtu.be") parsed.pathSegments.firstOrNull().orEmpty() else parsed.queryParameter("v").orEmpty()
+    val isSeedMix = youtubeVideoIdRegex.matches(video) && list.startsWith("RD")
+    return if (isSeedMix) {
+        "https://www.youtube.com/watch".toHttpUrl().newBuilder()
+            .addQueryParameter("v", video)
+            .addQueryParameter("list", list)
+            .build()
+            .toString()
+    } else {
+        "https://www.youtube.com/playlist".toHttpUrl().newBuilder()
+            .addQueryParameter("list", list)
+            .build()
+            .toString()
     }
 }
 
@@ -159,7 +189,7 @@ class OnlineRepository(private val g: Graph) {
                         dev.sillyplayer.online.provider(q) == "youtube" &&
                             !Uri.parse(q).getQueryParameter("list").isNullOrBlank()
                     ) {
-                        loadCollection(q)
+                        loadCollection(normalizeYoutubeCollectionUrl(q))
                         return@launch
                     }
                     play(
@@ -374,19 +404,20 @@ class OnlineRepository(private val g: Graph) {
     }
 
     fun loadCollection(url: String, more: Boolean = false) {
+        val targetUrl = if (more) url else normalizeYoutubeCollectionUrl(url)
         collectionRequest?.cancel()
         collectionRequest =
             g.scope.launch {
                 val old = collection.value ?: CollectionState()
                 collection.value =
                     if (more) old.copy(loading = true, message = "")
-                    else CollectionState(url = url, loading = true)
+                    else CollectionState(url = targetUrl, loading = true)
                 try {
-                    require(provider(url) == "youtube") { "Use a YouTube playlist or mix link" }
+                    require(provider(targetUrl) == "youtube") { "Use a YouTube playlist or mix link" }
                     val svc = service("youtube")
-                    val info = if (!more) transport.lookup { PlaylistInfo.getInfo(svc, url) } else null
+                    val info = if (!more) transport.lookup { PlaylistInfo.getInfo(svc, targetUrl) } else null
                     val page =
-                        if (more) transport.lookup { PlaylistInfo.getMoreItems(svc, url, collectionPage) } else null
+                        if (more) transport.lookup { PlaylistInfo.getMoreItems(svc, targetUrl, collectionPage) } else null
                     val rows = (page?.items ?: info!!.relatedItems).map { row(it, "youtube") }
                     ensureActive()
                     val start = if (more) old.rows.size else 0
@@ -394,14 +425,14 @@ class OnlineRepository(private val g: Graph) {
                     collectionPage = page?.nextPage ?: info?.nextPage
                     collection.value =
                         CollectionState(
-                            url,
+                            targetUrl,
                             info?.name ?: old.title,
                             combined,
                             if (more) old.selected
                             else rows.indices.filter { rows[it].playable }.toSet(),
                             false,
                             Page.isValid(collectionPage),
-                            if (Uri.parse(url).getQueryParameter("list")?.startsWith("RD") == true)
+                            if (Uri.parse(targetUrl).getQueryParameter("list")?.startsWith("RD") == true)
                                 "Mix snapshot: YouTube may change its contents"
                             else "",
                         )

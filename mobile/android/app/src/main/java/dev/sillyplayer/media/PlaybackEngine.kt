@@ -113,6 +113,8 @@ class PlaybackEngine(private val g: Graph) {
     private var fadeGain = 1f
     private var transitionGain = 1f
     private var transitionFadeJob: Job? = null
+    private var transitionFadeOutJob: Job? = null
+    private var fadeOutScheduledFor: String? = null
     private var crossfadeMs = 0
     private var smartShuffle = false
     private var lastPlayedByTrack: Map<String, Long> = emptyMap()
@@ -133,6 +135,7 @@ class PlaybackEngine(private val g: Graph) {
     private var countedQualified = false
     private var prefsMaster = 100f
     private var prefsOnline = 100f
+    private var pendingAutoFadeIn = false
 
     init {
         player.addListener(
@@ -146,16 +149,21 @@ class PlaybackEngine(private val g: Graph) {
                                 reason == Player.MEDIA_ITEM_TRANSITION_REASON_REPEAT
                         )
                             startListening()
+                        val autoBoundary = pendingAutoFadeIn
+                        pendingAutoFadeIn = false
+                        // also fade in when advancing across a modifier boundary where seekTo replaced auto transition (playWhenReady is still false during seekTo)
                         if (
                             crossfadeMs > 0 &&
-                                player.playWhenReady &&
-                                (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO ||
-                                    reason == Player.MEDIA_ITEM_TRANSITION_REASON_REPEAT)
+                                (autoBoundary ||
+                                    (player.playWhenReady &&
+                                        (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO ||
+                                            reason == Player.MEDIA_ITEM_TRANSITION_REASON_REPEAT)))
                         ) {
                             startTransitionFadeIn()
                         } else {
                             resetTransitionFade()
                         }
+                        scheduleTransitionFadeOut(force = true)
                     }
                     applyTrack()
                     refreshQueueOrder()
@@ -166,7 +174,7 @@ class PlaybackEngine(private val g: Graph) {
                 override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
                     if (!playWhenReady && reason == Player.PLAY_WHEN_READY_CHANGE_REASON_END_OF_MEDIA_ITEM && owner == "music") {
                         val index = if (mode == 1) player.currentMediaItemIndex else player.nextMediaItemIndex
-                        if (index in local.entries.indices) selectMusic(index, 0, true)
+                        if (index in local.entries.indices) selectMusic(index, 0, true, fadeIn = crossfadeMs > 0)
                     }
                 }
 
@@ -174,6 +182,12 @@ class PlaybackEngine(private val g: Graph) {
                     accountListening()
                     listeningRunning = isPlaying && owner == "music"
                     advancing.value = isPlaying
+                    if (isPlaying) scheduleTransitionFadeOut(force = true)
+                    else {
+                        transitionFadeOutJob?.cancel()
+                        transitionFadeOutJob = null
+                        fadeOutScheduledFor = null
+                    }
                     if (!isPlaying) checkpoint()
                 }
 
@@ -187,6 +201,9 @@ class PlaybackEngine(private val g: Graph) {
                             g.task { g.prefs.update { it.copy(mode = actualMode) } }
                         }
                         if (refreshQueueOrder() && ready.isCompleted) save()
+                    }
+                    if (events.containsAny(Player.EVENT_TIMELINE_CHANGED, Player.EVENT_PLAYBACK_STATE_CHANGED, Player.EVENT_PLAYBACK_PARAMETERS_CHANGED)) {
+                        scheduleTransitionFadeOut()
                     }
                     updateTransitionBoundary()
                     publish()
@@ -266,8 +283,12 @@ class PlaybackEngine(private val g: Graph) {
                     refreshQueueOrder()
                     save()
                 }
-                crossfadeMs = p.crossfadeMs.coerceIn(0, 8000)
-                if (crossfadeMs == 0) resetTransitionFade()
+                val newCrossfade = p.crossfadeMs.coerceIn(0, 8000)
+                if (newCrossfade != crossfadeMs) {
+                    crossfadeMs = newCrossfade
+                    if (crossfadeMs == 0) resetTransitionFade()
+                    else scheduleTransitionFadeOut(force = true)
+                }
                 if (duckAudio != p.duckAudio) {
                     duckAudio = p.duckAudio
                     // Media3 ducks AUDIO_CONTENT_TYPE_MUSIC on transient notifications and pauses AUDIO_CONTENT_TYPE_SPEECH instead of ducking
@@ -428,23 +449,27 @@ class PlaybackEngine(private val g: Graph) {
             )
             .build()
 
-    private fun writeVolume() {
+    private fun writeVolume(trackOverride: Track? = null) {
+        val active = trackOverride ?: currentTrack()
         val gain =
             songOutputGain(
                 if (owner == "music") master else onlineVolume,
-                previewGain?.takeIf { it.first == currentTrack()?.id }?.second
-                    ?: currentTrack()?.volumePercent
+                previewGain?.takeIf { it.first == active?.id }?.second
+                    ?: active?.volumePercent
                     ?: 100f,
             )
-        // ExoPlayer's volume is limited to 0..1
-        // apply only the excess boost to PCM, after combining both saved sliders, so attenuation doesn't clip prematurely
-        eq.signalGain = gain.coerceAtLeast(1f)
-        player.volume = gain.coerceAtMost(1f) * fadeGain * transitionGain
+        // scale total gain before splitting into pcm boost + exoplayer volume so fades stay smooth above 100%
+        val output = (gain * fadeGain * transitionGain).coerceAtLeast(0f)
+        eq.signalGain = output.coerceAtLeast(1f)
+        player.volume = output.coerceAtMost(1f)
     }
 
     private fun resetTransitionFade() {
         transitionFadeJob?.cancel()
         transitionFadeJob = null
+        transitionFadeOutJob?.cancel()
+        transitionFadeOutJob = null
+        fadeOutScheduledFor = null
         if (transitionGain != 1f) {
             transitionGain = 1f
             writeVolume()
@@ -461,10 +486,11 @@ class PlaybackEngine(private val g: Graph) {
                 val start = SystemClock.elapsedRealtime()
                 while (isActive) {
                     val elapsed = SystemClock.elapsedRealtime() - start
-                    transitionGain = (elapsed.toFloat() / halfFade).coerceIn(0f, 1f)
+                    // use perceptual curve so fade-in starts gentle instead of snapping loud
+                    transitionGain = perceptualFadeGain(elapsed.toFloat() / halfFade)
                     writeVolume()
                     if (elapsed >= halfFade) break
-                    delay(24)
+                    delay(20)
                 }
                 transitionGain = 1f
                 transitionFadeJob = null
@@ -472,24 +498,64 @@ class PlaybackEngine(private val g: Graph) {
             }
     }
 
-    private fun updateTransitionFadeOut() {
+    // schedule a dedicated 20ms fade-out coroutine instead of relying on the 250ms/15s background tick loop
+    private fun scheduleTransitionFadeOut(force: Boolean = false) {
         if (owner != "music" || crossfadeMs <= 0 || !player.isPlaying) {
-            if (transitionFadeJob == null && transitionGain != 1f) resetTransitionFade()
+            transitionFadeOutJob?.cancel()
+            transitionFadeOutJob = null
+            fadeOutScheduledFor = null
             return
         }
         val duration = player.duration
         if (duration <= crossfadeMs) return
+        val mediaId = player.currentMediaItem?.mediaId ?: return
+        val speed = player.playbackParameters.speed.coerceIn(0.5f, 2f)
+        val key = "$mediaId:$duration:$crossfadeMs:$speed"
+        if (!force && fadeOutScheduledFor == key && transitionFadeOutJob?.isActive == true) return
+        transitionFadeOutJob?.cancel()
+        fadeOutScheduledFor = key
         val halfFade = (crossfadeMs / 2).coerceIn(250, 4000)
-        val remaining = duration - player.currentPosition
-        if (remaining in 1..halfFade.toLong()) {
-            transitionFadeJob?.cancel()
-            transitionFadeJob = null
-            transitionGain = (remaining.toFloat() / halfFade).coerceIn(0f, 1f)
-            writeVolume()
-        } else if (transitionFadeJob == null && transitionGain != 1f) {
-            transitionGain = 1f
-            writeVolume()
+        val remainingMediaMs = (duration - player.currentPosition).coerceAtLeast(0L)
+        val remainingWallMs = (remainingMediaMs / speed).toLong()
+        val waitMs = (remainingWallMs - halfFade).coerceAtLeast(0L)
+        transitionFadeOutJob =
+            scope.launch {
+                if (waitMs > 0L) delay(waitMs)
+                while (isActive) {
+                    if (owner != "music" || crossfadeMs <= 0 || !player.isPlaying) break
+                    if (player.currentMediaItem?.mediaId != mediaId) break
+                    val dur = player.duration
+                    if (dur <= crossfadeMs) break
+                    val curSpeed = player.playbackParameters.speed.coerceIn(0.5f, 2f)
+                    val remWall = ((dur - player.currentPosition).coerceAtLeast(0L) / curSpeed)
+                    if (remWall > halfFade + 80f) {
+                        // user sought backwards or playback stalled; sleep until the fade window again
+                        if (transitionFadeJob == null && transitionGain != 1f) {
+                            transitionGain = 1f
+                            writeVolume()
+                        }
+                        delay((remWall - halfFade).toLong().coerceAtLeast(24L))
+                        continue
+                    }
+                    transitionFadeJob?.cancel()
+                    transitionFadeJob = null
+                    // stay at 0f right through track end so the next song never blasts before onMediaItemTransition
+                    transitionGain = perceptualFadeGain(remWall / halfFade)
+                    writeVolume()
+                    if (remWall <= 0f) break
+                    delay(20)
+                }
+                transitionFadeOutJob = null
+            }
+    }
+
+    private fun updateTransitionFadeOut() {
+        if (owner != "music" || crossfadeMs <= 0 || !player.isPlaying) {
+            if (transitionFadeJob == null && transitionFadeOutJob == null && !pendingAutoFadeIn && transitionGain != 1f)
+                resetTransitionFade()
+            return
         }
+        scheduleTransitionFadeOut()
     }
 
     private fun applyTrack() {
@@ -512,15 +578,41 @@ class PlaybackEngine(private val g: Graph) {
             (current.speed != next.speed || current.nightcore != next.nightcore || current.volumePercent != next.volumePercent))
     }
 
-    private fun selectMusic(index: Int, position: Long, play: Boolean) {
+    private fun selectMusic(index: Int, position: Long, play: Boolean, fadeIn: Boolean = false) {
         val track = local.entries.getOrNull(index)?.track ?: return
+        val prevTrack = currentTrack()
+        val targetParams = PlaybackParameters(track.speed, if (track.nightcore) track.speed else 1f)
+        val modifierChanged =
+            player.playbackParameters != targetParams ||
+                (prevTrack != null &&
+                    (prevTrack.speed != track.speed ||
+                        prevTrack.nightcore != track.nightcore ||
+                        prevTrack.volumePercent != track.volumePercent))
         player.pause()
-        resetFade()
+        fade?.cancel()
+        fade = null
+        fadeGain = 1f
+        transitionFadeJob?.cancel()
+        transitionFadeJob = null
+        transitionFadeOutJob?.cancel()
+        transitionFadeOutJob = null
+        fadeOutScheduledFor = null
+        pendingAutoFadeIn = fadeIn
+        transitionGain = if (fadeIn && crossfadeMs > 0) 0f else 1f
+        // full stop+prepare when speed, pitch, or song volume changed so SonicAudioProcessor and AudioTrack flush completely before the next song starts
+        if (modifierChanged) {
+            player.stop()
+        }
         applyParameters(track)
+        writeVolume(track)
         player.seekTo(index, position)
-        applyTrack()
         if (player.playbackState == Player.STATE_IDLE) player.prepare()
         player.playWhenReady = play
+        if (pendingAutoFadeIn && play && crossfadeMs > 0) {
+            pendingAutoFadeIn = false
+            startTransitionFadeIn()
+        }
+        updateTransitionBoundary()
         publish()
     }
 
@@ -573,8 +665,7 @@ class PlaybackEngine(private val g: Graph) {
                     val start = SystemClock.elapsedRealtime()
                     while (SystemClock.elapsedRealtime() - start < duration) {
                         fadeGain =
-                            (1f - (SystemClock.elapsedRealtime() - start).toFloat() / duration)
-                                .coerceIn(0f, 1f)
+                            perceptualFadeGain(1f - (SystemClock.elapsedRealtime() - start).toFloat() / duration)
                         writeVolume()
                         delay(16)
                     }
@@ -595,8 +686,9 @@ class PlaybackEngine(private val g: Graph) {
         if (owner != "music") {
             saveOnline()
             restoreLocal(true)
-        } else if (player.playWhenReady) pause()
+        } else if (player.playWhenReady && fade == null) pause()
         else {
+            // tapping play during a pause fade cancels the fade and resumes right away
             resetFade()
             if (player.playbackState == Player.STATE_IDLE) player.prepare()
             player.play()
@@ -606,7 +698,7 @@ class PlaybackEngine(private val g: Graph) {
     fun toggleOnline() {
         if (owner != "online") {
             online?.let { startOnline(it, onlinePosition) }
-        } else if (player.playWhenReady) pause()
+        } else if (player.playWhenReady && fade == null) pause()
         else {
             resetFade()
             if (player.playbackState == Player.STATE_IDLE) player.prepare()
@@ -651,7 +743,10 @@ class PlaybackEngine(private val g: Graph) {
         )
         val index = local.index.coerceIn(local.entries.indices)
         val savedShuffle = local.shuffleOrder
-        applyParameters(local.entries[index].track)
+        val targetTrack = local.entries[index].track
+        player.stop()
+        applyParameters(targetTrack)
+        writeVolume(targetTrack)
         changingQueue = true
         try {
             player.setMediaItems(local.entries.map(::item), index, local.position)
@@ -659,8 +754,12 @@ class PlaybackEngine(private val g: Graph) {
         } finally { changingQueue = false }
         refreshQueueOrder()
         player.prepare()
-        applyTrack()
+        updateTransitionBoundary()
         player.playWhenReady = play
+        if (pendingAutoFadeIn && play && crossfadeMs > 0) {
+            pendingAutoFadeIn = false
+            startTransitionFadeIn()
+        }
         publish()
     }
 
@@ -740,8 +839,8 @@ class PlaybackEngine(private val g: Graph) {
     }
 
     fun next() {
-        resetFade()
         if (owner != "music") {
+            resetFade()
             restoreLocal(false)
         }
         val next = player.nextMediaItemIndex.takeIf { it >= 0 } ?: 0
@@ -749,8 +848,10 @@ class PlaybackEngine(private val g: Graph) {
     }
 
     fun previous() {
-        resetFade()
-        if (owner != "music") restoreLocal(false)
+        if (owner != "music") {
+            resetFade()
+            restoreLocal(false)
+        }
         val previous = if (player.currentPosition > 3000) player.currentMediaItemIndex
             else player.previousMediaItemIndex.takeIf { it >= 0 } ?: player.currentMediaItemIndex
         selectMusic(previous, 0, true)
@@ -773,6 +874,7 @@ class PlaybackEngine(private val g: Graph) {
         if (player.duration <= 0) return
         resetTransitionFade()
         player.seekTo(position.coerceIn(0, player.duration))
+        scheduleTransitionFadeOut(force = true)
         publish()
     }
 
@@ -825,8 +927,10 @@ class PlaybackEngine(private val g: Graph) {
         if (owner == "music") {
             currentTrack()?.let { track ->
                 player.playbackParameters = PlaybackParameters(track.speed, if (track.nightcore) track.speed else 1f)
-                writeVolume()
+                writeVolume(track)
             }
+            // re-arm modifier boundary pause immediately when speed, nightcore, or volume changes on any queued song
+            updateTransitionBoundary()
         }
         publish()
         save()

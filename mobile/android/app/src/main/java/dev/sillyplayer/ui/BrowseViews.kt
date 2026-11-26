@@ -307,18 +307,21 @@ fun BrowseScreen(g: Graph, pickers: Pickers) {
         }
     }
     if (collectionInput)
-        AlertDialog(
+        AppModalDialog(
             onDismissRequest = { collectionInput = false },
-            title = { Text("YouTube playlist / mix") },
-            text = { Input(collectionUrl, { collectionUrl = it }, "Playlist or mix URL") },
-            confirmButton = {
-                Action("Load", enabled = collectionUrl.isNotBlank()) {
+            title = "YouTube playlist / mix",
+            subtitle = "Paste a YouTube or YouTube Music playlist link",
+            icon = "list-music",
+            actions = {
+                ModalTonalButton("Cancel") { collectionInput = false }
+                ModalPrimaryButton("Load", icon = "download", enabled = collectionUrl.isNotBlank()) {
                     g.online.loadCollection(collectionUrl)
                     collectionInput = false
                 }
             },
-            dismissButton = { Action("Cancel") { collectionInput = false } },
-        )
+        ) {
+            Input(collectionUrl, { collectionUrl = it }, "Playlist or mix URL")
+        }
     if (collection != null) CollectionDownloadDialog(g, pickers)
     downloading?.let { source -> DownloadDialog(g, pickers, source) { downloading = null } }
 }
@@ -339,37 +342,14 @@ fun DownloadDialog(g: Graph, pickers: Pickers, source: Source, onDismiss: () -> 
             // format information is optional here, the worker reports download errors
         }
     }
-    AlertDialog(
+    AppModalDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Download") },
-        text = {
-            Column {
-                Text(source.title, maxLines = 3, overflow = TextOverflow.Ellipsis)
-                PickMenu(
-                    kind,
-                    if (source.provider == "direct") listOf("Original")
-                    else listOf("Original", "MP3"),
-                ) {
-                    kind = it
-                }
-                Hint(
-                    info?.let {
-                        "Best source audio" +
-                            (if (it.bitrate > 0) " · ${it.bitrate} kbps" else "") +
-                            " · " +
-                            it.suffix.uppercase()
-                    } ?: "Best available source audio"
-                )
-                Hint(
-                    if (kind == "MP3") "MP3 encoding does not improve source quality."
-                    else "Keeps the original source audio format."
-                )
-                Hint(prefs.musicDir.ifBlank { "No download folder selected" })
-                Action("Choose folder", "folder") { pickers.folder("destination") }
-            }
-        },
-        confirmButton = {
-            Action("Download", enabled = prefs.musicDir.isNotBlank()) {
+        title = "Download audio",
+        subtitle = source.title,
+        icon = "download",
+        actions = {
+            ModalTonalButton("Cancel", onClick = onDismiss)
+            ModalPrimaryButton("Download", icon = "download", enabled = prefs.musicDir.isNotBlank()) {
                 val existing =
                     jobs.firstOrNull {
                         it.url == source.url && it.kind == kind && it.state == "Completed"
@@ -381,38 +361,70 @@ fun DownloadDialog(g: Graph, pickers: Pickers, source: Source, onDismiss: () -> 
                 }
             }
         },
-        dismissButton = { Action("Cancel") { onDismiss() } },
-    )
+    ) {
+        ModalSectionCard {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text("Format", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.weight(1f))
+                PickMenu(
+                    kind,
+                    if (source.provider == "direct") listOf("Original")
+                    else listOf("Original", "MP3"),
+                ) {
+                    kind = it
+                }
+            }
+            Text(
+                info?.let {
+                    "Best source audio" +
+                        (if (it.bitrate > 0) " · ${it.bitrate} kbps" else "") +
+                        " · " +
+                        it.suffix.uppercase()
+                } ?: if (kind == "MP3") "Converts best source audio to MP3" else "Keeps original source audio format",
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        ModalOptionRow(
+            title = "Download folder",
+            subtitle = prefs.musicDir.ifBlank { "No download folder selected — tap to choose" },
+            icon = "folder",
+            selected = prefs.musicDir.isNotBlank(),
+        ) {
+            pickers.folder("destination")
+        }
+    }
     duplicate?.let { job ->
-        AlertDialog(
+        AppModalDialog(
             onDismissRequest = { duplicate = null },
-            title = { Text("Already downloaded") },
-            text = { Text("Reuse the existing file, skip, or download another copy.") },
-            confirmButton = {
-                Action("Download again") {
+            title = "Already downloaded",
+            subtitle = source.title,
+            icon = "download",
+            actions = {
+                ModalTonalButton("Skip") {
+                    duplicate = null
+                    onDismiss()
+                }
+                ModalTonalButton("Open", icon = "external-link") {
+                    openFile(g, job.output)
+                    duplicate = null
+                    onDismiss()
+                }
+                ModalPrimaryButton("Download again", icon = "download") {
                     g.task { g.online.enqueue(source, kind, true) }
                     duplicate = null
                     onDismiss()
                 }
             },
-            dismissButton = {
-                Row {
-                    Action("Open") {
-                        openFile(g, job.output)
-                        duplicate = null
-                        onDismiss()
-                    }
-                    Action("Skip") {
-                        duplicate = null
-                        onDismiss()
-                    }
-                }
-            },
-        )
+        ) {
+            Text(
+                "Reuse the existing file, open it, or download another copy.",
+                fontSize = 13.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun CollectionDownloadDialog(g: Graph, pickers: Pickers) {
     val collection by g.online.collection.collectAsStateWithLifecycle()
@@ -424,83 +436,116 @@ private fun CollectionDownloadDialog(g: Graph, pickers: Pickers) {
     val prefs by g.prefs.state.collectAsStateWithLifecycle()
     LaunchedEffect(c.title) { if (name.isBlank()) name = c.title }
     val all = c.rows.indices.filter { c.rows[it].playable }.toSet()
-    ModalBottomSheet(onDismissRequest = { g.online.dismissCollection() }) {
-        Column(Modifier.fillMaxWidth().fillMaxHeight(.94f).padding(horizontal = 14.dp)) {
-            Text(
-                c.title.ifBlank { "YouTube playlist / mix" },
-                fontSize = 19.sp,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-            )
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Hint("${c.selected.size} selected · ${c.rows.size} loaded")
-                Spacer(Modifier.weight(1f))
-                Action(
-                    if (all.isNotEmpty() && c.selected == all) "Deselect all" else "Select all"
+    AppModalSheet(onDismissRequest = { g.online.dismissCollection() }) {
+        Column(
+            Modifier.fillMaxWidth().fillMaxHeight(.94f).padding(horizontal = 16.dp, vertical = 6.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Row(
+                Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        c.title.ifBlank { "YouTube playlist / mix" },
+                        fontSize = 17.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        "${c.selected.size} selected · ${c.rows.size} loaded",
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                ToolPillButton(
+                    if (all.isNotEmpty() && c.selected == all) "Deselect all" else "Select all",
+                    "list-checks",
+                    enabled = all.isNotEmpty(),
                 ) {
                     g.online.selectAll()
                 }
             }
-            LazyColumn(Modifier.weight(1f)) {
+            LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 itemsIndexed(c.rows, key = { i, s -> "$i:${s.id}" }) { i, source ->
-                    Row(
-                        Modifier.fillMaxWidth()
-                            .clickable(enabled = source.playable) { g.online.select(i) }
-                            .padding(vertical = 7.dp),
-                        verticalAlignment = Alignment.CenterVertically,
+                    val checked = i in c.selected
+                    Surface(
+                        onClick = { if (source.playable) g.online.select(i) },
+                        shape = RoundedCornerShape(10.dp),
+                        color = if (checked) MaterialTheme.colorScheme.primary.copy(alpha = 0.11f) else androidx.compose.ui.graphics.Color.Transparent,
+                        modifier = Modifier.fillMaxWidth(),
                     ) {
-                        Checkbox(i in c.selected, { g.online.select(i) }, enabled = source.playable)
-                        Artwork(source.thumbnail, 40, youtubeId = source.id)
-                        Spacer(Modifier.width(8.dp))
-                        Column(Modifier.weight(1f)) {
-                            Text(
-                                "${i+1}. ${source.title}",
-                                maxLines = 2,
-                                overflow = TextOverflow.Ellipsis,
-                                fontSize = 13.sp,
-                            )
-                            Hint(source.reason.ifBlank { source.uploader })
+                        Row(
+                            Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 7.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Checkbox(checked, { g.online.select(i) }, enabled = source.playable)
+                            Artwork(source.thumbnail, 40, youtubeId = source.id)
+                            Spacer(Modifier.width(10.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text(
+                                    "${i+1}. ${source.title}",
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis,
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.Medium,
+                                )
+                                Hint(source.reason.ifBlank { source.uploader })
+                            }
                         }
                     }
                 }
                 item {
                     if (c.loading) Progress("Loading playlist")
-                    if (c.more)
-                        Action("Load more", enabled = !c.loading) {
-                            g.online.loadCollection(c.url, true)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        if (c.more)
+                            ModalTonalButton("Load more", "plus", enabled = !c.loading) {
+                                g.online.loadCollection(c.url, true)
+                            }
+                        if (c.loading)
+                            ModalTonalButton("Cancel loading", "x") {
+                                g.online.cancelCollectionLoading()
+                            }
+                    }
+                    if (c.message.isNotBlank()) {
+                        ModalSectionCard {
+                            Text(c.message, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
-                    if (c.loading) Action("Cancel loading") { g.online.cancelCollectionLoading() }
-                    Hint(c.message)
+                    }
                 }
             }
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                PickMenu(kind, listOf("Original", "MP3")) { kind = it }
-                Hint("Best available source")
-                Spacer(Modifier.weight(1f))
-                Action("Folder", "folder") { pickers.folder("destination") }
-            }
-            if (kind != "Video") Choice("Create a local playlist", create) { create = it }
-            if (create) Input(name, { name = it }, "Playlist name")
-            Choice("Download completed songs again", again) { again = it }
-            Action(
-                if (create) "Download and create playlist"
-                else "Download ${c.selected.size} selected",
-                "download",
-                !c.loading &&
-                    c.selected.isNotEmpty() &&
-                    prefs.musicDir.isNotBlank() &&
-                    (!create || name.isNotBlank()),
-            ) {
-                g.task {
-                    g.online.enqueueCollection(
-                        kind,
-                        if (create && kind != "Video") name else null,
-                        again,
-                    )
+            ModalSectionCard {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    PickMenu(kind, listOf("Original", "MP3")) { kind = it }
+                    Text("Best available source", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.weight(1f))
+                    ToolPillButton("Folder", "folder") { pickers.folder("destination") }
+                }
+                if (kind != "Video") Choice("Create a local playlist", create) { create = it }
+                if (create) Input(name, { name = it }, "Playlist name")
+                Choice("Download completed songs again", again) { again = it }
+                ModalPrimaryButton(
+                    label = if (create) "Download & create playlist" else "Download ${c.selected.size} selected",
+                    icon = "download",
+                    enabled =
+                        !c.loading &&
+                            c.selected.isNotEmpty() &&
+                            prefs.musicDir.isNotBlank() &&
+                            (!create || name.isNotBlank()),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    g.task {
+                        g.online.enqueueCollection(
+                            kind,
+                            if (create && kind != "Video") name else null,
+                            again,
+                        )
+                    }
                 }
             }
             if (prefs.musicDir.isBlank()) Hint("Choose a download folder first")
-            Spacer(Modifier.height(12.dp))
+            Spacer(Modifier.height(8.dp))
         }
     }
 }

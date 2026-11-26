@@ -64,6 +64,9 @@ public:
   Q_INVOKABLE void clearCompleted();
   Q_INVOKABLE void removeJob(const QString &id);
   Q_INVOKABLE void clearFailed();
+  Q_INVOKABLE QString streamQualityLabel(const QVariantMap &details) const;
+  Q_INVOKABLE QVariantMap repairDownloadedSongs();
+  void resetJobs();
   void shutdown();
   static QString tool(const QString &name);
   static QVariantMap normalizeResult(QVariantMap result);

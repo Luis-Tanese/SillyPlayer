@@ -57,6 +57,10 @@ public:
   static constexpr quint16 kDiscoveryPort = 43818;
   static QByteArray discoveryReplyPayload(const QString &deviceId, const QString &name,
                                           quint16 port, const QString &fingerprint);
+  static QVariantList mergeEqPresets(const QVariantList &local, const QVariantList &remote);
+  static QVariantMap mergeEqState(const QVariantMap &local, const QVariantMap &remote,
+                                  const QVariantList &mergedPresets);
+  void resetLocalState();
   QVariantMap exchange(const QString &peer, const QVariantList &operations);
   QVariantMap changes(qint64 cursor, int limit = 200) const;
   void markDirty();
@@ -64,6 +68,7 @@ public:
 signals:
   void changed();
   void applied();
+  void presetsChanged();
   void aboutToApply();
   void resolutionProgressChanged();
   void fileReceived(const QString &path, const QVariantMap &source);

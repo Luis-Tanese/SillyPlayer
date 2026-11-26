@@ -28,6 +28,7 @@ public:
   void remapTracks(const QVariantMap &ids);
   void shutdown();
   void reload();
+  void resetState();
 signals:
   void summaryChanged();
   void rankingsChanged();

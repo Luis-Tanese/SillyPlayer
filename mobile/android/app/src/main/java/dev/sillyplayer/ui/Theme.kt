@@ -5,6 +5,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.unit.dp
 import dev.sillyplayer.data.Preferences
 
@@ -38,43 +39,82 @@ val Palettes = linkedMapOf(
     "Sublime Snazzy" to listOf("282a36", "222430", "44475a", "eff0eb", "a5a6ac", "ff6ac1", "ffffff", "f6f8fa", "e5e9ef", "24292e", "586069", "0366d6"),
     "Two Dark" to listOf("282c34", "21252b", "3e4451", "abb2bf", "9da5b4", "c678dd", "ffffff", "f6f8fa", "e5e9ef", "24292e", "586069", "0366d6"),
     "Zenburn" to listOf("3f3f3f", "333333", "505050", "dcdccc", "b0b09b", "f0dfaf", "ffffff", "f6f8fa", "e5e9ef", "24292e", "586069", "0366d6"),
-    "Catppuccin Latte" to listOf("1e1e2e", "181825", "313244", "cdd6f4", "a6adc8", "cba6f7", "eff1f5", "e6e9ef", "ccd0da", "4c4f69", "6c6f85", "8839ef"),
-    "Catppuccin Mocha" to listOf("1e1e2e", "181825", "313244", "cdd6f4", "a6adc8", "cba6f7", "eff1f5", "e6e9ef", "ccd0da", "4c4f69", "6c6f85", "8839ef"),
-    "Base16 Ocean Light" to listOf("2b303b", "232833", "4f5b66", "c0c5ce", "a7adba", "8fa1b3", "ffffff", "f6f8fa", "e5e9ef", "24292e", "586069", "0366d6"),
-    "Coldark Cold" to listOf("111b27", "0b141f", "213043", "e3eaf2", "8da1b9", "66b3ff", "ffffff", "f6f8fa", "e5e9ef", "24292e", "586069", "0366d6"),
-    "Coldark Dark" to listOf("111b27", "0b141f", "213043", "e3eaf2", "8da1b9", "66b3ff", "ffffff", "f6f8fa", "e5e9ef", "24292e", "586069", "0366d6"),
-    "Gruvbox Dark" to listOf("282828", "1d2021", "3c3836", "ebdbb2", "bdae93", "d8a657", "fbf1c7", "f2e5bc", "ebdbb2", "3c3836", "665c54", "9d5b16"),
-    "Gruvbox Light" to listOf("282828", "1d2021", "3c3836", "ebdbb2", "bdae93", "d8a657", "fbf1c7", "f2e5bc", "ebdbb2", "3c3836", "665c54", "9d5b16"),
-    "Monokai Extended Light" to listOf("272822", "1e1f1c", "49483e", "f8f8f2", "a6a69c", "a6e22e", "ffffff", "f6f8fa", "e5e9ef", "24292e", "586069", "0366d6"),
-    "One Half Dark" to listOf("282c34", "21252b", "3e4451", "dcdfe4", "a0a7b4", "61afef", "ffffff", "f6f8fa", "e5e9ef", "24292e", "586069", "0366d6"),
-    "One Half Light" to listOf("282c34", "21252b", "3e4451", "dcdfe4", "a0a7b4", "61afef", "ffffff", "f6f8fa", "e5e9ef", "24292e", "586069", "0366d6"),
-    "Solarized Dark" to listOf("002b36", "00212b", "073642", "eee8d5", "93a1a1", "2aa198", "fdf6e3", "eee8d5", "ddd6c1", "586e75", "657b83", "167d77"),
-    "Solarized Light" to listOf("002b36", "00212b", "073642", "eee8d5", "93a1a1", "2aa198", "fdf6e3", "eee8d5", "ddd6c1", "586e75", "657b83", "167d77"),
 )
+
+// map old duplicate palette names back here so nobody loses their picked theme
+private val paletteAliases =
+    mapOf(
+        "Catppuccin Latte" to "Catppuccin",
+        "Catppuccin Mocha" to "Catppuccin",
+        "Base16 Ocean Light" to "Base16 Ocean",
+        "Coldark Cold" to "Coldark",
+        "Coldark Dark" to "Coldark",
+        "Gruvbox Dark" to "Gruvbox",
+        "Gruvbox Light" to "Gruvbox",
+        "Monokai Extended Light" to "Monokai Extended",
+        "One Half Dark" to "One Half",
+        "One Half Light" to "One Half",
+        "Solarized Dark" to "Solarized",
+        "Solarized Light" to "Solarized",
+    )
+
+fun canonicalPalette(name: String): String {
+    val mapped = paletteAliases[name] ?: name
+    return if (mapped in Palettes) mapped else "Catppuccin"
+}
 
 @Composable
 fun SillyTheme(preferences: Preferences, content: @Composable () -> Unit) {
     val scheme = remember(preferences.palette, preferences.light) {
-        val p = Palettes[preferences.palette] ?: Palettes.getValue("Catppuccin")
-        val o = if (preferences.light) 6 else 0
-        fun color(i: Int): Color {
-            return Color(("ff" + p[o + i]).toLong(16))
-        }
-        (if (preferences.light) lightColorScheme() else darkColorScheme()).copy(
-            primary = color(5),
-            onPrimary = color(1),
-            secondary = color(5),
-            background = color(0),
-            onBackground = color(3),
-            surface = color(0),
-            onSurface = color(3),
-            surfaceVariant = color(2),
-            onSurfaceVariant = color(4),
-            outline = color(4).copy(alpha = .4f),
-            outlineVariant = color(4).copy(alpha = .18f),
-            surfaceContainer = color(1),
-            surfaceContainerHigh = color(2),
-            error = if (preferences.light) Color(0xffb12b48) else Color(0xfff38ba8),
+        val p = Palettes[canonicalPalette(preferences.palette)] ?: Palettes.getValue("Catppuccin")
+        val light = preferences.light
+        val o = if (light) 6 else 0
+        fun color(i: Int): Color = Color(("ff" + p[o + i]).toLong(16))
+        val bg = color(0)
+        val base = color(1)
+        val hover = color(2)
+        val text = color(3)
+        val muted = color(4)
+        val accent = color(5)
+        val errorColor = if (light) Color(0xffb12b48) else Color(0xfff38ba8)
+        val errorContainerColor = lerp(bg, errorColor, if (light) 0.14f else 0.22f)
+        val onErrorContainerColor = if (light) Color(0xff5c1022) else errorColor
+        // fill in every M3 surface container role from the active palette so default purple never leaks into modals
+        val surfaceLowest = if (light) bg else lerp(base, Color.Black, 0.2f)
+        val surfaceLow = if (light) lerp(bg, base, 0.65f) else lerp(bg, base, 0.45f)
+        val surfaceMid = base
+        val surfaceHigh = if (light) lerp(base, hover, 0.55f) else lerp(bg, hover, 0.55f)
+        val surfaceHighest = hover
+        (if (light) lightColorScheme() else darkColorScheme()).copy(
+            primary = accent,
+            onPrimary = base,
+            primaryContainer = lerp(bg, accent, if (light) 0.16f else 0.24f),
+            onPrimaryContainer = text,
+            secondary = accent,
+            onSecondary = base,
+            secondaryContainer = surfaceHigh,
+            onSecondaryContainer = text,
+            tertiary = accent,
+            onTertiary = base,
+            background = bg,
+            onBackground = text,
+            surface = bg,
+            onSurface = text,
+            surfaceDim = surfaceLowest,
+            surfaceBright = surfaceHighest,
+            surfaceVariant = hover,
+            onSurfaceVariant = muted,
+            outline = muted.copy(alpha = .4f),
+            outlineVariant = muted.copy(alpha = .18f),
+            surfaceContainerLowest = surfaceLowest,
+            surfaceContainerLow = surfaceLow,
+            surfaceContainer = surfaceMid,
+            surfaceContainerHigh = surfaceHigh,
+            surfaceContainerHighest = surfaceHighest,
+            error = errorColor,
+            onError = base,
+            errorContainer = errorContainerColor,
+            onErrorContainer = onErrorContainerColor,
         )
     }
     MaterialTheme(

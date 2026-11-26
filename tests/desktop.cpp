@@ -5,11 +5,13 @@
 #include "m3u.h"
 #include "tagcleanup.h"
 #include "discordrpc.h"
+#include "sourcetags.h"
 #include "fileavailability.h"
 #include "artworknetwork.h"
 #include "thumbnailurls.h"
 #include "stablemodel.h"
 #include "directtransfer.h"
+#include "youtubeplaylist.h"
 #include <QBuffer>
 #include <QDateTime>
 #include <QJsonDocument>
@@ -90,6 +92,45 @@ int main(int argc, char **argv) {
     CHECK(pausedAct["state"].toString().contains("Paused"));
     CHECK(pausedAct["assets"].toMap()["large_image"].toString() == "sillyplayer");
     CHECK(!pausedAct.contains("buttons"));
+
+    // rpcCoverUrl is used for local tracks without a youtube videoId
+    const auto rpcCoverPayload = DiscordRpc::buildActivityPayload(
+        {{"title", "G.H.O.S.T."}, {"artist", "Yuta Imai"}, {"rpcCoverUrl", "https://is1-ssl.mzstatic.com/image/thumb/x/600x600bb.jpg"}},
+        true, 5.0, 180.0, 1000000, 42, "n3");
+    CHECK(rpcCoverPayload["args"].toMap()["activity"].toMap()["assets"].toMap()["large_image"].toString()
+          == "https://is1-ssl.mzstatic.com/image/thumb/x/600x600bb.jpg");
+
+    // query cleanup splits Artist - Title and strips feat/Official Audio junk
+    const auto [qArtist, qTitle] = DiscordRpc::normalizeQueryArtistTitle(
+        QString::fromUtf8("Yuta Imai feat. 重音テト - G.H.O.S.T. (Official Audio)"), "Unknown artist");
+    CHECK(qArtist == "Yuta Imai");
+    CHECK(qTitle == "G.H.O.S.T.");
+
+    // iTunes and Deezer cover parsers pick matching tracks and skip unrelated hits
+    const QByteArray itunesJson = R"({"results":[
+      {"trackName":"Totally Unrelated","artistName":"Someone Else","artworkUrl100":"https://is1-ssl.mzstatic.com/wrong/100x100bb.jpg"},
+      {"trackName":"G.H.O.S.T.","artistName":"Yuta Imai","artworkUrl100":"https://is1-ssl.mzstatic.com/right/100x100bb.jpg"}
+    ]})";
+    CHECK(DiscordRpc::parseItunesCoverUrl(itunesJson, "G.H.O.S.T.", "Yuta Imai")
+          == "https://is1-ssl.mzstatic.com/right/600x600bb.jpg");
+    const QByteArray deezerJson = R"({"data":[
+      {"title":"G.H.O.S.T.","artist":{"name":"Yuta Imai"},"album":{"cover_big":"https://e-cdns-images.dzcdn.net/images/cover/abc/500x500.jpg"}}
+    ]})";
+    CHECK(DiscordRpc::parseDeezerCoverUrl(deezerJson, "G.H.O.S.T.", "Yuta Imai")
+          == "https://e-cdns-images.dzcdn.net/images/cover/abc/500x500.jpg");
+
+    // source attribution extraction handles sillyplayer comments, purl tags, and yt-dlp filenames
+    const auto fromComment = extractSourceMetadata(
+        {QString::fromUtf8("https://www.youtube.com/watch?v=dQw4w9WgXcQ · Uploader: Rick · Original title: Never Gonna Give You Up")},
+        "renamed.mp3");
+    CHECK(fromComment["videoId"].toString() == "dQw4w9WgXcQ");
+    CHECK(fromComment["sourceProvider"].toString() == "youtube");
+    CHECK(fromComment["uploader"].toString() == "Rick");
+    const auto fromFilename = extractSourceMetadata({}, "Yuta Imai - G.H.O.S.T. [aBcDeFgHiJk] 1234abcd.opus");
+    CHECK(fromFilename["videoId"].toString() == "aBcDeFgHiJk");
+    CHECK(fromFilename["sourceUrl"].toString() == "https://www.youtube.com/watch?v=aBcDeFgHiJk");
+    const auto fromSc = extractSourceMetadata({"https://soundcloud.com/artist/track"}, "track.mp3");
+    CHECK(fromSc["sourceProvider"].toString() == "soundcloud");
   }
   {
     const QByteArray payload = SyncManager::discoveryReplyPayload("desk-1", "MyPC", 43817, QString(64, 'a'));
@@ -346,7 +387,15 @@ int main(int argc, char **argv) {
       app.youtube.stop();
     }
     window->setProperty("page","Settings");settle();
-    for(auto object:window->findChildren<QObject*>()) if(object->metaObject()->indexOfProperty("category")>=0 && object->metaObject()->indexOfProperty("categories")>=0) object->setProperty("category","About");
+    for(auto object:window->findChildren<QObject*>()) if(object->metaObject()->indexOfProperty("category")>=0 && object->metaObject()->indexOfProperty("categories")>=0) {
+      if(qEnvironmentVariableIsSet("SILLYPLAYER_QA_DIR")) {
+        object->setProperty("category","Playback"); settle();
+        window->grabWindow().save(qEnvironmentVariable("SILLYPLAYER_QA_DIR")+"/settings-playback-rpc.png");
+        object->setProperty("category","Library and storage"); settle();
+        window->grabWindow().save(qEnvironmentVariable("SILLYPLAYER_QA_DIR")+"/settings-library-reinstate.png");
+      }
+      object->setProperty("category","About");
+    }
     settle();
     if(qEnvironmentVariableIsSet("SILLYPLAYER_QA_DIR")) window->grabWindow().save(qEnvironmentVariable("SILLYPLAYER_QA_DIR")+"/about-reliability.png");
     if(qEnvironmentVariableIsSet("SILLYPLAYER_QA_DIR")) window->grabWindow().save(qEnvironmentVariable("SILLYPLAYER_QA_DIR")+"/settings.png");
@@ -488,6 +537,240 @@ int main(int argc, char **argv) {
     settle();
     CHECK(musicPane->property("songSortAsc").toBool() == !initialAsc);
     CHECK(songList->property("contentY").toDouble() <= 1.0);
+
+    // allowPlaylistDuplicates defaults off, preserves existing duplicates, skips on auto add, and removes duplicates cleanly
+    CHECK(app.settings()["allowPlaylistDuplicates"].toBool() == false);
+    const auto dupPl = app.createCollection("Dup Cleanup", "playlist");
+    CHECK(app.addTracksToCollection(dupPl, {"fa1", "fa1", "fa2", "fa1"}, "duplicates")["added"].toInt() == 4);
+    CHECK(app.countPlaylistDuplicates(dupPl) == 2);
+    const auto skipAuto = app.addTracksToCollection(dupPl, {"fa1", "fa3"}, "auto");
+    CHECK(skipAuto["added"].toInt() == 1 && skipAuto["skipped"].toInt() == 1);
+    CHECK(app.countPlaylistDuplicates(dupPl) == 2);
+    const auto cleaned = app.removePlaylistDuplicates(dupPl);
+    CHECK(cleaned["status"] == "done" && cleaned["removed"].toInt() == 2);
+    CHECK(app.countPlaylistDuplicates(dupPl) == 0);
+    const auto dupTracksAfter = app.collectionTracks(dupPl);
+    CHECK(dupTracksAfter.size() == 3);
+    CHECK(dupTracksAfter[0].toMap()["id"] == "fa1");
+    CHECK(dupTracksAfter[1].toMap()["id"] == "fa2");
+    CHECK(dupTracksAfter[2].toMap()["id"] == "fa3");
+    app.setSetting("allowPlaylistDuplicates", true);
+    const auto allowAuto = app.addTracksToCollection(dupPl, {"fa2"}, "auto");
+    CHECK(allowAuto["added"].toInt() == 1 && allowAuto["skipped"].toInt() == 0);
+    app.setSetting("allowPlaylistDuplicates", false);
+
+    // playlist sorting inside opened collection reverses playlist order and restores on reopen
+    musicPane->setProperty("collectionId", dupPl);
+    settle();
+    auto colSort = window->findChild<QObject*>("collectionSort");
+    auto colSortDir = window->findChild<QObject*>("collectionSortDirection");
+    CHECK(colSort && colSortDir);
+    CHECK(QMetaObject::invokeMethod(colSortDir, "clicked"));
+    settle();
+    CHECK(musicPane->property("collectionSortAsc").toBool() == false);
+    musicPane->setProperty("collectionId", "");
+    settle();
+
+    // custom eq presets validation, persistence, tombstone deletion, and sync merge
+    CHECK(app.saveEqPreset("Flat", {1,2,3,4,5,6,7,8,9,10})["ok"].toBool() == false);
+    const auto savedPreset = app.saveEqPreset("Breakcore Punch", {6,4,2,0,-1,0,2,4,5,6});
+    CHECK(savedPreset["ok"].toBool() == true);
+    CHECK(app.settings()["eqPreset"].toString() == "Breakcore Punch");
+    CHECK(app.settings()["eqCustomPresets"].toList().size() == 1);
+    const QString presetId = savedPreset["preset"].toMap()["id"].toString();
+    const auto mergedRemote = SyncManager::mergeEqPresets(
+      store.setting("eqCustomPresets").toList(),
+      QVariantList{QVariantMap{{"id","remote-1"},{"name","Late Night"},{"gains",QVariantList{3,2,1,0,0,-1,-2,0,1,2}},{"updatedAt",9999999999999LL},{"deleted",false}}});
+    store.setSetting("eqCustomPresets", mergedRemote);
+    CHECK(SyncManager::mergeEqPresets(mergedRemote, QVariantList{QVariantMap{{"id",presetId},{"name","Breakcore Punch"},{"gains",QVariantList{}},{"updatedAt",9999999999999LL},{"deleted",true}}})
+      .size() == 2);
+    CHECK(app.deleteEqPreset("Breakcore Punch")["ok"].toBool() == true);
+
+    // youtube music playlist link canonicalization with tracking params
+    CHECK(YouTubePlaylist::canonicalUrl("https://music.youtube.com/playlist?list=PLWyngZ1wSkETpYiqDXHs7N1kUkuXj_VIK&drli=1")
+      == "https://www.youtube.com/playlist?list=PLWyngZ1wSkETpYiqDXHs7N1kUkuXj_VIK");
+    CHECK(YouTubePlaylist::canonicalUrl("https://music.youtube.com/playlist/?list=PLWyngZ1wSkETpYiqDXHs7N1kUkuXj_VIK&drli=1")
+      == "https://www.youtube.com/playlist?list=PLWyngZ1wSkETpYiqDXHs7N1kUkuXj_VIK");
+
+    // desktop effective volume scales past 100% up to 300% off the 0-100 main slider
+    app.music.setVolume(80);
+    app.music.setTrackVolume(200);
+    CHECK(std::abs(app.music.effectiveVolume() - 160.0) < 0.01);
+    app.music.setVolume(100);
+    app.music.setTrackVolume(300);
+    CHECK(std::abs(app.music.effectiveVolume() - 300.0) < 0.01);
+    app.music.setTrackVolume(100);
+
+    // deleted tracks must not count as duplicates or trigger collectionContains
+    const auto delPl = app.createCollection("Deleted Check", "playlist");
+    CHECK(app.addTracksToCollection(delPl, {"fa1", "fa1"}, "duplicates")["added"].toInt() == 2);
+    CHECK(app.collectionContains(delPl, "fa1") == true);
+    CHECK(app.countPlaylistDuplicates(delPl) == 1);
+    CHECK(store.exec("UPDATE tracks SET deleted=1 WHERE id='fa1'"));
+    CHECK(app.collectionContains(delPl, "fa1") == false);
+    CHECK(app.countPlaylistDuplicates(delPl) == 0);
+    CHECK(store.exec("UPDATE tracks SET deleted=0 WHERE id='fa1'"));
+
+    // clock-skewed eq preset edits/deletes still win locally and full eq state merges cleanly
+    store.setSetting("eqCustomPresets", QVariantList{
+      QVariantMap{{"id","skew-1"},{"name","Skewed"},{"gains",QVariantList{1,0,0,0,0,0,0,0,0,0}},{"updatedAt",9999999999990LL},{"deleted",false}}
+    });
+    const auto skewSave = app.saveEqPreset("Skewed", {5,4,3,2,1,0,0,0,0,0});
+    CHECK(skewSave["ok"].toBool() == true);
+    CHECK(skewSave["preset"].toMap()["updatedAt"].toLongLong() > 9999999999990LL);
+    CHECK(app.deleteEqPreset("Skewed")["ok"].toBool() == true);
+    bool skewedDeleted = false;
+    for (const auto &v : store.setting("eqCustomPresets").toList()) {
+      const auto m = v.toMap();
+      if (m["id"] == "skew-1") skewedDeleted = m["deleted"].toBool();
+    }
+    CHECK(skewedDeleted);
+
+    const auto eqStateMerged = SyncManager::mergeEqState(
+      {{"enabled", false}, {"preset", "Flat"}, {"gains", QVariantList{0,0,0,0,0,0,0,0,0,0}}, {"updatedAt", 100}},
+      {{"enabled", true}, {"preset", "Late Night"}, {"gains", QVariantList{3,2,1,0,0,-1,-2,0,1,2}}, {"updatedAt", 200}},
+      QVariantList{QVariantMap{{"id","r1"},{"name","Late Night"},{"gains",QVariantList{4,3,2,0,0,0,0,0,0,0}},{"updatedAt",250},{"deleted",false}}});
+    CHECK(eqStateMerged["enabled"].toBool() == true);
+    CHECK(eqStateMerged["preset"].toString() == "Late Night");
+    CHECK(eqStateMerged["gains"].toList().first().toDouble() == 4.0);
+    const auto eqStateAfterDel = SyncManager::mergeEqState(
+      eqStateMerged, {},
+      QVariantList{QVariantMap{{"id","r1"},{"name","Late Night"},{"gains",QVariantList{}},{"updatedAt",300},{"deleted",true}}});
+    CHECK(eqStateAfterDel["preset"].toString() == "Custom");
+
+    // stream quality preview formatting for download dialog
+    const auto qLabel = app.online.streamQualityLabel({
+      {"provider", "youtube"},
+      {"requested_formats", QVariantList{QVariantMap{{"acodec", "opus"}, {"abr", 128.4}, {"ext", "webm"}, {"filesize", 3500000}}}},
+    });
+    CHECK(qLabel.contains("128 kbps") && qLabel.contains("WEBM") && qLabel.contains("OPUS"));
+
+    // portable sqlite mirror saves into musicDir and recovers cleanly into an empty store
+    const QString mirrorDir = dir.path() + "/mirror-music";
+    app.setSetting("musicDir", mirrorDir);
+    const auto mirrorRes = app.recovery.saveNow(false);
+    CHECK(mirrorRes["ok"].toBool() == true);
+    CHECK(QFileInfo::exists(mirrorDir + "/.sillyplayer-library-0.sqlite3"));
+    {
+      Store fresh(dir.path() + "/fresh-recovery.sqlite3");
+      DesktopRecovery freshRec(&fresh);
+      const auto recRes = freshRec.recoverFromFolder(mirrorDir);
+      CHECK(recRes["ok"].toBool() == true);
+      CHECK(recRes["restored"].toInt() > 0);
+      CHECK(fresh.setting("eqPreset").toString() == app.settings()["eqPreset"].toString());
+    }
+
+    // developer mode and maintenance mode gate desktop library reset
+    CHECK(app.resetDesktopLibrary(false)["ok"].toBool() == false);
+    app.setSetting("developerMode", true);
+    CHECK(app.resetDesktopLibrary(false)["ok"].toBool() == false); // blocked while in maintenance
+    app.library.endMaintenance();
+    {
+      QElapsedTimer waitScan; waitScan.start();
+      while (app.library.scanning() && waitScan.elapsed() < 10000) { gui.processEvents(); QThread::msleep(5); }
+      CHECK(!app.library.scanning());
+    }
+
+    // discord rpc cover lookup (iTunes -> Deezer -> optional upload) caches in rpc_covers and mirrors to folder db
+    {
+      QTcpServer coverServer; CHECK(coverServer.listen(QHostAddress::LocalHost));
+      QObject::connect(&coverServer, &QTcpServer::newConnection, [&] {
+        while (coverServer.hasPendingConnections()) {
+          auto *sock = coverServer.nextPendingConnection();
+          QObject::connect(sock, &QTcpSocket::readyRead, sock, [sock] {
+            const QByteArray req = sock->readAll();
+            QByteArray body;
+            if (req.contains("/itunes") && req.contains("Alpha")) {
+              body = R"({"results":[{"trackName":"Alpha Song","artistName":"Alpha Artist","artworkUrl100":"https://is1-ssl.mzstatic.com/a/100x100bb.jpg"}]})";
+            } else if (req.contains("/deezer") && req.contains("Beta")) {
+              body = R"({"data":[{"title":"Beta Song","artist":{"name":"Beta Artist"},"album":{"cover_big":"https://cdn.example.test/beta-500.jpg"}}]})";
+            } else if (req.contains("/upload")) {
+              body = "https://litter.catbox.moe/testcover.jpg";
+            } else {
+              body = R"({"results":[],"data":[]})";
+            }
+            sock->write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " +
+                        QByteArray::number(body.size()) + "\r\nConnection: close\r\n\r\n" + body);
+            sock->disconnectFromHost();
+          });
+          QObject::connect(sock, &QTcpSocket::disconnected, sock, &QObject::deleteLater);
+        }
+      });
+      const QString base = QString("http://127.0.0.1:%1").arg(coverServer.serverPort());
+      app.discord.setCoverEndpointsForTesting(base + "/itunes", base + "/deezer", base + "/upload");
+      app.setSetting("discordRpcLookupCovers", true);
+      app.setSetting("discordRpcUploadCovers", true);
+
+      auto waitCover = [&](const QVariantMap &t) {
+        QString resolved;
+        auto conn = QObject::connect(&app.discord, &DiscordRpc::coverResolved,
+                                     [&](const QString &id, const QString &url) { if (id == t["id"].toString()) resolved = url; });
+        app.discord.resolveCoverNow(t);
+        QElapsedTimer wt; wt.start();
+        while (resolved.isEmpty() && wt.elapsed() < 5000) { gui.processEvents(); QThread::msleep(5); }
+        QObject::disconnect(conn);
+        return resolved;
+      };
+      CHECK(waitCover({{"id", "fa1"}, {"title", "Alpha Song"}, {"artist", "Alpha Artist"}})
+            == "https://is1-ssl.mzstatic.com/a/600x600bb.jpg");
+      CHECK(app.discord.cachedCoverUrl("fa1") == "https://is1-ssl.mzstatic.com/a/600x600bb.jpg");
+      CHECK(waitCover({{"id", "fa2"}, {"title", "Beta Song"}, {"artist", "Beta Artist"}})
+            == "https://cdn.example.test/beta-500.jpg");
+      CHECK(waitCover({{"id", "fa3"}, {"title", "Unlisted Song"}, {"artist", "Obscure"}, {"art", QUrl::fromLocalFile(file).toString()}})
+            == "https://litter.catbox.moe/testcover.jpg");
+
+      // verify rpc_covers survives portable sqlite mirror save & recovery
+      CHECK(app.recovery.saveNow(false)["ok"].toBool() == true);
+      Store freshRpc(dir.path() + "/fresh-rpc.sqlite3");
+      DesktopRecovery freshRpcRec(&freshRpc);
+      CHECK(freshRpcRec.recoverFromFolder(mirrorDir)["ok"].toBool() == true);
+      CHECK(freshRpc.rows("SELECT url FROM rpc_covers WHERE track='fa1'").first().toMap()["url"].toString()
+            == "https://is1-ssl.mzstatic.com/a/600x600bb.jpg");
+    }
+
+    // reinstateFolder imports missing songs, restores deleted ones, extracts youtube links from filename/tags, and saves folder db
+    {
+      const QString reinstateDir = dir.path() + "/reinstate-folder";
+      CHECK(QDir().mkpath(reinstateDir));
+      const QString f1 = reinstateDir + "/Legacy Song [dQw4w9WgXcQ] abcd1234.mp3";
+      const QString f2 = reinstateDir + "/Tagged Song.mp3";
+      QProcess ff1;
+      ff1.start("ffmpeg", {"-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=0.2",
+                           "-metadata", "title=Legacy Song", "-metadata", "artist=Old Artist", f1});
+      CHECK(ff1.waitForFinished(10000) && ff1.exitCode() == 0);
+      QProcess ff2;
+      ff2.start("ffmpeg", {"-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=520:duration=0.2",
+                           "-metadata", "title=Tagged Song", "-metadata", "artist=Tag Artist",
+                           "-metadata", QString::fromUtf8("comment=https://www.youtube.com/watch?v=9bZkp7q19f0 · Uploader: PSY · Original title: Gangnam Style"), f2});
+      CHECK(ff2.waitForFinished(10000) && ff2.exitCode() == 0);
+
+      const auto r1 = app.reinstateFolder(reinstateDir);
+      CHECK(r1["ok"].toBool() == true);
+      CHECK(r1["checked"].toInt() == 2);
+      CHECK(r1["reinstated"].toInt() == 2);
+      CHECK(r1["linksRestored"].toInt() == 2);
+      CHECK(r1["dbSaved"].toBool() == true);
+      const auto t1 = store.rows("SELECT id,videoId,sourceUrl FROM tracks WHERE path=?", {f1}).first().toMap();
+      CHECK(t1["videoId"].toString() == "dQw4w9WgXcQ");
+      const auto t2 = store.rows("SELECT id,videoId,sourceUrl,uploader FROM tracks WHERE path=?", {f2}).first().toMap();
+      CHECK(t2["videoId"].toString() == "9bZkp7q19f0");
+      CHECK(t2["uploader"].toString() == "PSY");
+
+      // soft-deleted song in folder gets reinstated cleanly on re-check
+      CHECK(store.exec("UPDATE tracks SET deleted=1,videoId='',sourceUrl='' WHERE id=?", {t1["id"]}));
+      const auto r2 = app.reinstateFolder(reinstateDir);
+      CHECK(r2["ok"].toBool() == true);
+      CHECK(r2["reinstated"].toInt() == 1);
+      CHECK(r2["linksRestored"].toInt() == 1);
+      CHECK(store.rows("SELECT deleted,videoId FROM tracks WHERE id=?", {t1["id"]}).first().toMap()["deleted"].toInt() == 0);
+      CHECK(store.rows("SELECT videoId FROM tracks WHERE id=?", {t1["id"]}).first().toMap()["videoId"].toString() == "dQw4w9WgXcQ");
+    }
+
+    const auto resetRes = app.resetDesktopLibrary(false);
+    if (!resetRes["ok"].toBool()) qWarning("resetDesktopLibrary failed: %s", qPrintable(resetRes["message"].toString()));
+    CHECK(resetRes["ok"].toBool() == true);
+    CHECK(store.rows("SELECT id FROM tracks").isEmpty());
+    CHECK(store.rows("SELECT id FROM collections").isEmpty());
   }
   {
     QTcpServer server;CHECK(server.listen(QHostAddress::LocalHost));

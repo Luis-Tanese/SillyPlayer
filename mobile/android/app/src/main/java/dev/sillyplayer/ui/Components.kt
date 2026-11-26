@@ -4,6 +4,7 @@ import androidx.compose.foundation.*
 import androidx.compose.foundation.gestures.*
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
@@ -14,6 +15,8 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -239,12 +242,21 @@ fun Input(
     trailing: @Composable (() -> Unit)? = null,
     onSubmit: (() -> Unit)? = null,
 ) {
+    val shape = RoundedCornerShape(14.dp)
     OutlinedTextField(
         value,
         onChange,
         modifier = modifier.fillMaxWidth(),
         label = { Text(label) },
         singleLine = true,
+        shape = shape,
+        colors =
+            OutlinedTextFieldDefaults.colors(
+                focusedContainerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+                unfocusedContainerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+                focusedBorderColor = MaterialTheme.colorScheme.primary,
+                unfocusedBorderColor = MaterialTheme.colorScheme.outlineVariant,
+            ),
         keyboardOptions = KeyboardOptions(imeAction = if (onSubmit != null) ImeAction.Search else ImeAction.Default),
         keyboardActions = KeyboardActions(onSearch = { onSubmit?.invoke() }, onDone = { onSubmit?.invoke() }),
         leadingIcon =
@@ -457,10 +469,39 @@ fun <T> PickMenu(
 ) {
     var open by remember { mutableStateOf(false) }
     Box {
-        Action(label(value), "chevron-down") { open = true }
+        Surface(
+            onClick = { open = true },
+            shape = RoundedCornerShape(10.dp),
+            color = MaterialTheme.colorScheme.surfaceContainerHighest,
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+            modifier = Modifier.heightIn(min = 36.dp),
+        ) {
+            Row(
+                Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Text(
+                    label(value),
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Glyph("chevron-down", modifier = Modifier.size(14.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
         DropdownMenu(open, { open = false }) {
             for (choice in choices) DropdownMenuItem(
-                text = { Text(label(choice)) },
+                text = {
+                    Text(
+                        label(choice),
+                        color = if (choice == value) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+                        fontWeight = if (choice == value) FontWeight.Medium else FontWeight.Normal,
+                    )
+                },
+                trailingIcon = if (choice == value) { { Glyph("check", modifier = Modifier.size(15.dp), tint = MaterialTheme.colorScheme.primary) } } else null,
                 onClick = {
                     open = false
                     onPick(choice)
@@ -471,25 +512,299 @@ fun <T> PickMenu(
 }
 
 @Composable
+fun ModalPrimaryButton(
+    label: String,
+    icon: String = "",
+    enabled: Boolean = true,
+    danger: Boolean = false,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit,
+) {
+    val colors =
+        if (danger)
+            ButtonDefaults.buttonColors(
+                containerColor = MaterialTheme.colorScheme.error,
+                contentColor = MaterialTheme.colorScheme.onError,
+            )
+        else
+            ButtonDefaults.buttonColors(
+                containerColor = MaterialTheme.colorScheme.primary,
+                contentColor = MaterialTheme.colorScheme.onPrimary,
+            )
+    Button(
+        onClick = onClick,
+        enabled = enabled,
+        shape = RoundedCornerShape(10.dp),
+        colors = colors,
+        contentPadding = PaddingValues(horizontal = 15.dp, vertical = 9.dp),
+        modifier = modifier.heightIn(min = 38.dp),
+    ) {
+        if (icon.isNotBlank()) {
+            Glyph(icon, modifier = Modifier.size(15.dp), tint = LocalContentColor.current)
+            Spacer(Modifier.width(6.dp))
+        }
+        Text(label, fontSize = 13.sp, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+    }
+}
+
+@Composable
+fun ModalTonalButton(
+    label: String,
+    icon: String = "",
+    enabled: Boolean = true,
+    danger: Boolean = false,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit,
+) {
+    val colors =
+        if (danger)
+            ButtonDefaults.filledTonalButtonColors(
+                containerColor = MaterialTheme.colorScheme.errorContainer,
+                contentColor = MaterialTheme.colorScheme.onErrorContainer,
+            )
+        else
+            ButtonDefaults.filledTonalButtonColors(
+                containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+                contentColor = MaterialTheme.colorScheme.onSurface,
+            )
+    FilledTonalButton(
+        onClick = onClick,
+        enabled = enabled,
+        shape = RoundedCornerShape(10.dp),
+        colors = colors,
+        contentPadding = PaddingValues(horizontal = 13.dp, vertical = 9.dp),
+        modifier = modifier.heightIn(min = 38.dp),
+    ) {
+        if (icon.isNotBlank()) {
+            Glyph(icon, modifier = Modifier.size(15.dp), tint = LocalContentColor.current)
+            Spacer(Modifier.width(6.dp))
+        }
+        Text(label, fontSize = 13.sp, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+    }
+}
+
+@Composable
+fun ModalSectionCard(
+    modifier: Modifier = Modifier,
+    highlighted: Boolean = false,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    val bg =
+        if (highlighted) MaterialTheme.colorScheme.primary.copy(alpha = 0.08f)
+        else MaterialTheme.colorScheme.surfaceContainerHigh
+    Surface(
+        modifier = modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(12.dp),
+        color = bg,
+    ) {
+        Column(
+            Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+            content = content,
+        )
+    }
+}
+
+@Composable
+fun ModalOptionRow(
+    title: String,
+    subtitle: String = "",
+    icon: String = "",
+    selected: Boolean = false,
+    danger: Boolean = false,
+    trailingIcon: String = "",
+    onClick: () -> Unit,
+) {
+    val tint =
+        when {
+            danger -> MaterialTheme.colorScheme.error
+            selected -> MaterialTheme.colorScheme.primary
+            else -> MaterialTheme.colorScheme.onSurfaceVariant
+        }
+    val bg =
+        when {
+            selected -> MaterialTheme.colorScheme.primary.copy(alpha = 0.11f)
+            danger -> MaterialTheme.colorScheme.error.copy(alpha = 0.07f)
+            else -> MaterialTheme.colorScheme.surfaceContainerHigh
+        }
+    Surface(
+        onClick = onClick,
+        shape = RoundedCornerShape(12.dp),
+        color = bg,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(
+            Modifier.padding(horizontal = 12.dp, vertical = 11.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            if (icon.isNotBlank()) {
+                Glyph(icon, modifier = Modifier.size(18.dp), tint = tint)
+            }
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(
+                    title,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = if (danger) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                if (subtitle.isNotBlank()) {
+                    Text(
+                        subtitle,
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+            val rightIcon = trailingIcon.ifBlank { if (selected) "check" else "" }
+            if (rightIcon.isNotBlank()) {
+                Glyph(rightIcon, modifier = Modifier.size(16.dp), tint = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+fun AppModalDialog(
+    onDismissRequest: () -> Unit,
+    title: String,
+    subtitle: String = "",
+    icon: String = "",
+    danger: Boolean = false,
+    dismissible: Boolean = true,
+    actions: @Composable RowScope.() -> Unit = {},
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    // kept simpler and flatter without chunky icon boxes or dividers, using FlowRow so 3 buttons never clip
+    Dialog(
+        onDismissRequest = { if (dismissible) onDismissRequest() },
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+    ) {
+        Surface(
+            modifier =
+                Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 20.dp, vertical = 20.dp)
+                    .widthIn(max = 440.dp),
+            shape = RoundedCornerShape(18.dp),
+            color = MaterialTheme.colorScheme.surfaceContainer,
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)),
+            shadowElevation = 8.dp,
+            tonalElevation = 0.dp,
+        ) {
+            Column(
+                Modifier.padding(20.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp),
+            ) {
+                Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        if (icon.isNotBlank() && danger) {
+                            Glyph(icon, modifier = Modifier.size(18.dp), tint = MaterialTheme.colorScheme.error)
+                        }
+                        Text(
+                            title,
+                            Modifier.weight(1f),
+                            fontSize = 18.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            lineHeight = 22.sp,
+                            color = MaterialTheme.colorScheme.onSurface,
+                        )
+                    }
+                    if (subtitle.isNotBlank()) {
+                        Text(
+                            subtitle,
+                            fontSize = 13.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                }
+                Column(
+                    Modifier.fillMaxWidth().weight(1f, fill = false),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                    content = content,
+                )
+                FlowRow(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    actions()
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun AppModalSheet(
+    onDismissRequest: () -> Unit,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    ModalBottomSheet(
+        onDismissRequest = onDismissRequest,
+        shape = RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp),
+        containerColor = MaterialTheme.colorScheme.surfaceContainer,
+        tonalElevation = 0.dp,
+        dragHandle = {
+            Box(
+                Modifier
+                    .padding(top = 10.dp, bottom = 6.dp)
+                    .width(36.dp)
+                    .height(4.dp)
+                    .clip(CircleShape)
+                    .background(MaterialTheme.colorScheme.outlineVariant)
+            )
+        },
+        content = content,
+    )
+}
+
+@Composable
 fun Confirmation(
     title: String,
     text: String,
     confirm: String = "Confirm",
     onDismiss: () -> Unit,
+    danger: Boolean = false,
+    icon: String = "",
     onConfirm: () -> Unit,
 ) {
-    AlertDialog(
+    val destructive = danger || confirm.contains("delete", true) || confirm.contains("trash", true) || confirm.contains("unpair", true) || confirm.contains("remove", true)
+    val badgeIcon = icon.ifBlank { if (destructive) "trash-2" else "" }
+    AppModalDialog(
         onDismissRequest = onDismiss,
-        title = { Text(title) },
-        text = { Text(text) },
-        confirmButton = {
-            Action(confirm) {
+        title = title,
+        icon = badgeIcon,
+        danger = destructive,
+        actions = {
+            ModalTonalButton("Cancel", onClick = onDismiss)
+            ModalPrimaryButton(confirm, danger = destructive) {
                 onConfirm()
                 onDismiss()
             }
         },
-        dismissButton = { Action("Cancel") { onDismiss() } },
-    )
+    ) {
+        if (text.isNotBlank()) {
+            Text(
+                text,
+                fontSize = 14.sp,
+                lineHeight = 20.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
 }
 
 @Composable

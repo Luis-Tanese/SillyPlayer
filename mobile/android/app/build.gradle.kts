@@ -14,8 +14,8 @@ android {
         applicationId = "dev.sillyplayer"
         minSdk = 26
         targetSdk = 36
-        versionCode = 21
-        versionName = "1.2.2"
+        versionCode = 22
+        versionName = "1.3.0"
         externalNativeBuild { cmake { arguments += listOf("-DANDROID_STL=c++_shared") } }
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
